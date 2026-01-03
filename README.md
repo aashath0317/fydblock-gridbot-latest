@@ -1,33 +1,42 @@
 # Fydblock Spot Grid Trading Bot 🚀
 
-A high-performance, asynchronous cryptocurrency trading bot specializing in **Spot Grid Trading**. Built with Python, FastAPI, and CCXT, it is designed for resilience, security, and automated grid management.
-
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.95%2B-green)
-![License](https://img.shields.io/badge/License-MIT-purple)
+A high-performance, asynchronous cryptocurrency trading bot specializing in **Spot Grid Trading**. Built with Python (FastAPI) and CCXT, it features enterprise-grade security, real-time observability (Grafana/Loki), and a robust simulation engine.
 
 ## 🌟 Key Features
 
-* **⚡ Asynchronous Core**: Powered by `asyncio` and `FastAPI` for non-blocking I/O, allowing the bot to handle real-time WebSocket feeds for prices and order updates simultaneously.
+* **⚡ Asynchronous Core**: Powered by `asyncio` and `FastAPI` for non-blocking I/O, handling real-time WebSocket feeds and order updates simultaneously.
 * **🛡️ Resilient Order Management**:
-    * **State Reconciliation**: Automatically detects and handles "vanished" orders (orders filled or canceled on the exchange but missed by the WebSocket) via `OrderManager.sync_orders`.
-    * **Strict Isolation**: Prevents "phantom orders" by ensuring database state matches exchange state before placing new trades.
-* **🔒 Enterprise-Grade Security**:
-    * **AES Encryption**: API keys and secrets are encrypted at rest using `Fernet` (symmetric encryption) before being stored in the database.
-    * **Environment Isolation**: Critical secrets (Encryption Keys, DB URLs) are managed via `.env` files.
+* **State Reconciliation**: Automatically detects and handles "vanished" orders via `OrderManager`.
+* **Strict Isolation**: Prevents "phantom orders" by ensuring database state matches exchange state.
+
+
+* **🔒 Enterprise Security**:
+* **AES Encryption**: API keys/secrets are encrypted at rest using `Fernet` before storage.
+* **Environment Isolation**: Critical secrets managed via `.env`.
+
+
 * **🤖 Smart Auto-Tuner**:
-    * **Reset Up**: Automatically resets the grid upwards if the price breaks the upper limit.
-    * **Expand Down**: Intelligently lowers the bottom limit during market dips (with cooldowns) to catch lower prices without over-committing.
-* **📊 Built-in Backtesting**: Includes a simulation engine to verify strategy logic against historical CSV data or dummy sine-wave data.
+* **Reset Up**: Automatically resets the grid upwards if the price breaks the upper limit.
+* **Expand Down**: Intelligently lowers limits during market dips with configurable cooldowns.
+
+
+* **👁️ Observability & Monitoring**:
+* Full integration with **Grafana**, **Loki**, and **Promtail** for log aggregation and visualization.
+* Health stats endpoints.
+
+
+* **📊 Built-in Backtesting**: Simulation engine to verify strategies against historical data before going live.
 
 ---
 
 ## 🛠️ Technology Stack
 
-* **Framework**: FastAPI, Uvicorn
+* **Core**: Python 3.12+
+* **Web Framework**: FastAPI, Uvicorn
 * **Database**: SQLite (Async/WAL mode) with SQLAlchemy
-* **Exchange Integration**: CCXT Pro (WebSockets + REST)
-* **Data Validation**: Pydantic
+* **Exchange**: CCXT (WebSockets + REST)
+* **Monitoring**: Grafana, Loki, Promtail (via Docker)
+* **Data Analysis**: Pandas, NumPy, Plotly
 
 ---
 
@@ -35,140 +44,180 @@ A high-performance, asynchronous cryptocurrency trading bot specializing in **Sp
 
 ### Prerequisites
 
-* Python 3.10 or higher
+* Python 3.12 or higher
 * Git
+* Docker & Docker Compose (optional, for monitoring)
 
 ### Installation
 
-1.  **Clone the Repository**
-    ```bash
-    git clone [https://github.com/yourusername/fydblock-grid-bot.git](https://github.com/yourusername/fydblock-grid-bot.git)
-    cd fydblock-grid-bot
-    ```
+1. **Clone the Repository**
+```bash
+git clone https://github.com/yourusername/fydblock-grid-bot.git
+cd fydblock-grid-bot
 
-2.  **Set up Virtual Environment**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows: venv\Scripts\activate
-    ```
+```
 
-3.  **Install Dependencies**
-    ```bash
-    pip install -r requirements.txt
-    ```
 
-4.  **Configuration**
-    Create a `.env` file in the root directory (use `config.py` as reference):
-    ```env
-    DB_URL=sqlite+aiosqlite:///grid_bot.db
-    ENCRYPTION_KEY=YOUR_GENERATED_FERNET_KEY
-    ```
-    *Note: You can generate a key using `from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())`.*
+2. **Set up Virtual Environment**
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+```
+
+
+3. **Install Dependencies**
+```bash
+pip install -r requirements.txt
+
+```
+
+
+4. **Environment Configuration**
+Create a `.env` file in the root directory:
+```env
+# Database Configuration
+DB_URL=sqlite+aiosqlite:///grid_bot.db
+
+# Security (Generate a key using cryptography.fernet)
+ENCRYPTION_KEY=YOUR_GENERATED_FERNET_KEY
+
+# Monitoring (Optional)
+GRAFANA_ADMIN_USER=admin
+GRAFANA_ADMIN_PASSWORD=admin
+
+# Notifications (Optional - Apprise)
+APPRISE_NOTIFICATION_URLS=discord://webhook_id/webhook_token
+
+```
+
+
+*Tip: Generate a Fernet key with:*
+```python
+from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())
+
+```
+
+
 
 ---
 
 ## 🏃 Running the Bot
 
-Start the API server:
+### 1. Run the API Server (Live/Paper Trading)
+
+The server handles API requests to start/stop bots and manage state.
 
 ```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uvicorn server:app --reload --host 0.0.0.0 --port 8000
 
 ```
 
-* **API Documentation**: `http://localhost:8000/docs`
-* **Health Check**: `http://localhost:8000/health_stats`
+* **Swagger Docs**: `http://localhost:8000/docs`
+* **Health Check**: `http://localhost:8000/`
 
----
+### 2. Run with Monitoring Stack (Docker)
 
-## 🕹️ Usage Guide
-
-### 1. Start a New Grid Bot
-
-Send a `POST` request to `/start_bot` with your configuration.
+To spin up Grafana, Loki, and Promtail for logs and dashboards:
 
 ```bash
-curl -X POST "http://localhost:8000/start_bot" \
-     -H "Content-Type: application/json" \
-     -d '{
-           "user_id": "user_01",
-           "pair": "BTC/USDT",
-           "amount": 1000,
-           "lower_limit": 50000,
-           "upper_limit": 60000,
-           "grid_count": 10,
-           "mode": "AUTO",
-           "api_key": "YOUR_BINANCE_API_KEY",
-           "secret_key": "YOUR_BINANCE_SECRET_KEY"
-         }'
+docker-compose up -d
 
 ```
 
-### 2. Monitor Health
+* **Grafana Dashboard**: `http://localhost:3000` (Default login: defined in `.env`)
 
-Check if the system is running smoothly and view API latency stats.
+### 3. Run Standalone (CLI)
 
-```bash
-curl "http://localhost:8000/health_stats"
-
-```
-
-### 3. Stop a Bot
-
-Gracefully stop a bot and cancel its active tasks.
+To run a specific configuration file directly without the API server:
 
 ```bash
-curl -X POST "http://localhost:8000/stop_bot" \
-     -H "Content-Type: application/json" \
-     -d '{"bot_id": 1}'
+python main.py --config config/config.json
 
 ```
 
 ---
 
-## 🧠 How It Works
+## 🕹️ API Usage Guide
 
-### The Grid Strategy
+The bot is primarily controlled via REST API.
 
-1. **Initialization**: The bot calculates grid levels and places `LIMIT` orders for the entire range.
-2. **Execution**: When an order fills (e.g., a Buy), the bot immediately places a corresponding counter-order (Sell) at a higher price (profit step).
-3. **Loop**: This repeats indefinitely, capturing profit from market volatility ("buying low and selling high" within the grid).
+### Start a Bot
 
-### Auto-Tuner Logic
+**POST** `/start`
 
-The bot doesn't just sit idle when prices go out of range. The `AutoTuner` module monitors the price:
-
-* **Price > Upper Limit**: Triggers `RESET_UP`. The bot cancels orders and shifts the entire grid up to center on the new price.
-* **Price < Lower Limit**: Triggers `EXPAND_DOWN`. The bot extends the grid downwards to keep buying into the dip, respecting a configurable cooldown period.
-
----
-
-## 🧪 Backtesting
-
-You can verify the logic without real funds using the included backtester.
-
-1. Place your historical data CSV in `backtest/data.csv`.
-2. Run the verification script:
-```bash
-python verify_backtest.py
+```json
+{
+  "bot_id": 1,
+  "user_id": 101,
+  "exchange": "binance",
+  "pair": "BTC/USDT",
+  "api_key": "YOUR_API_KEY",
+  "api_secret": "YOUR_SECRET",
+  "mode": "paper",
+  "investment": 1000.0,
+  "strategy": {
+    "upper_price": 60000,
+    "lower_price": 50000,
+    "grids": 10,
+    "spacing": "geometric"
+  }
+}
 
 ```
 
+### Stop a Bot
 
+**POST** `/stop/{bot_id}`
+
+```bash
+curl -X POST "http://localhost:8000/stop/1"
+
+```
+
+### Delete a Bot (Liquidate Assets)
+
+**DELETE** `/bot/{bot_id}?liquidate=true`
+
+* If the bot is running, it stops and sells assets.
+* If the bot is offline, pass credentials in the body to perform "Offline Liquidation".
+
+### Run Backtest
+
+**POST** `/backtest`
+
+```json
+{
+  "exchange": "binance",
+  "pair": "SOL/USDT",
+  "startDate": "2024-01-01T00:00:00Z",
+  "endDate": "2024-02-01T00:00:00Z",
+  "capital": 1000,
+  "upperPrice": 150,
+  "lowerPrice": 80,
+  "gridSize": 20
+}
+
+```
 
 ---
 
 ## 📂 Project Structure
 
-```
-├── backtest/           # Historical data loader & simulation engine
-├── database/           # SQLAlchemy models & repositories
-├── exchange/           # CCXT wrappers & Binance client
-├── execution/          # OrderManager & BalanceManager
-├── strategies/         # Grid math & Auto-Tuner logic
-├── utils/              # Logger, Security, & Health checks
-├── main.py             # FastAPI entry point & Lifecycle management
-└── config.py           # Configuration loader
+```text
+├── backtest/            # Simulation engine & data loaders
+├── config/              # Config validators & schema definitions
+├── core/
+│   ├── bot_management/  # Bot Controller, Event Bus, Health Checks
+│   ├── grid_management/ # Logic for calculating grid levels
+│   ├── order_handling/  # Order execution, fee calc, & reconciliation
+│   ├── services/        # Exchange interfaces (CCXT wrapper)
+│   └── storage/         # Database persistence layers
+├── monitoring/          # Docker configs for Grafana/Loki/Promtail
+├── strategies/          # Trading logic (Grid Strategy, Auto-Tuner)
+├── server.py            # FastAPI Entry Point
+├── main.py              # CLI Entry Point
+└── docker-compose.yml   # Observability Stack
 
 ```
 
