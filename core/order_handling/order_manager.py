@@ -467,7 +467,8 @@ class OrderManager:
                 required_value = raw_quantity * price
 
                 # 5% tolerance to avoid skipping due to tiny fee mismatches, but prevent massive partial "dust" fills
-                if self.balance_tracker.balance < (required_value * 0.95):
+                # FIX: Use BalanceTracker's attempt_fee_recovery to auto-heal "dust" shortfalls
+                if not self.balance_tracker.attempt_fee_recovery(required_value * 0.95):
                     self.logger.warning(
                         f"Skipping BUY reconciliation for level {price}: Insufficient funds "
                         f"(Available: {self.balance_tracker.balance:.2f}, Required: {required_value:.2f})"

@@ -44,6 +44,7 @@ class BalanceTracker:
         self.reserved_fiat: float = 0.0
         self.reserved_crypto: float = 0.0
         self.investment_cap: float = float("inf")
+        self.operational_reserve: float = 0.0  # Dynamic Fee Stabilization Reserve
 
         # REMOVED: Automatic subscription. OrderManager will call update manually to ensure sequence.
         # self.event_bus.subscribe(Events.ORDER_FILLED, self._update_balance_on_order_completion)
@@ -62,8 +63,28 @@ class BalanceTracker:
         self.investment_cap = initial_balance
 
         self.logger.info(
-            f"Balance Tracker Initialized: {self.balance} {self.quote_currency} (Investment Cap) / {self.crypto_balance} {self.base_currency}"
+            f"Balance Tracker Initialized: {self.balance} {self.quote_currency} (Investment Cap) / {self.crypto_balance} {self.base_currency} / Reserve: {self.operational_reserve}"
         )
+
+    def attempt_fee_recovery(self, required_amount: float) -> bool:
+        """
+        Checks if the main balance is sufficient. If not, attempts to auto-heal
+        using the Operational Reserve ("Dust Shortfall" logic).
+        """
+        if self.balance >= required_amount:
+            return True
+
+        deficit = required_amount - self.balance
+
+        # FR-03/04: Auto-Injection if reserve covers deficit
+        # We assume ANY deficit covered by reserve is valid "Fee Drag" recovery.
+        if self.operational_reserve >= deficit:
+            self.operational_reserve -= deficit
+            self.balance += deficit
+            self.logger.info(f"?? RESCUE: Auto-injected {deficit:.6f} from Operational Reserve to cover shortfall.")
+            return True
+
+        return False
 
     async def _fetch_live_balances(
         self,
@@ -140,7 +161,7 @@ class BalanceTracker:
 
         Args:
             order: The filled `Order` object containing details such as the side
-                (BUY/SELL), filled quantity, and price.
+            (BUY/SELL), filled quantity, and price.
         """
         if order.side == OrderSide.BUY:
             self._update_after_buy_order_filled(order.filled, order.price)
@@ -182,14 +203,7 @@ class BalanceTracker:
     ) -> None:
         """
         Updates the balances after a sell order is completed, including handling reserved funds.
-
-        Deducts the sold crypto quantity from the reserved crypto balance, releases any
-        unused reserved crypto back to the main crypto balance, adds the sale proceeds
-        (quantity * price - fee) to the fiat balance, and tracks the fees incurred.
-
-        Args:
-            quantity: The quantity of crypto sold.
-            price: The price at which the crypto was sold (per unit).
+        Implements Profit Recycling to specific Operational Reserve.
         """
         fee = self.fee_calculator.calculate_fee(quantity * price)
         sale_proceeds = quantity * price - fee
@@ -199,9 +213,26 @@ class BalanceTracker:
             self.crypto_balance += abs(self.reserved_crypto)  # Adjust with excess reserved crypto
             self.reserved_crypto = 0
 
-        self.balance += sale_proceeds
+        # --- Dynamic Fee Stabilization (FR-01/02) ---
+        # 1. Calculate Replacement Cost (Fee * Safety Multiplier)
+        # We assume we need to buy back roughly same amount, so fee will be similar.
+        safety_multiplier = 1.1
+        replacement_cost = fee * safety_multiplier
+
+        # 2. Allocate to Reserve
+        # Ensure we don't take more than the proceeds (sanity check)
+        allocation = min(replacement_cost, sale_proceeds)
+
+        self.operational_reserve += allocation
+        net_proceeds = sale_proceeds - allocation
+
+        self.balance += net_proceeds
         self.total_fees += fee
-        self.logger.info(f"Sell order completed: {quantity} crypto sold at {price}.")
+
+        self.logger.info(
+            f"Sell order completed: {quantity} crypto sold at {price}. "
+            f"Recycled {allocation:.4f} to Reserve. Net Proceeds: {net_proceeds:.4f}"
+        )
 
     def update_after_initial_purchase(self, initial_order: Order):
         """
