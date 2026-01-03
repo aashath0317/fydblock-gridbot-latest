@@ -1,0 +1,54 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: debug
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: "http://loki:3100/loki/api/v1/push"
+    batchsize: 1
+    batchwait: 1s
+
+scrape_configs:
+  - job_name: bot_logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: grid_trading_bot
+          __path__: /logs/**/*.log
+
+    relabel_configs:
+      - source_labels: [__path__]
+        regex: '.*/bot_(?P<base>[A-Z]+)_(?P<quote>[A-Z]+)_(?P<mode>[A-Z]+)_strategy(?P<strategy>[A-Z_]+)_spacing(?P<spacing>[A-Z]+)_size(?P<size>\d+)_range(?P<range>\d+-\d+)_.*\.log$'
+        target_label: filename
+
+      - source_labels: [base]
+        target_label: base_currency
+      - source_labels: [quote]
+        target_label: quote_currency
+      - source_labels: [mode]
+        target_label: trading_mode
+      - source_labels: [strategy]
+        target_label: strategy_type
+      - source_labels: [spacing]
+        target_label: spacing_type
+      - source_labels: [size]
+        target_label: grid_size
+      - source_labels: [range]
+        target_label: grid_range
+
+    pipeline_stages:
+      - regex:
+          expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - (?P<service>[A-Za-z0-9_]+) - (?P<level>[A-Z]+) - (?P<log_message>.*)$'
+
+      - labels:
+          service: '{{ .service }}'
+          level: '{{ .level }}'
+
+      # Convert timestamp to Loki format
+      - timestamp:
+          source: timestamp
+          format: "2006-01-02 15:04:05,000"

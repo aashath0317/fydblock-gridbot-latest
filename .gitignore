@@ -1,0 +1,45 @@
+# --- Python Essentials ---
+__pycache__/
+*.pyc
+*.py[cod]
+# IMPORTANT: This matches your folder name
+venv/
+env/
+.venv/
+
+# --- System & Logs ---
+*.DS_Store
+pip-log.txt
+logs/*
+*.prof
+
+# --- Distribution ---
+build/
+dist/
+*.egg-info/
+
+# --- Dependencies Lock Files ---
+# CAUTION: Usually you WANT to commit lock files (like uv.lock or poetry.lock)
+# to make sure the server installs the exact same versions. 
+# Uncomment the line below only if you really want to ignore them.
+# *.lock
+
+# --- VS Code ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# --- Secrets (Safety First!) ---
+secrets.json
+.env.yml
+.env
+
+# --- Project Specific ---
+loki-data/
+grafana-data/
+/data/
+.uv/
+.tox/
+.coverage
+.cache
+coverage.xml

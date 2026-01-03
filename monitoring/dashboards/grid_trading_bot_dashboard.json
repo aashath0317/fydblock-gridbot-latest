@@ -1,0 +1,103 @@
+{
+  "title": "Grid Trading Bot Dashboard",
+  "variables": [
+    {
+      "name": "trading_pair",
+      "type": "query",
+      "datasource": "Loki",
+      "query": "label_values(trading_pair)"
+    },
+    {
+      "name": "trading_mode",
+      "type": "query",
+      "datasource": "Loki",
+      "query": "label_values(trading_mode)"
+    },
+    {
+      "name": "strategy",
+      "type": "query",
+      "datasource": "Loki",
+      "query": "label_values(strategy_type)"
+    }
+  ],
+  "panels": [
+    {
+      "title": "Strategy Overview",
+      "type": "stat",
+      "datasource": "Loki",
+      "targets": [
+        {
+          "expr": "{job=\"grid_trading_bot\", trading_pair=\"$trading_pair\", trading_mode=\"$trading_mode\", strategy_type=\"$strategy\"} | json | line_format \"{{.grid_size}} grids, Range: {{.grid_range}}, Spacing: {{.spacing_type}}\""
+        }
+      ]
+    },
+    {
+      "title": "ROI Over Time",
+      "type": "timeseries",
+      "datasource": "Loki",
+      "targets": [
+        {
+          "expr": "{job=\"grid_trading_bot\", trading_pair=\"$trading_pair\", trading_mode=\"$trading_mode\", strategy_type=\"$strategy\"} | regexp \"ROI\\s+\\|\\s+(?P<roi>[\\-\\d\\.]+)%\" | unwrap roi"
+        }
+      ]
+    },
+    {
+      "title": "Grid Level States",
+      "type": "table",
+      "datasource": "Loki",
+      "targets": [
+        {
+          "expr": "{job=\"grid_trading_bot\", trading_pair=\"$trading_pair\", trading_mode=\"$trading_mode\", strategy_type=\"$strategy\"} | json | grid_price != \"\" and grid_state != \"\" | line_format \"{{.grid_price}} - {{.grid_state}}\""
+        }
+      ]
+    },
+    {
+      "title": "Order Flow",
+      "type": "timeseries",
+      "datasource": "Loki",
+      "targets": [
+        {
+          "expr": "sum(count_over_time({job=\"grid_trading_bot\", trading_pair=\"$trading_pair\", trading_mode=\"$trading_mode\", strategy_type=\"$strategy\", order_side=\"BUY\"}[5m]))",
+          "legendFormat": "Buy Orders"
+        },
+        {
+          "expr": "sum(count_over_time({job=\"grid_trading_bot\", trading_pair=\"$trading_pair\", trading_mode=\"$trading_mode\", strategy_type=\"$strategy\", order_side=\"SELL\"}[5m]))",
+          "legendFormat": "Sell Orders"
+        }
+      ]
+    },
+    {
+      "title": "Balance History",
+      "type": "timeseries",
+      "datasource": "Loki",
+      "targets": [
+        {
+          "expr": "{job=\"grid_trading_bot\", trading_pair=\"$trading_pair\", trading_mode=\"$trading_mode\", strategy_type=\"$strategy\"} | regexp \"Balance: (?P<balance>[\\d\\.]+)\" | unwrap balance"
+        }
+      ]
+    },
+    {
+      "title": "System Health",
+      "type": "gauge",
+      "datasource": "Loki",
+      "targets": [
+        {
+          "expr": "{job=\"grid_trading_bot\", trading_pair=\"$trading_pair\"} | json | unwrap cpu"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "value": 0, "color": "green" },
+              { "value": 70, "color": "yellow" },
+              { "value": 85, "color": "red" }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 36
+}
