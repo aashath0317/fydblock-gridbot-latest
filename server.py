@@ -95,6 +95,10 @@ health_monitor = HealthMonitor(db)
 
 
 # --- Lifecycle Management ---
+import json
+
+
+# --- Lifecycle Management ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 0. Setup Logging
@@ -122,7 +126,7 @@ async def lifespan(app: FastAPI):
         # allowing for zero-downtime updates.
         # We just stop the loop and let the DB keep status='RUNNING'
         # so next boot picks it up.
-        tasks.append(bot._stop(sell_assets=False))
+        tasks.append(bot._stop(sell_assets=False, cancel_orders=False))
 
     if tasks:
         await asyncio.gather(*tasks)
@@ -134,30 +138,56 @@ async def recover_active_bots():
     Scans DB for bots that were left RUNNING.
     Restarts them in Hot Boot mode (reconcile orders, don't cancel).
     """
-    # Requires a way to iterate bots. BotDatabase schema needs list_active_bots support.
-    # For now, we stub this or would need to query `SELECT bot_id FROM bots WHERE status='RUNNING'`
-    # Let's add that method to BotDatabase or execute here.
-    # Let's add that method to BotDatabase or execute here.
-
     try:
         import sqlite3
 
         conn = sqlite3.connect(db.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT bot_id FROM bots WHERE status = 'RUNNING'")
+        cursor.execute("SELECT bot_id, config_json FROM bots WHERE status = 'RUNNING'")
         rows = cursor.fetchall()
 
         if rows:
             logger.info(f"🔥 Found {len(rows)} bots to recover.")
             for row in rows:
                 bot_id = row[0]
-                # To restart, we need the original CONFIG.
-                # Since we don't store the full config in DB yet (Task: 'Database Schema'),
-                # we can't fully auto-recover without user input or a config table.
-                # SRS 1.2 "Hot Boot: The new version starts and reads the database".
-                # Crucial missing piece: Storing Config in DB.
-                # Current Scope: We will log this. Real implementation needs a `bot_configs` table.
-                logger.warning(f"⚠️ Bot {bot_id} is marked RUNNING but config is missing. Waiting for manual restart.")
+                config_json = row[1]
+
+                if not config_json:
+                    logger.warning(
+                        f"⚠️ Bot {bot_id} is marked RUNNING but config is missing. Waiting for manual restart."
+                    )
+                    continue
+
+                try:
+                    logger.info(f"♻️ Recovering Bot {bot_id}...")
+
+                    config_dict = json.loads(config_json)
+                    validator = ConfigValidator()
+                    config_manager = DictConfigManager(config_dict, validator)
+
+                    event_bus = EventBus()
+                    notification_handler = NotificationHandler(event_bus, None, config_manager.get_trading_mode())
+
+                    bot = GridTradingBot(
+                        config_path="memory",
+                        config_manager=config_manager,
+                        notification_handler=notification_handler,
+                        event_bus=event_bus,
+                        no_plot=True,
+                        bot_id=bot_id,
+                    )
+
+                    # Force Hot Boot
+                    bot.strategy.use_hot_boot = True
+
+                    task = asyncio.create_task(bot.run())
+                    active_instances[bot_id] = {"bot": bot, "task": task, "event_bus": event_bus}
+                    logger.info(f"✅ Bot {bot_id} successfully recovered and restarted!")
+
+                except Exception as e:
+                    logger.error(f"Failed to recover Bot {bot_id}: {e}")
+                    db.update_bot_status(bot_id, "CRASHED")
+
         else:
             logger.info("✅ No active bots found.")
         conn.close()
@@ -242,31 +272,11 @@ async def start_bot(req: BotRequest):
             bot_id=req.bot_id,
         )
 
-        # Update DB Status immediately to Lock it
-        db.update_bot_status(req.bot_id, "RUNNING")
-
-        # Start the bot task
-        # We relying on the Strategy to read `hot_boot` flag?
-        # We need to pass it.
-        # FIX: The `bot.run()` needs to accept the flag or set it on strategy.
-        # Since `bot.run` calls `strategy.run`, and we can't easily change signature everywhere,
-        # let's set a strategy attribute directly before running.
-
-        # bot.strategy._run_live_or_paper_trading signature change requires modifying GridTradingBot too.
-        # Let's just modify the `bot.run` call in `GridTradingStrategy` if we could, but better:
-        # We inject the intention via `bot` instance if possible, or assume strategy checks DB?
-        # Re-using the logic from Step 95 (where I added `hot_boot` param to `_initialize_grid_orders_once`).
-        # But `_run_live...` calls it.
+        # Update DB Status & Config immediately to Lock it and ensure persistence
+        db.update_bot_status(req.bot_id, "RUNNING", config_json=json.dumps(config_dict))
 
         # Hack/Fix: Set a temporary attribute on the strategy instance.
         bot.strategy.use_hot_boot = is_hot_boot
-
-        # Wait, I didn't add `use_hot_boot` field to Strategy class.
-        # I added `hot_boot` argument to `_initialize_grid_orders_once`.
-        # I need to wire `run` -> `_run_live` -> `_initialize`.
-        # OR: Just override the method in the runtime instance? No.
-
-        # Let's assume for now I will modify `GridTradingStrategy.run` to support checking a property.
 
         task = asyncio.create_task(bot.run())
 
@@ -303,7 +313,7 @@ async def stop_bot(bot_id: int):
     await bot._stop(sell_assets=False)
 
     try:
-        await asyncio.wait_for(instance["task"], timeout=5.0)
+        await asyncio.wait_for(instance["task"], timeout=30.0)
     except TimeoutError:
         logger.warning(f"Bot {bot_id} stop timed out, forcing removal.")
     except Exception as e:
@@ -340,6 +350,8 @@ async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotReques
     """
     logger.info(f"DELETE /bot/{bot_id}: Liquidate={liquidate}, Creds={creds}")
 
+    logger.info(f"DELETE /bot/{bot_id}: Liquidate={liquidate}, Creds={creds}")
+
     if bot_id in active_instances:
         # Active Bot: Can Liquidate
         instance = active_instances[bot_id]
@@ -347,8 +359,22 @@ async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotReques
 
         db.update_bot_status(bot_id, "STOPPING")
 
-        logger.info(f"🗑️ Deleting Bot {bot_id} (Active, Liquidate={liquidate})...")
+        logger.info(f"🗑️ Deleting Bot {bot_id} (Active, Liquidate/Nuclear={liquidate})...")
+
+        # If liquidate=True (Default on delete), we assume the user wants EVERYTHING gone for this bot.
+        # We trigger the standard stop, but ALSO trigger the nuclear cleanup if requested.
+        # However, `bot._stop` calls `cancel_all_open_orders`.
+        # To access `force_nuclear_cleanup`, we need to call it explicitly on the order manager.
+
         await bot._stop(sell_assets=liquidate)
+
+        if liquidate:
+            logger.info(f"☢️ Triggering Nuclear Cleanup for Bot {bot_id}...")
+            try:
+                # Re-run nuclear cleanup just in case `_stop` missed something
+                await bot.strategy.order_manager.force_nuclear_cleanup()
+            except Exception as e:
+                logger.error(f"Nuclear cleanup failed: {e}")
 
         try:
             await asyncio.wait_for(instance["task"], timeout=10.0)

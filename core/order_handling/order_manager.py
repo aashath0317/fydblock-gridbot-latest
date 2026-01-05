@@ -20,7 +20,7 @@ from ..validation.order_validator import OrderValidator
 from .execution_strategy.order_execution_strategy_interface import (
     OrderExecutionStrategyInterface,
 )
-from .order import Order, OrderSide, OrderStatus
+from .order import Order, OrderSide, OrderStatus, OrderType  # Added OrderStatus/OrderType, OrderStatus
 
 
 class OrderManager:
@@ -60,6 +60,17 @@ class OrderManager:
 
         self.event_bus.subscribe(Events.ORDER_FILLED, self._on_order_filled)
         self.event_bus.subscribe(Events.ORDER_CANCELLED, self._on_order_cancelled)
+
+    def has_active_orders(self) -> bool:
+        """
+        Checks if the bot has any active orders in the persistent database.
+        Used for Smart Resume (Hot Boot).
+        """
+        if not self.bot_id:
+            return False
+
+        active_orders = self.db.get_all_active_orders(self.bot_id)
+        return len(active_orders) > 0
 
     # ==============================================================================
     #  METHOD 3: SAFE CLEAN START (DB-DRIVEN)
@@ -167,6 +178,8 @@ class OrderManager:
                 # Strict: Must match DB ID?
                 # SRS: "Matches them against the database records"
 
+                closest_grid = None  # Initialize to avoid UnboundLocalError
+
                 if order_id in db_orders:
                     # Verified match
                     pass
@@ -184,19 +197,35 @@ class OrderManager:
                         continue
 
                 # 4. update Grid Level State
-                grid_level = self.grid_manager.grid_levels.get(price) or self.grid_manager.grid_levels.get(closest_grid)
+                grid_level = self.grid_manager.grid_levels.get(price)
+
+                # If exact match failed, try closest grid
+                if not grid_level:
+                    # Calculate closest_grid if we haven't already
+                    if closest_grid is None:
+                        closest_grid = min(self.grid_manager.price_grids, key=lambda x: abs(x - price))
+
+                    # Try to match to closest grid
+                    grid_level = self.grid_manager.grid_levels.get(closest_grid)
 
                 if grid_level:
                     # Reconstruct Order Object
                     # We need a proper Order object to add to OrderBook
                     order_obj = Order(
                         identifier=order_id,
-                        side=side,
-                        pair=self.trading_pair,
-                        amount=float(order_data["amount"]),
-                        price=price,
                         status=OrderStatus.OPEN,
-                        timestamp=int(pd.Timestamp.now().timestamp()),
+                        order_type=OrderType.LIMIT,
+                        side=side,
+                        price=price,
+                        average=None,
+                        amount=float(order_data["amount"]),
+                        filled=0.0,
+                        remaining=float(order_data["amount"]),
+                        timestamp=int(pd.Timestamp.now().timestamp() * 1000),  # Milliseconds expected
+                        datetime=pd.Timestamp.now().isoformat(),
+                        last_trade_timestamp=None,
+                        symbol=self.trading_pair,  # "pair" argument was incorrect, "symbol" is correct
+                        time_in_force="GTC",
                     )
 
                     self.order_book.add_order(order_obj, grid_level)
@@ -619,20 +648,14 @@ class OrderManager:
 
     async def cancel_all_open_orders(self) -> None:
         """
-        Safe cancellation: Only cancels orders that belong to this bot (found in DB).
+        Robust cancellation: Fetches ALL open orders from Exchange and cancels those belonging to this bot.
+        Uses a dual-matching strategy:
+        1. Match by Exchange ID against local DB (Primary).
+        2. Match by clientOrderId prefix (Secondary).
         """
-        self.logger.info(f"Cancelling open orders for Bot {self.bot_id}...")
+        self.logger.info(f"🛑 Stopping: Force-cancelling confirmed open orders for Bot {self.bot_id}...")
 
-        if self.bot_id:
-            my_orders = self.db.get_all_active_orders(self.bot_id)
-            for order_id in my_orders.keys():
-                try:
-                    await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
-                    self.db.update_order_status(order_id, "CANCELLED")
-                    self.logger.info(f"Cancelled order {order_id}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to cancel {order_id}: {e}")
-        else:
+        if not self.bot_id:
             # Legacy fallback
             open_orders = self.order_book.get_open_orders()
             for order in open_orders:
@@ -640,6 +663,60 @@ class OrderManager:
                     await self.order_execution_strategy.cancel_order(order.identifier, self.trading_pair)
                 except Exception as e:
                     self.logger.error(f"Failed: {e}")
+            return
+
+        # 1. Fetch Source of Truth from Exchange
+        try:
+            exchange_orders = await self.order_execution_strategy.exchange_service.fetch_open_orders(self.trading_pair)
+
+            # 2. Fetch Source of Truth from DB
+            db_orders = self.db.get_all_active_orders(self.bot_id)
+            db_order_ids = set(db_orders.keys())
+
+            # 3. Identify Orders to Cancel
+            orders_to_cancel = []
+            prefix = f"G_{self.bot_id}_"
+
+            for o in exchange_orders:
+                oid = o["id"]
+                client_oid = o.get("clientOrderId", "")
+
+                # Match A: ID is in our DB
+                if oid in db_order_ids:
+                    orders_to_cancel.append(o)
+                    continue
+
+                # Match B: Prefix matches (even if not in DB, we own it)
+                if client_oid.startswith(prefix):
+                    orders_to_cancel.append(o)
+                    continue
+
+            self.logger.info(
+                f"🔎 Found {len(orders_to_cancel)} active orders on exchange to cancel (matched against DB & Prefix)."
+            )
+
+            for order_data in orders_to_cancel:
+                order_id = order_data["id"]
+                try:
+                    await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
+                    self.logger.info(f"✅ Cancelled order {order_id}")
+
+                    # Update DB to keep it consistent
+                    self.db.update_order_status(order_id, "CANCELLED")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Failed to cancel {order_id}: {e}")
+
+            # 4. Final DB Cleanup (Force mark all 'OPEN' as 'CANCELLED' in DB to remove zombies)
+            # Even if exchange didn't return them (maybe they closed 1ms ago), we shouldn't think they are open.
+            # Rrefetch active orders to see what's left
+            remaining_db_orders = self.db.get_all_active_orders(self.bot_id)
+            if remaining_db_orders:
+                self.logger.info(f"🧹 Cleanup: Marking {len(remaining_db_orders)} local DB orders as CANCELLED.")
+                for oid in remaining_db_orders.keys():
+                    self.db.update_order_status(oid, "CANCELLED")
+
+        except Exception as e:
+            self.logger.error(f"❌ Critical Error during cancel_all_open_orders: {e}", exc_info=True)
 
     async def liquidate_positions(self, current_price: float) -> None:
         crypto_balance = self.balance_tracker.crypto_balance
@@ -670,3 +747,42 @@ class OrderManager:
                         self.logger.warning(f"⚠️ Profit Sync Failed: {response.status}")
         except Exception as e:
             self.logger.error(f"❌ Error syncing profit: {e}")
+
+    async def force_nuclear_cleanup(self) -> None:
+        """
+        ☢️ NUCLEAR OPTION: Cancels ALL open orders for this trading pair on the account.
+        Ignores Bot ID, prefixes, or DB records.
+        Used only for explicit Bot Deletion to ensure a completely clean slate.
+        """
+        self.logger.warning(f"☢️ NUCLEAR CLEANUP TRIGGERED for {self.trading_pair}. Wiping EVERYTHING.")
+
+        try:
+            # 1. Fetch EVERYTHING
+            open_orders = await self.order_execution_strategy.exchange_service.fetch_open_orders(self.trading_pair)
+
+            if not open_orders:
+                self.logger.info("✅ Nuclear Cleanup Verified: 0 Open Orders found.")
+                # Ensure DB is wiped too
+                if self.bot_id:
+                    self.db.clear_all_orders(self.bot_id)
+                return
+
+            self.logger.info(f"☢️ Found {len(open_orders)} orders to wipe. Proceeding...")
+
+            # 2. Cancel EVERYTHING
+            for order in open_orders:
+                order_id = order["id"]
+                try:
+                    await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
+                    self.logger.info(f"💥 Nuclear: Cancelled {order_id}")
+                except Exception as e:
+                    self.logger.error(f"Failed to nuke order {order_id}: {e}")
+
+            # 3. Wipe DB
+            if self.bot_id:
+                self.db.clear_all_orders(self.bot_id)
+
+            self.logger.info("✅ Nuclear Cleanup Complete.")
+
+        except Exception as e:
+            self.logger.error(f"Nuclear Cleanup Failed: {e}", exc_info=True)

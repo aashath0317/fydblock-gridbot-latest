@@ -178,12 +178,12 @@ class GridTradingBot:
         self.logger.info(f"Handling START_BOT event: {reason}")
         await self.restart()
 
-    async def _stop(self, sell_assets: bool = False) -> None:
+    async def _stop(self, sell_assets: bool = False, cancel_orders: bool = True) -> None:
         if not self.is_running:
             self.logger.info("Bot is not running. Nothing to stop.")
             return
 
-        self.logger.info("Stopping Grid Trading Bot...")
+        self.logger.info(f"Stopping Grid Trading Bot... (Cancel Orders: {cancel_orders})")
 
         try:
             # --- FIX: Kill the Integrity Watchdog FIRST ---
@@ -199,11 +199,14 @@ class GridTradingBot:
             self.is_running = False
             await self.order_status_tracker.stop_tracking()
 
-            # Cancel orders (Clean up exchange)
-            # Safe because OrderManager checks DB for ownership
-            await self.strategy.order_manager.cancel_all_open_orders()
+            # Cancel orders (Clean up exchange) if requested
+            if cancel_orders:
+                self.logger.info("🛑 Stopping: Force-cancelling confirmed open orders...")
+                await self.strategy.order_manager.cancel_all_open_orders()
+            else:
+                self.logger.info("⏸️ Soft Stop: Leaving orders active on exchange for resume.")
 
-            await self.strategy.stop(sell_assets=sell_assets)
+            await self.strategy.stop(sell_assets=sell_assets, cancel_orders=cancel_orders)
 
         except Exception as e:
             self.logger.error(f"Error while stopping components: {e}", exc_info=True)

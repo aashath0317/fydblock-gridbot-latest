@@ -14,13 +14,22 @@ class BotDatabase:
         cursor = conn.cursor()
 
         # 1. Bots Table (Persistence)
+        # Added config_json column for restart recovery
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bots (
                 bot_id INTEGER PRIMARY KEY,
                 status TEXT DEFAULT 'STOPPED',
+                config_json TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Schema Migration: Add config_json to existing table if missing
+        try:
+            cursor.execute("ALTER TABLE bots ADD COLUMN config_json TEXT")
+        except sqlite3.OperationalError:
+            # Column likely already exists
+            pass
 
         # 2. Grid Orders Table
         # We enforce a UNIQUE constraint on (bot_id, price, status)
@@ -158,20 +167,38 @@ class BotDatabase:
             conn.close()
 
     # --- Bot Status Persistence ---
-    def update_bot_status(self, bot_id: int, status: str):
-        """Updates the persistent status of a bot."""
+    def update_bot_status(self, bot_id: int, status: str, config_json: str | None = None):
+        """
+        Updates the persistent status of a bot.
+        Optionally updates config_json (used on Start).
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         try:
-            # Upsert logic (Insert or Replace)
-            cursor.execute(
-                """
-                INSERT INTO bots (bot_id, status, updated_at) 
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(bot_id) DO UPDATE SET status=excluded.status, updated_at=CURRENT_TIMESTAMP
-            """,
-                (bot_id, status),
-            )
+            if config_json:
+                cursor.execute(
+                    """
+                    INSERT INTO bots (bot_id, status, config_json, updated_at) 
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(bot_id) DO UPDATE SET 
+                        status=excluded.status, 
+                        config_json=excluded.config_json,
+                        updated_at=CURRENT_TIMESTAMP
+                """,
+                    (bot_id, status, config_json),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO bots (bot_id, status, updated_at) 
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(bot_id) DO UPDATE SET 
+                        status=excluded.status, 
+                        updated_at=CURRENT_TIMESTAMP
+                """,
+                    (bot_id, status),
+                )
+
             conn.commit()
             self.logger.info(f"🔄 DB: Bot {bot_id} status updated to {status}")
         except Exception as e:
@@ -187,6 +214,15 @@ class BotDatabase:
         result = cursor.fetchone()
         conn.close()
         return result[0] if result else "STOPPED"
+
+    def get_bot_config(self, bot_id: int) -> str | None:
+        """Returns the persistent config JSON of a bot."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT config_json FROM bots WHERE bot_id = ?", (bot_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
 
     # --- System Logs Methods ---
     def log_event(self, bot_id: int, severity: str, message: str, fix_action: str = None):

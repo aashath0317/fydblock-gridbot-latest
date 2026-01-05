@@ -66,7 +66,7 @@ class GridTradingStrategy(TradingStrategyInterface):
     def initialize_strategy(self):
         self.grid_manager.initialize_grids_and_levels()
 
-    async def stop(self, sell_assets: bool = False):
+    async def stop(self, sell_assets: bool = False, cancel_orders: bool = True):
         self._running = False
 
         if sell_assets and self.trading_mode != TradingMode.BACKTEST:
@@ -76,6 +76,7 @@ class GridTradingStrategy(TradingStrategyInterface):
                 current_price = await self.exchange_service.get_current_price(self.trading_pair)
 
                 # 2. Cancel all pending grid orders (Releases locked funds)
+                # Note: Emergency stop implies we MUST cancel orders to liquidate.
                 await self.order_manager.cancel_all_open_orders()
 
                 # 3. SYNC BALANCE (Crucial Fix)
@@ -166,6 +167,16 @@ class GridTradingStrategy(TradingStrategyInterface):
             self._running = False
             return
         # -----------------------------------
+
+        # --- SMART RESUME (HOT BOOT) ---
+        # FIX: Check if we have active orders in DB. If so, enable hot_boot to Resume instead of Wipe.
+        if self.order_manager.has_active_orders():
+            self.logger.info("🔥 Found active orders in Database. Enabling Smart Resume (Hot Boot).")
+            self.use_hot_boot = True
+        else:
+            self.logger.info("✨ No active orders found. Proceeding with Clean Start.")
+            self.use_hot_boot = False
+        # -------------------------------
 
         last_price: float | None = None
         grid_orders_initialized = False

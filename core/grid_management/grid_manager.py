@@ -167,6 +167,32 @@ class GridManager:
             else:
                 self.logger.info(f"   Skipping state update for busy grid {price} (State: {grid_level.state})")
 
+        # 4. FIX: Enforce Absolute Max Order Count
+        # If we have N grids, we should have at most (N-1) pending orders.
+        # If total > max, we suppress the grid closest to current_price.
+        total_active_orders = len(self.sorted_buy_grids) + len(self.sorted_sell_grids)
+        max_allowed_orders = len(self.price_grids) - 1
+
+        if total_active_orders > max_allowed_orders:
+            self.logger.warning(
+                f"?? Extra Order Detected! Total: {total_active_orders}, Max: {max_allowed_orders}. "
+                f"Suppressing closest grid to price {current_price}."
+            )
+
+            # Combine all candidate grids
+            all_candidates = self.sorted_buy_grids + self.sorted_sell_grids
+
+            # Find closest
+            closest_grid = min(all_candidates, key=lambda p: abs(p - current_price))
+
+            # Remove from respective list
+            if closest_grid in self.sorted_buy_grids:
+                self.sorted_buy_grids.remove(closest_grid)
+                self.logger.info(f"   -> Removed {closest_grid} from BUY candidates.")
+            elif closest_grid in self.sorted_sell_grids:
+                self.sorted_sell_grids.remove(closest_grid)
+                self.logger.info(f"   -> Removed {closest_grid} from SELL candidates.")
+
         self.logger.info(f"   ? New Buy Grids: {len(self.sorted_buy_grids)}")
         self.logger.info(f"   ? New Sell Grids: {len(self.sorted_sell_grids)}")
 
