@@ -9,16 +9,31 @@ from pydantic import BaseModel, Field
 
 from config.config_validator import ConfigValidator
 from core.bot_management.event_bus import EventBus
-from core.storage.bot_database import BotDatabase
-
 from core.bot_management.grid_trading_bot import GridTradingBot
 from core.bot_management.notification.notification_handler import NotificationHandler
 from core.services.exchange_service_factory import ExchangeServiceFactory
-from core.order_handling.order import OrderSide
+from core.storage.bot_database import BotDatabase
+
 
 # --- Logging Setup ---
+class DuplicateLogFilter(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self.last_log = None
+
+    def filter(self, record):
+        current_log = (record.msg, record.args)
+        if current_log == self.last_log:
+            return False
+        self.last_log = current_log
+        return True
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("FydEngine")
+
+# Apply filter to uvicorn.error to suppress repetitive "Invalid HTTP request received"
+logging.getLogger("uvicorn.error").addFilter(DuplicateLogFilter())
 
 # Store active bots: { bot_id: { "bot": GridTradingBot, "task": asyncio.Task } }
 active_instances: dict[int, dict[str, Any]] = {}
@@ -84,8 +99,8 @@ def create_config(exchange, pair, api_key, api_secret, passphrase, mode, strateg
     }
 
 
-from core.logging.db_logger import DBLoggingHandler
 from core.health_monitor import HealthMonitor
+from core.logging.db_logger import DBLoggingHandler
 
 # --- Persistent State Manager ---
 db = BotDatabase()
@@ -455,7 +470,7 @@ async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotReques
 
             except Exception as e:
                 logger.error(f"Offline Liquidation Failed: {e}", exc_info=True)
-                liq_msg = f"Failed: {str(e)}"
+                liq_msg = f"Failed: {e!s}"
 
         return {"status": "deleted", "message": "Bot marked DELETED.", "offline_liquidation": liq_msg}
 
@@ -474,6 +489,80 @@ async def health_system():
 async def get_bot_logs(bot_id: int, limit: int = 50):
     logs = db.get_logs(bot_id, limit)
     return {"logs": logs}
+
+
+@app.get("/allocations")
+async def get_allocations(mode: str = "live"):
+    """
+    Returns the total funds currently allocated/reserved by ACTIVE bots.
+    Used by the backend to calculate precise Available Balance.
+    """
+    try:
+        # Normalize mode string to match TradingMode enum values
+        target_mode = mode
+        if mode == "paper":
+            target_mode = "paper_trading"
+
+        logger.info(f"🔍 /allocations called with mode='{mode}' -> target='{target_mode}'")
+        logger.info(f"   Active Instances: {len(active_instances)}")
+
+        allocations = {}
+
+        for bot_id, instance in active_instances.items():
+            bot = instance["bot"]
+            b_mode = bot.trading_mode.value
+
+            # Filter by mode
+            if b_mode != target_mode:
+                # logger.info(f"   Skipping Bot {bot_id} (Mode: {b_mode})")
+                continue
+
+            try:
+                # Get Bot Balances (Free + Reserved)
+                bals = bot.get_balances()
+                # { "fiat": 100, "reserved_fiat": 50, "crypto": 0.1, "reserved_crypto": 0.2 }
+
+                # Identify Currencies from pair
+                pair = bot.trading_pair  # e.g. "SOL/USDT"
+                base, quote = pair.split("/")
+
+                # Fiat/Quote Breakdown
+                q_idle = bals.get("fiat", 0.0)
+                q_locked = bals.get("reserved_fiat", 0.0)
+                q_total = q_idle + q_locked
+
+                # Crypto/Base Breakdown
+                b_idle = bals.get("crypto", 0.0)
+                b_locked = bals.get("reserved_crypto", 0.0)
+                b_total = b_idle + b_locked
+
+                logger.info(
+                    f"   Bot {bot_id} ({pair}): Quote total={q_total}(idle={q_idle}), Base total={b_total}(idle={b_idle})"
+                )
+
+                # Initialize Structure if needed
+                if quote not in allocations:
+                    allocations[quote] = {"total": 0.0, "idle": 0.0}
+                if base not in allocations:
+                    allocations[base] = {"total": 0.0, "idle": 0.0}
+
+                # Aggregate Quote (e.g. USDT)
+                allocations[quote]["total"] += q_total
+                allocations[quote]["idle"] += q_idle
+
+                # Aggregate Base (e.g. SOL)
+                allocations[base]["total"] += b_total
+                allocations[base]["idle"] += b_idle
+
+            except Exception as e:
+                logger.error(f"Error calculating allocation for bot {bot_id}: {e}")
+
+        logger.info(f"   ✅ Final Allocations: {allocations}")
+        return allocations
+
+    except Exception as e:
+        logger.error(f"Failed handling /allocations: {e}", exc_info=True)
+        return {}
 
 
 @app.post("/backtest")

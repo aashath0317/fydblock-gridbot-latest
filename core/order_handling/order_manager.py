@@ -449,12 +449,20 @@ class OrderManager:
                             elif verified_order.status == OrderStatus.CANCELED:
                                 self.logger.info(f"ℹ️ Found missing order {order_id} as CANCELED. syncing...")
                                 await self._on_order_cancelled(verified_order)
-                            else:
                                 # It exists but not Open/Closed/Canceled? Weird. Assume closed if not in open list.
-                                self.logger.warning(
-                                    f"Order {order_id} status is {verified_order.status} but not in open list. Marking CLOSED_UNKNOWN."
-                                )
-                                self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
+                                # FIX: Do not mark CLOSED_UNKNOWN if status is valid (OPEN/PARTIALLY_FILLED).
+                                if verified_order.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]:
+                                    self.logger.debug(
+                                        f"Order {order_id} is {verified_order.status} on exchange but missing from open list. "
+                                        f"Trusting specific fetch and keeping it alive."
+                                    )
+                                    # Ideally we should re-add it to our open list if missing?
+                                    # But for now, just don't kill it.
+                                else:
+                                    self.logger.warning(
+                                        f"Order {order_id} status is {verified_order.status} but not in open list. Marking CLOSED_UNKNOWN."
+                                    )
+                                    self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
                         else:
                             # returned None
                             self.logger.warning(f"Order {order_id} returned None from fetch. Marking CLOSED_UNKNOWN.")
@@ -473,79 +481,83 @@ class OrderManager:
         # Dynamic Dead Zone: Use the GridManager's logic
         safe_buy_limit, safe_sell_limit = self.grid_manager.get_dead_zone_thresholds(current_price)
 
+        # Balance Check Limits (soft check only needed later)
+        # We don't block the loop on this anymore.
+
+        # Dynamic Dead Zone: Use the GridManager's logic
+        safe_buy_limit, safe_sell_limit = self.grid_manager.get_dead_zone_thresholds(current_price)
+
         # Check BUY Grids
-        if has_fiat:
-            for price in self.grid_manager.sorted_buy_grids:
-                if price >= safe_buy_limit:
-                    continue
+        for price in self.grid_manager.sorted_buy_grids:
+            if price >= safe_buy_limit:
+                continue
 
-                # Check DB first
-                if self.bot_id and self.db.get_active_order_at_price(self.bot_id, price):
-                    continue
+            # Check DB first
+            if self.bot_id and self.db.get_active_order_at_price(self.bot_id, price):
+                continue
 
-                # Check Exchange (Secondary)
-                is_active = any(
-                    math.isclose(p, price, rel_tol=1e-3) for p in [float(o["price"]) for o in exchange_orders]
+            # Check Exchange (Secondary)
+            is_active = any(math.isclose(p, price, rel_tol=1e-3) for p in [float(o["price"]) for o in exchange_orders])
+            if is_active:
+                continue
+
+            # --- FUND CHECK MOVED HERE ---
+            # Only check funds if we actually NEED to place an order
+            if not has_fiat:
+                self.logger.debug(f"Skipping BUY at {price}: No Fiat (Throttle Log)")
+                # If we have 0 fiat and no order, we can't do anything. Stop this loop cycle.
+                break
+
+            # Check for Dust/Insufficient Funds per order
+            total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
+            raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+            required_value = raw_quantity * price
+
+            if not self.balance_tracker.attempt_fee_recovery(required_value * 0.95):
+                self.logger.warning(
+                    f"Skipping BUY reconciliation for level {price}: Insufficient funds "
+                    f"(Available: {self.balance_tracker.balance:.2f}, Required: {required_value:.2f})"
                 )
-                if is_active:
-                    continue
+                continue
+            # -----------------------------
 
-                # --- FIX: Check for Dust/Insufficient Funds ---
-                total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
-                raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
-                required_value = raw_quantity * price
-
-                # 5% tolerance to avoid skipping due to tiny fee mismatches, but prevent massive partial "dust" fills
-                # FIX: Use BalanceTracker's attempt_fee_recovery to auto-heal "dust" shortfalls
-                if not self.balance_tracker.attempt_fee_recovery(required_value * 0.95):
-                    self.logger.warning(
-                        f"Skipping BUY reconciliation for level {price}: Insufficient funds "
-                        f"(Available: {self.balance_tracker.balance:.2f}, Required: {required_value:.2f})"
-                    )
-                    continue
-                # ----------------------------------------------
-
-                success = await self._place_limit_order_safe(price, OrderSide.BUY)
-                if not success:
-                    break
-        else:
-            self.logger.info("ℹ️ Skipping Buy Recovery: Insufficient Fiat.")
+            success = await self._place_limit_order_safe(price, OrderSide.BUY)
+            if not success:
+                break
 
         # Check SELL Grids
-        if has_crypto:
-            for price in self.grid_manager.sorted_sell_grids:
-                if price <= safe_sell_limit:
-                    continue
+        for price in self.grid_manager.sorted_sell_grids:
+            if price <= safe_sell_limit:
+                continue
 
-                if self.bot_id and self.db.get_active_order_at_price(self.bot_id, price):
-                    continue
+            if self.bot_id and self.db.get_active_order_at_price(self.bot_id, price):
+                continue
 
-                is_active = any(
-                    math.isclose(p, price, rel_tol=1e-3) for p in [float(o["price"]) for o in exchange_orders]
+            is_active = any(math.isclose(p, price, rel_tol=1e-3) for p in [float(o["price"]) for o in exchange_orders])
+            if is_active:
+                continue
+
+            # --- FUND CHECK MOVED HERE ---
+            if not has_crypto:
+                self.logger.debug(f"Skipping SELL at {price}: No Crypto (Throttle Log)")
+                break
+
+            # Check for Dust/Insufficient Funds
+            total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
+            raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+            required_crypto = raw_quantity
+
+            if self.balance_tracker.crypto_balance < (required_crypto * 0.95):
+                self.logger.warning(
+                    f"Skipping SELL reconciliation for level {price}: Insufficient crypto "
+                    f"(Available: {self.balance_tracker.crypto_balance:.4f}, Required: {required_crypto:.4f})"
                 )
-                if is_active:
-                    continue
+                continue
+            # ------------------------------
 
-                # --- FIX: Check for Dust/Insufficient Funds ---
-                total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
-                raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
-
-                # For SELL, the "value" needed is the crypto amount itself
-                required_crypto = raw_quantity
-
-                if self.balance_tracker.crypto_balance < (required_crypto * 0.95):
-                    self.logger.warning(
-                        f"Skipping SELL reconciliation for level {price}: Insufficient crypto "
-                        f"(Available: {self.balance_tracker.crypto_balance:.4f}, Required: {required_crypto:.4f})"
-                    )
-                    continue
-                # ----------------------------------------------
-
-                success = await self._place_limit_order_safe(price, OrderSide.SELL)
-                if not success:
-                    break
-        else:
-            self.logger.info("ℹ️ Skipping Sell Recovery: Insufficient Crypto.")
+            success = await self._place_limit_order_safe(price, OrderSide.SELL)
+            if not success:
+                break
 
     # --- Misc Methods ---
 
@@ -677,9 +689,14 @@ class OrderManager:
             orders_to_cancel = []
             prefix = f"G_{self.bot_id}_"
 
+            # Create a set of strict grid prices for orphan matching
+            # We use a small tolerance for float comparison
+            active_grid_prices = set(self.grid_manager.grid_levels.keys())
+
             for o in exchange_orders:
                 oid = o["id"]
                 client_oid = o.get("clientOrderId", "")
+                price = float(o.get("price", 0.0))
 
                 # Match A: ID is in our DB
                 if oid in db_order_ids:
@@ -691,8 +708,24 @@ class OrderManager:
                     orders_to_cancel.append(o)
                     continue
 
+                # Match C: Orphaned Grid Match (Price matches a Grid Level)
+                # This catches orders from a previous run where DB was lost/cleared but orders remain on exchange
+                # Tolerance: 0.1% or similar
+                # Only if we are fairly sure it's ours.
+                # FIX: Check if price matches ANY grid level we currently care about.
+                matched_grid = False
+                for gp in active_grid_prices:
+                    if abs(price - gp) / gp < 0.001:  # 0.1% tolerance
+                        matched_grid = True
+                        break
+
+                if matched_grid:
+                    self.logger.warning(f"🧟 Found POTENTIAL ORPHAN order {oid} at {price}. Marking for cleanup.")
+                    orders_to_cancel.append(o)
+                    continue
+
             self.logger.info(
-                f"🔎 Found {len(orders_to_cancel)} active orders on exchange to cancel (matched against DB & Prefix)."
+                f"🔎 Found {len(orders_to_cancel)} active orders on exchange to cancel (DB, Prefix, or Orphan Match)."
             )
 
             for order_data in orders_to_cancel:

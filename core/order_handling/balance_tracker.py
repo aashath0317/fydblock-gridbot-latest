@@ -139,7 +139,7 @@ class BalanceTracker:
 
                 # Log only if there's a significant drift
                 if abs(new_fiat - self.balance) > 1.0 or abs(new_crypto - self.crypto_balance) > 0.01:
-                    self.logger.info(
+                    self.logger.debug(
                         f"⚖️ Balance Synced: {self.balance:.2f} -> {new_fiat:.2f} {self.quote_currency} "
                         f"(Wallet Free: {free_fiat:.2f}, Total Crypto Val: {crypto_equity_value:.2f}) | "
                         f"{self.crypto_balance:.4f} -> {new_crypto:.4f} {self.base_currency}"

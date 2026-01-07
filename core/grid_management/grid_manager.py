@@ -19,6 +19,9 @@ class GridManager:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.config_manager: ConfigManager = config_manager
         self.strategy_type: StrategyType = strategy_type
+
+        # Inject bot_id if available in config, needed for DB persistence
+        self.bot_id = self.config_manager.config.get("bot_id")
         self.price_grids: list[float]
         self.central_price: float
         self.sorted_buy_grids: list[float]
@@ -81,13 +84,30 @@ class GridManager:
             self.grid_levels = {
                 price: GridLevel(
                     price,
-                    GridCycleState.READY_TO_BUY_OR_SELL
-                    if price != self.price_grids[-1]
-                    else GridCycleState.READY_TO_SELL,
                 )
                 for price in self.price_grids
             }
+
+        # 4. FIX: Enforce Absolute Max Order Count (Startup)
+        max_allowed_orders = self.config_manager.get_num_grids()
+        if not max_allowed_orders or max_allowed_orders < 1:
+            max_allowed_orders = len(self.price_grids) - 1
+
+        while (len(self.sorted_buy_grids) + len(self.sorted_sell_grids)) > max_allowed_orders:
+            # Strategies to remove excess orders:
+            # Remove furthest from central price (initial state).
+            all_candidates = self.sorted_buy_grids + self.sorted_sell_grids
+            furthest_grid = max(all_candidates, key=lambda p: abs(p - self.central_price))
+
+            if furthest_grid in self.sorted_buy_grids:
+                self.sorted_buy_grids.remove(furthest_grid)
+            elif furthest_grid in self.sorted_sell_grids:
+                self.sorted_sell_grids.remove(furthest_grid)
+
+            self.logger.info(f"Startup: Trimming excess grid {furthest_grid} to match limit {max_allowed_orders}")
+
         self.logger.info(f"Grids and levels initialized. Central price: {self.central_price}")
+        self.logger.info(f"Final Count: {len(self.sorted_buy_grids)} Buys, {len(self.sorted_sell_grids)} Sells")
 
     def get_dead_zone_thresholds(self, current_price: float) -> tuple[float, float]:
         """
@@ -122,34 +142,46 @@ class GridManager:
         threshold_margin = gap / 2.0
         return current_price - threshold_margin, current_price + threshold_margin
 
-    def update_zones_based_on_price(self, current_price: float) -> None:
+    def update_zones_based_on_price(self, current_price: float):
         """
         Re-aligns the Buy/Sell zones based on the actual Current Market Price.
-        FIX: Ensures we do not overwrite states of active/busy grids.
-        NOW INCLUDES Dynamic DEAD ZONE around current price.
+        Triggers Smart Trailing if price exits the grid range.
         """
         if self.strategy_type != StrategyType.SIMPLE_GRID:
             return
 
         self.logger.info(f"?? Re-aligning grid zones to Current Price: {current_price}")
 
+        # 1. Smart Trailing Check
+        lowest_grid = min(self.price_grids)
+        highest_grid = max(self.price_grids)
+
+        if current_price < lowest_grid:
+            self.trail_grid_down(current_price)
+            return  # Re-init happens inside, so we exit this cycle
+
+        if current_price > highest_grid:
+            self.trail_grid_up(current_price)
+            return
+
+        # 2. Normal Zone Update
         self.sorted_buy_grids = []
         self.sorted_sell_grids = []
 
         # Dynamic Buffer Thresholds
-        buy_threshold, sell_threshold = self.get_dead_zone_thresholds(current_price)
-        self.logger.info(f"   Dead Zone: {buy_threshold:.4f} - {sell_threshold:.4f}")
+        safe_buy_limit, safe_sell_limit = self.get_dead_zone_thresholds(current_price)
+        self.logger.info(f"   Dead Zone: {safe_buy_limit:.4f} - {safe_sell_limit:.4f}")
 
         for price in self.price_grids:
             grid_level = self.grid_levels[price]
 
             # 1. Determine Zone
-            if price <= buy_threshold:
+            if price <= safe_buy_limit:
                 # Clearly in Buy Zone
                 self.sorted_buy_grids.append(price)
                 ideal_state = GridCycleState.READY_TO_BUY
 
-            elif price >= sell_threshold:
+            elif price >= safe_sell_limit:
                 # Clearly in Sell Zone
                 self.sorted_sell_grids.append(price)
                 ideal_state = GridCycleState.READY_TO_SELL
@@ -168,30 +200,24 @@ class GridManager:
                 self.logger.info(f"   Skipping state update for busy grid {price} (State: {grid_level.state})")
 
         # 4. FIX: Enforce Absolute Max Order Count
-        # If we have N grids, we should have at most (N-1) pending orders.
-        # If total > max, we suppress the grid closest to current_price.
-        total_active_orders = len(self.sorted_buy_grids) + len(self.sorted_sell_grids)
-        max_allowed_orders = len(self.price_grids) - 1
+        # This must be done AFTER the loop has populated all candidates.
+        max_allowed_orders = self.config_manager.get_num_grids()
 
-        if total_active_orders > max_allowed_orders:
-            self.logger.warning(
-                f"?? Extra Order Detected! Total: {total_active_orders}, Max: {max_allowed_orders}. "
-                f"Suppressing closest grid to price {current_price}."
-            )
+        if not max_allowed_orders or max_allowed_orders < 1:
+            max_allowed_orders = len(self.price_grids) - 1
 
-            # Combine all candidate grids
+        while (len(self.sorted_buy_grids) + len(self.sorted_sell_grids)) > max_allowed_orders:
+            # Strategies to remove excess orders:
+            # Remove furthest from current price.
             all_candidates = self.sorted_buy_grids + self.sorted_sell_grids
+            furthest_grid = max(all_candidates, key=lambda p: abs(p - current_price))
 
-            # Find closest
-            closest_grid = min(all_candidates, key=lambda p: abs(p - current_price))
+            if furthest_grid in self.sorted_buy_grids:
+                self.sorted_buy_grids.remove(furthest_grid)
+            elif furthest_grid in self.sorted_sell_grids:
+                self.sorted_sell_grids.remove(furthest_grid)
 
-            # Remove from respective list
-            if closest_grid in self.sorted_buy_grids:
-                self.sorted_buy_grids.remove(closest_grid)
-                self.logger.info(f"   -> Removed {closest_grid} from BUY candidates.")
-            elif closest_grid in self.sorted_sell_grids:
-                self.sorted_sell_grids.remove(closest_grid)
-                self.logger.info(f"   -> Removed {closest_grid} from SELL candidates.")
+            # self.logger.info(f"DEBUG: Removed excess grid {furthest_grid} to offset count.")
 
         self.logger.info(f"   ? New Buy Grids: {len(self.sorted_buy_grids)}")
         self.logger.info(f"   ? New Sell Grids: {len(self.sorted_sell_grids)}")
@@ -438,96 +464,119 @@ class GridManager:
 
         return grids, central_price
 
-    def reset_grid_up(self, current_price: float):
+    def trail_grid_up(self, current_price: float):
         """
-        Auto-Tuner Logic 1: Reset Up (Bullish Breakout).
-        Centers the new grid around the current price, maintaining original density and range %.
+        Smart Trailing Logic: Shift the ENTIRE grid window UP.
+        Maintains the same number of grids and spacing/ratio.
         """
-        self.logger.info(f"?? AUTO-TUNER: Resetting Grid UP around {current_price}")
+        self.logger.info(f"🚀 TRAILING UP: Shifting grid window UP to cover {current_price}")
 
         old_bottom, old_top, num_grids, spacing_type = self._extract_grid_config()
 
-        # Calculate Range Percentage (approximate from old settings)
-        range_percent = (old_top - old_bottom) / old_bottom
+        if spacing_type == SpacingType.ARITHMETIC:
+            # Shift by one grid interval? Or shift such that current price is inside?
+            # Standard trailing: Top moves up, Bottom moves up.
+            # We calculate the Shift Amount needed.
+            # If we just want to expand, that's different.
+            # "Trail Up" usually means following the price.
+            # Let's shift so that the NEW Top is slightly above current price?
+            # Or just Add 1 Grid to Top and Remove 1 from Bottom?
+            grid_gap = (old_top - old_bottom) / num_grids
+            new_bottom = old_bottom + grid_gap
+            new_top = old_top + grid_gap
 
-        # New Center is Current Price.
-        # We assume the user wants the same 'spread' relative to the new price.
-        # Simple Logic: Maintain +/- half of the range percent around the current price?
-        # OR: Shift the entire bracket up?
-        # SRS says: "Center the new grid around the current price. Calculate new Upper and Lower limits based on original Risk Percentage."
+            # Consistency check: Ensure current_price is within (new_bottom, new_top) roughly?
+            # If price jumped massively, one shift might not be enough.
+            # Recursively shift? Or calculate target.
+            if current_price > new_top:
+                # Big jump: Shift window to center? No, user said "Trail".
+                # Let's shift enough steps.
+                steps = int((current_price - old_top) / grid_gap) + 1
+                new_bottom = old_bottom + (grid_gap * steps)
+                new_top = old_top + (grid_gap * steps)
 
-        # Let's infer "Risk Percentage" as the spread from Center to Top/Bottom.
-        # Or simpler: Preserve the ratio (Top/Bottom) if Geometric.
+        else:  # GEOMETRIC
+            # Ratio = (Top/Bottom)^(1/N)
+            ratio = (old_top / old_bottom) ** (1 / num_grids)
+            new_bottom = old_bottom * ratio
+            new_top = old_top * ratio
 
-        if spacing_type == SpacingType.GEOMETRIC:
-            # Preserve ratio width
-            ratio_width = old_top / old_bottom
-            # Geometric Center (roughly) ~ sqrt(Top * Bottom)
-            # We want current_price to be the new geometric mean?
-            # Let's derive new limits such that current_price is in the middle.
-            # New Bottom = Current / sqrt(Ratio)
-            # New Top = Current * sqrt(Ratio)
-            half_ratio = ratio_width**0.5
-            new_bottom = current_price / half_ratio
-            new_top = current_price * half_ratio
-        else:
-            # Arithmetic: Preserve absolute spread or percentage? SRS says Risk PERCENTAGE.
-            # Let's use percentage of price.
-            half_spread_percent = range_percent / 2
-            new_bottom = current_price * (1 - half_spread_percent)
-            new_top = current_price * (1 + half_spread_percent)
+            if current_price > new_top:
+                # Calculate needed steps
+                # top * (ratio^steps) >= current
+                # ratio^steps >= current/top
+                # steps * ln(ratio) >= ln(current/top)
+                import math
+
+                steps = math.ceil(math.log(current_price / old_top) / math.log(ratio))
+                multiplier = ratio**steps
+                new_bottom = old_bottom * multiplier
+                new_top = old_top * multiplier
 
         self.logger.info(f"   New Range: {new_bottom:.4f} - {new_top:.4f}")
+        self._update_and_persist_config(new_bottom, new_top)
+        self.initialize_grids_and_levels()
 
-        # Update Config Manager (In-Memory Override)
-        # NOTE: This assumes ConfigManager has setters or we can update the config dict it holds.
-        # Since ConfigManager reads from a dict usually, we should update that source.
-        # For now, we update the manager's state if possible, or re-init logic.
-        # Since we don't have direct setters in ConfigManager from the snippet,
-        # we might need to rely on the Strategy updating the ConfigManager's internal config.
-        # Assuming ConfigManager.update_config() exists or we add it.
-        # We will assume we can update the config values here via a helper or direct access if strict.
+    def trail_grid_down(self, current_price: float):
+        """
+        Smart Trailing Logic: Shift the ENTIRE grid window DOWN.
+        """
+        self.logger.info(f"📉 TRAILING DOWN: Shifting grid window DOWN to cover {current_price}")
 
-        # *CRITICAL*: The Plan says "Calculated new Upper and Lower limits".
-        # We need to apply these to the bot.
+        old_bottom, old_top, num_grids, spacing_type = self._extract_grid_config()
+
+        if spacing_type == SpacingType.ARITHMETIC:
+            grid_gap = (old_top - old_bottom) / num_grids
+            new_bottom = old_bottom - grid_gap
+            new_top = old_top - grid_gap
+
+            if current_price < new_bottom:
+                steps = int((old_bottom - current_price) / grid_gap) + 1
+                new_bottom = old_bottom - (grid_gap * steps)
+                new_top = old_top - (grid_gap * steps)
+
+        else:  # GEOMETRIC
+            ratio = (old_top / old_bottom) ** (1 / num_grids)
+            new_bottom = old_bottom / ratio
+            new_top = old_top / ratio
+
+            if current_price < new_bottom:
+                import math
+
+                # bottom / (ratio^steps) <= current
+                # bottom/current <= ratio^steps
+                steps = math.ceil(math.log(old_bottom / current_price) / math.log(ratio))
+                divisor = ratio**steps
+                new_bottom = old_bottom / divisor
+                new_top = old_top / divisor
+
+        self.logger.info(f"   New Range: {new_bottom:.4f} - {new_top:.4f}")
+        self._update_and_persist_config(new_bottom, new_top)
+        self.initialize_grids_and_levels()
+
+    def _update_and_persist_config(self, new_bottom: float, new_top: float):
+        """
+        Updates the in-memory config and persists it to the DB.
+        """
+        # 1. Update ConfigManager state
         self.config_manager.config["grid_strategy"]["range"]["top"] = new_top
         self.config_manager.config["grid_strategy"]["range"]["bottom"] = new_bottom
 
-        # Re-initialize
-        self.initialize_grids_and_levels()
+        # 2. Persist to DB
+        if hasattr(self, "bot_id") and self.bot_id:
+            # Need to access BotDatabase.
+            # GridManager doesn't natively have BotDatabase access in __init__,
+            # but OrderManager does. Or we can instantiate it purely for storage.
+            # Better: GridManager should perhaps rely on OrderManager?
+            # Or just allow GridManager to initiate a DB connection for this persistence event.
+            import json
 
-    def expand_grid_down(self, current_price: float):
-        """
-        Auto-Tuner Logic 2: Expand Down (Bearish Drop).
-        Expands lower limit, keeps upper limit, reduces density (same grid count, wider range).
-        """
-        self.logger.info(f"?? AUTO-TUNER: Expanding Grid DOWN to cover {current_price}")
+            from core.storage.bot_database import BotDatabase
 
-        old_bottom, old_top, num_grids, spacing_type = self._extract_grid_config()
+            db = BotDatabase()
 
-        # "Lower Limit: Calculate new bottom using formula: Current Price - (Current Price * Risk%)"
-        # Since we don't have "Risk%" explicitly stored, let's assume a default safe margin,
-        # or infer it from adjacent grids.
-        # Let's use a 5-10% buffer below current price to catch the knife.
-        # SRS: "Force a 5% drop from the Old Lower Limit to ensure the grid expands significantly."
-
-        proposed_bottom = current_price * 0.95  # 5% below current price logic?
-        # SRS says: "Validation: If Calculated New Lower Limit >= Old Lower Limit, force 5% drop from Old Lower Limit."
-
-        # Let's define Risk% as 5% for the expansion buffer.
-        risk_buffer = 0.05
-        calc_bottom = current_price * (1 - risk_buffer)
-
-        if calc_bottom >= old_bottom:
-            new_bottom = old_bottom * (1 - risk_buffer)
-        else:
-            new_bottom = calc_bottom
-
-        self.logger.info(f"   New Bottom: {new_bottom:.4f} (Top remains {old_top:.4f})")
-
-        # Update Config
-        self.config_manager.config["grid_strategy"]["range"]["bottom"] = new_bottom
-        # Top remains same. Grid count remains same. -> Density decreases.
-
-        # Re-initialize
-        self.initialize_grids_and_levels()
+            # serializing the FULL config might be heavy, but necessary.
+            # We assume self.config_manager.config is the dict structure we want to save.
+            config_json = json.dumps(self.config_manager.config)
+            db.update_bot_status(self.bot_id, "RUNNING", config_json)
+            self.logger.info("💾 Grid Configuration Persisted to DB.")
