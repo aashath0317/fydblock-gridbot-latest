@@ -43,3 +43,4 @@ grafana-data/
 .coverage
 .cache
 coverage.xml
+bot_data.db
