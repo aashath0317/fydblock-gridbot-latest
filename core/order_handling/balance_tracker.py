@@ -57,13 +57,19 @@ class BalanceTracker:
     ):
         """
         Sets up the balances using the investment cap passed from the Strategy.
+        1% is moved to Operational Reserve for fees.
         """
-        self.balance = initial_balance
+        reservation_amount = initial_balance * 0.01
+        self.operational_reserve = reservation_amount
+        self.balance = initial_balance - reservation_amount
+
         self.crypto_balance = initial_crypto_balance
         self.investment_cap = initial_balance
 
         self.logger.info(
-            f"Balance Tracker Initialized: {self.balance} {self.quote_currency} (Investment Cap) / {self.crypto_balance} {self.base_currency} / Reserve: {self.operational_reserve}"
+            f"Balance Tracker Initialized: {self.balance:.2f} {self.quote_currency} (Trading) / "
+            f"{self.operational_reserve:.2f} {self.quote_currency} (Fee Reserve) / "
+            f"{self.crypto_balance} {self.base_currency}"
         )
 
     def attempt_fee_recovery(self, required_amount: float) -> bool:
@@ -117,6 +123,9 @@ class BalanceTracker:
         Forces an update of the available (free) balance from the exchange.
         This ensures the bot doesn't try to spend funds it doesn't actually have.
         """
+        if self.trading_mode != TradingMode.LIVE:
+            return
+
         try:
             balances = await exchange_service.get_balance()
             if balances and "free" in balances and "total" in balances:

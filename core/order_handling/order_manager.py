@@ -1,6 +1,7 @@
-import asyncio  # Added for sleep
+import asyncio
 import logging
 import math
+import time
 
 import aiohttp
 import pandas as pd
@@ -40,6 +41,7 @@ class OrderManager:
         backend_url: str = "http://localhost:5000/api/user/bot-trade",
     ):
         self.logger = logging.getLogger(self.__class__.__name__)
+        self._log_throttle = {}
         self.grid_manager = grid_manager
         self.order_validator = order_validator
         self.balance_tracker = balance_tracker
@@ -60,6 +62,18 @@ class OrderManager:
 
         self.event_bus.subscribe(Events.ORDER_FILLED, self._on_order_filled)
         self.event_bus.subscribe(Events.ORDER_CANCELLED, self._on_order_cancelled)
+
+    import time
+
+    def _throttled_warning(self, msg: str, key: str, interval: int = 60):
+        """Logs a warning only if 'interval' seconds have passed since the last log for 'key'."""
+        import time
+
+        now = time.time()
+        last_time = self._log_throttle.get(key, 0)
+        if now - last_time > interval:
+            self.logger.warning(msg)
+            self._log_throttle[key] = now
 
     def has_active_orders(self) -> bool:
         """
@@ -167,6 +181,7 @@ class OrderManager:
 
             # 3. Reconcile & Rebuild State
             matched_count = 0
+            resumed_grid_prices = set()
 
             for order_data in open_orders:
                 order_id = order_data["id"]
@@ -175,21 +190,15 @@ class OrderManager:
                 side = OrderSide.BUY if side_str == "BUY" else OrderSide.SELL
 
                 # Check if it belongs to us (by ID or Price match)
-                # Strict: Must match DB ID?
-                # SRS: "Matches them against the database records"
-
                 closest_grid = None  # Initialize to avoid UnboundLocalError
 
                 if order_id in db_orders:
                     # Verified match
                     pass
                 else:
-                    # Check if it's a grid order by price logic?
-                    # If we have a Grid Level at this price, we claim it.
+                    # Check if it's a grid order by price logic
                     closest_grid = min(self.grid_manager.price_grids, key=lambda x: abs(x - price))
                     if abs(closest_grid - price) / price < 0.001:  # 0.1% tolerance
-                        # It matches a grid line.
-                        # Upsert to DB if missing?
                         self.logger.info(f"   Claiming orphaned order {order_id} at {price}")
                         self.db.add_order(self.bot_id, order_id, price, side.value, float(order_data["amount"]))
                     else:
@@ -201,16 +210,24 @@ class OrderManager:
 
                 # If exact match failed, try closest grid
                 if not grid_level:
-                    # Calculate closest_grid if we haven't already
                     if closest_grid is None:
                         closest_grid = min(self.grid_manager.price_grids, key=lambda x: abs(x - price))
-
-                    # Try to match to closest grid
                     grid_level = self.grid_manager.grid_levels.get(closest_grid)
 
                 if grid_level:
+                    # --- DUPLICATE CHECK ---
+                    if grid_level.price in resumed_grid_prices:
+                        self.logger.warning(f"⚠️ Duplicate order found for grid {grid_level.price} (Order {order_id}). Cancelling...")
+                        try:
+                            await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
+                        except Exception as e:
+                            self.logger.error(f"Failed to cancel duplicate order {order_id}: {e}")
+                        continue
+                    
+                    resumed_grid_prices.add(grid_level.price)
+                    # -----------------------
+
                     # Reconstruct Order Object
-                    # We need a proper Order object to add to OrderBook
                     order_obj = Order(
                         identifier=order_id,
                         status=OrderStatus.OPEN,
@@ -221,10 +238,10 @@ class OrderManager:
                         amount=float(order_data["amount"]),
                         filled=0.0,
                         remaining=float(order_data["amount"]),
-                        timestamp=int(pd.Timestamp.now().timestamp() * 1000),  # Milliseconds expected
+                        timestamp=int(pd.Timestamp.now().timestamp() * 1000),
                         datetime=pd.Timestamp.now().isoformat(),
                         last_trade_timestamp=None,
-                        symbol=self.trading_pair,  # "pair" argument was incorrect, "symbol" is correct
+                        symbol=self.trading_pair,
                         time_in_force="GTC",
                     )
 
@@ -501,6 +518,17 @@ class OrderManager:
             if is_active:
                 continue
 
+            # --- STRICT ORDER COUNT GUARD ---
+            # If we are already at (or above) capacity, do NOT place new orders.
+            # This prevents the "46th order" bug.
+            if len(exchange_orders) >= self.grid_manager.num_grids:
+                self._throttled_warning(
+                    f"🛑 Max orders reached ({len(exchange_orders)}/{self.grid_manager.num_grids}). Skipping BUY at {price}.",
+                    f"max_orders_buy_{self.bot_id}",
+                )
+                break
+            # --------------------------------
+
             # --- FUND CHECK MOVED HERE ---
             # Only check funds if we actually NEED to place an order
             if not has_fiat:
@@ -514,9 +542,10 @@ class OrderManager:
             required_value = raw_quantity * price
 
             if not self.balance_tracker.attempt_fee_recovery(required_value * 0.95):
-                self.logger.warning(
+                self._throttled_warning(
                     f"Skipping BUY reconciliation for level {price}: Insufficient funds "
-                    f"(Available: {self.balance_tracker.balance:.2f}, Required: {required_value:.2f})"
+                    f"(Available: {self.balance_tracker.balance:.2f}, Required: {required_value:.2f})",
+                    f"insufficient_funds_buy_{price}",
                 )
                 continue
             # -----------------------------
@@ -537,6 +566,15 @@ class OrderManager:
             if is_active:
                 continue
 
+            # --- STRICT ORDER COUNT GUARD ---
+            if len(exchange_orders) >= self.grid_manager.num_grids:
+                self._throttled_warning(
+                    f"🛑 Max orders reached ({len(exchange_orders)}/{self.grid_manager.num_grids}). Skipping SELL at {price}.",
+                    f"max_orders_sell_{self.bot_id}",
+                )
+                break
+            # --------------------------------
+
             # --- FUND CHECK MOVED HERE ---
             if not has_crypto:
                 self.logger.debug(f"Skipping SELL at {price}: No Crypto (Throttle Log)")
@@ -548,9 +586,10 @@ class OrderManager:
             required_crypto = raw_quantity
 
             if self.balance_tracker.crypto_balance < (required_crypto * 0.95):
-                self.logger.warning(
+                self._throttled_warning(
                     f"Skipping SELL reconciliation for level {price}: Insufficient crypto "
-                    f"(Available: {self.balance_tracker.crypto_balance:.4f}, Required: {required_crypto:.4f})"
+                    f"(Available: {self.balance_tracker.crypto_balance:.4f}, Required: {required_crypto:.4f})",
+                    f"insufficient_crypto_sell_{price}",
                 )
                 continue
             # ------------------------------
@@ -588,9 +627,8 @@ class OrderManager:
                     price=current_price,
                 )
                 self.order_book.add_order(buy_order)
-                if self.trading_mode != TradingMode.BACKTEST:
-                    self.balance_tracker.update_after_initial_purchase(initial_order=buy_order)
-                else:
+                # FIX: Redundant update removed. Event bus handles it via _on_order_filled.
+                if self.trading_mode == TradingMode.BACKTEST:
                     await self._simulate_fill(buy_order, buy_order.timestamp)
 
                 await self.notification_handler.async_send_notification(

@@ -29,65 +29,61 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
         order_side: OrderSide,
         pair: str,
         amount: float,
-        price: float = None, 
+        price: float = None,
     ) -> Order:
         try:
             raw_order = await self.exchange_service.place_order(
-                pair,
-                OrderType.MARKET.value.lower(),
-                order_side.value.lower(),
-                amount,
-                price
+                pair, OrderType.MARKET.value.lower(), order_side.value.lower(), amount, price
             )
 
             # --- SAFE PARSING START ---
-            parsed_amount = float(raw_order.get('amount') or amount)
-            parsed_filled = float(raw_order.get('filled') or parsed_amount)
-            
-            parsed_price = float(raw_order.get('price') or (price if price is not None else 0.0))
-            
-            parsed_average = raw_order.get('average')
+            parsed_amount = float(raw_order.get("amount") or amount)
+            parsed_filled = float(raw_order.get("filled") or parsed_amount)
+
+            parsed_price = float(raw_order.get("price") or (price if price is not None else 0.0))
+
+            parsed_average = raw_order.get("average")
             if parsed_average is None:
                 parsed_average = parsed_price
             else:
                 parsed_average = float(parsed_average)
 
-            parsed_cost = raw_order.get('cost')
+            parsed_cost = raw_order.get("cost")
             if parsed_cost is None:
                 parsed_cost = parsed_price * parsed_filled
             else:
                 parsed_cost = float(parsed_cost)
 
-            parsed_timestamp = raw_order.get('timestamp')
+            parsed_timestamp = raw_order.get("timestamp")
             if parsed_timestamp is None:
                 parsed_timestamp = int(time.time() * 1000)
             else:
                 parsed_timestamp = int(parsed_timestamp)
-                
-            parsed_fee = raw_order.get('fee')
+
+            parsed_fee = raw_order.get("fee")
             if parsed_fee is None:
-                parsed_fee = {'cost': 0.0, 'currency': pair.split('/')[1] if '/' in pair else 'USDT'}
+                parsed_fee = {"cost": 0.0, "currency": pair.split("/")[1] if "/" in pair else "USDT"}
             # --------------------------
 
             return Order(
-                identifier=str(raw_order['id']),
+                identifier=str(raw_order["id"]),
                 symbol=pair,
                 side=order_side,
                 order_type=OrderType.MARKET,
                 status=OrderStatus.CLOSED,
                 timestamp=parsed_timestamp,
-                datetime=raw_order.get('datetime'), 
-                last_trade_timestamp=raw_order.get('lastTradeTimestamp'),
+                datetime=raw_order.get("datetime"),
+                last_trade_timestamp=raw_order.get("lastTradeTimestamp"),
                 amount=parsed_amount,
                 filled=parsed_filled,
-                remaining=0.0, 
+                remaining=0.0,
                 price=parsed_price,
-                average=parsed_average, 
-                time_in_force=raw_order.get('timeInForce'),
-                trades=raw_order.get('trades', []),
-                fee=parsed_fee, 
+                average=parsed_average,
+                time_in_force=raw_order.get("timeInForce"),
+                trades=raw_order.get("trades", []),
+                fee=parsed_fee,
                 cost=parsed_cost,
-                info=raw_order
+                info=raw_order,
             )
 
         except Exception as e:
@@ -98,14 +94,14 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
                 OrderType.MARKET,
                 pair,
                 amount,
-                price if price is not None else 0.0
+                price if price is not None else 0.0,
             ) from e
 
     async def execute_limit_order(
         self,
         order_side: OrderSide,
         pair: str,
-        amount: float, 
+        amount: float,
         price: float,
     ) -> Order | None:
         try:
@@ -116,7 +112,8 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
                 amount,
                 price,
             )
-            order_result = await self._parse_order_result(raw_order)
+            # FIX: Pass amount and price as fallback
+            order_result = await self._parse_order_result(raw_order, fallback_amount=amount, fallback_price=price)
             return order_result
 
         except DataFetchError as e:
@@ -160,6 +157,8 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
     async def _parse_order_result(
         self,
         raw_order_result: dict,
+        fallback_amount: float = 0.0,
+        fallback_price: float = 0.0,
     ) -> Order:
         """
         Parses the raw order response from the exchange into an Order object.
@@ -170,16 +169,18 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
         else:
             ts = int(ts)
 
-        price = float(raw_order_result.get("price") or 0.0)
-        amount = float(raw_order_result.get("amount") or 0.0)
+        # FIX: Use fallback for price if missing/zero
+        price = float(raw_order_result.get("price") or fallback_price)
+        # FIX: Use fallback if amount is missing/zero (common in Sandbox/Async)
+        amount = float(raw_order_result.get("amount") or fallback_amount)
         filled = float(raw_order_result.get("filled") or 0.0)
-        
+
         cost = raw_order_result.get("cost")
         if cost is None:
             cost = price * filled
         else:
             cost = float(cost)
-            
+
         avg = raw_order_result.get("average")
         if avg is None:
             avg = price
@@ -188,20 +189,20 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
 
         fee = raw_order_result.get("fee")
         if fee is None:
-            fee = {'cost': 0.0, 'currency': 'UNKNOWN'}
+            fee = {"cost": 0.0, "currency": "UNKNOWN"}
 
         # --- CRITICAL FIX: Safe String Parsing ---
         status_val = raw_order_result.get("status")
         if status_val is None:
-            status_val = "open" # Default for new limit orders
-        
+            status_val = "open"  # Default for new limit orders
+
         type_val = raw_order_result.get("type")
         if type_val is None:
-            type_val = "limit" # Default if missing
+            type_val = "limit"  # Default if missing
 
         side_val = raw_order_result.get("side")
         if side_val is None:
-            side_val = "buy" # Should not happen, but safe fallback
+            side_val = "buy"  # Should not happen, but safe fallback
         # -----------------------------------------
 
         return Order(
@@ -210,7 +211,7 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
             order_type=OrderType(type_val.lower()),
             side=OrderSide(side_val.lower()),
             price=price,
-            average=avg, 
+            average=avg,
             amount=amount,
             filled=filled,
             remaining=float(raw_order_result.get("remaining") or 0.0),
@@ -220,8 +221,8 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
             symbol=raw_order_result.get("symbol", ""),
             time_in_force=raw_order_result.get("timeInForce"),
             trades=raw_order_result.get("trades", []),
-            fee=fee, 
-            cost=cost, 
+            fee=fee,
+            cost=cost,
             info=raw_order_result.get("info", raw_order_result),
         )
 
@@ -264,7 +265,7 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
 
             await asyncio.sleep(self.retry_delay)
         return False
-        
+
     async def cancel_order(
         self,
         order_id: str,

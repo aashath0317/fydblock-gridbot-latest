@@ -29,6 +29,10 @@ class GridManager:
         self.grid_levels: dict[float, GridLevel] = {}
         self.uniform_order_quantity: float | None = None  # Store the fixed quantity
 
+    @property
+    def num_grids(self) -> int:
+        return self.config_manager.get_num_grids()
+
     def initialize_grids_and_levels(self) -> None:
         """
         Initializes the grid levels and assigns their respective states.
