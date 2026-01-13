@@ -20,6 +20,7 @@ from .exchange_interface import ExchangeInterface
 
 
 class BacktestExchangeService(ExchangeInterface):
+    # class BacktestExchangeService:
     def __init__(self, config_manager: ConfigManager):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.config_manager = config_manager
@@ -198,7 +199,18 @@ class BacktestExchangeService(ExchangeInterface):
     async def close_connection(self) -> None:
         self.logger.info("[BACKTEST] Closing WebSocket connection...")
 
-    async def fetch_open_orders(self, pair: str) -> list[dict]:
+    async def refresh_open_orders(self, pair: str) -> list[dict]:
         # In backtesting, we don't fetch open orders from an 'exchange'.
         # The OrderManager tracks simulated orders internally.
+        # Implemented to satisfy abstract base class.
         return []
+
+    async def start_user_stream(
+        self,
+        on_order_update: Any,
+    ) -> None:
+        """
+        In backtesting, we don't need a real WebSocket stream.
+        Order updates are handled synchronously by the backtest engine.
+        """
+        pass

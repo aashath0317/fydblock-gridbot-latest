@@ -134,14 +134,25 @@ class GridTradingStrategy(TradingStrategyInterface):
             self.logger.info(f"   ?? Wallet Has: {actual_fiat_balance} {quote_currency}")
             self.logger.info(f"   ?? User Allocated: {investment_amount} {quote_currency}")
 
-            # 3. Validate Funds
+            # 3. Check for Active Orders (Hot Boot detection)
+            has_active_orders = self.order_manager.has_active_orders()
+
+            # 4. Validate Funds
+            # FIX: If we have active orders, we expect the wallet balance to be lower (funds locked).
+            # So we SKIP the strict check in that case.
             if actual_fiat_balance < investment_amount:
-                self.logger.error(
-                    f"? INSUFFICIENT FUNDS: Wallet has {actual_fiat_balance} {quote_currency}, "
-                    f"but strategy requires {investment_amount} {quote_currency}."
-                )
-                self._running = False
-                return
+                if has_active_orders:
+                    self.logger.warning(
+                        f"🔥 Hot Boot Detected: Wallet balance ({actual_fiat_balance}) < Investment ({investment_amount}). "
+                        f"Assuming difference is locked in active orders. Proceeding."
+                    )
+                else:
+                    self.logger.error(
+                        f"? INSUFFICIENT FUNDS: Wallet has {actual_fiat_balance} {quote_currency}, "
+                        f"but strategy requires {investment_amount} {quote_currency}."
+                    )
+                    self._running = False
+                    return
 
             # 4. Cap the Bot's Balance to the Investment Amount
             # We ignore any extra money in the wallet so the bot doesn't touch it.

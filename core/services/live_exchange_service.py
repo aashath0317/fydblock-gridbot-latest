@@ -317,7 +317,7 @@ class LiveExchangeService(ExchangeInterface):
         except Exception as e:
             return {"status": "error", "info": f"Failed to fetch exchange status: {e}"}
 
-    async def fetch_open_orders(self, pair: str) -> list[dict]:
+    async def refresh_open_orders(self, pair: str) -> list[dict]:
         if not self.exchange:
             raise UnsupportedExchangeError("Exchange has not been initialized")
 

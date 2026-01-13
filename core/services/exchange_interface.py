@@ -64,7 +64,7 @@ class ExchangeInterface(ABC):
         pass
 
     @abstractmethod
-    async def fetch_open_orders(self, pair: str) -> list[dict]:
+    async def refresh_open_orders(self, pair: str) -> list[dict]:
         """Fetches all currently open orders for the pair."""
         pass
 

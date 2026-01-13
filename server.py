@@ -15,6 +15,9 @@ from core.services.exchange_service_factory import ExchangeServiceFactory
 from core.storage.bot_database import BotDatabase
 
 
+from utils.logging_config import setup_logging
+
+
 # --- Logging Setup ---
 class DuplicateLogFilter(logging.Filter):
     def __init__(self):
@@ -29,7 +32,9 @@ class DuplicateLogFilter(logging.Filter):
         return True
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Use centralized logging setup to enable file logging (visible to Admin Panel)
+setup_logging(logging.INFO, log_to_file=True, config_name="server")
 logger = logging.getLogger("FydEngine")
 
 # Apply filter to uvicorn.error to suppress repetitive "Invalid HTTP request received"
@@ -95,7 +100,7 @@ def create_config(exchange, pair, api_key, api_secret, passphrase, mode, strateg
             "take_profit": {"enabled": False, "threshold": 0.0},
             "stop_loss": {"enabled": False, "threshold": 0.0},
         },
-        "logging": {"log_level": "INFO", "log_to_file": False},
+        "logging": {"log_level": "INFO", "log_to_file": True},
     }
 
 

@@ -174,7 +174,7 @@ class OrderManager:
 
         try:
             # 1. Fetch Orders from Exchange
-            open_orders = await self.order_execution_strategy.exchange_service.fetch_open_orders(self.trading_pair)
+            open_orders = await self.order_execution_strategy.exchange_service.refresh_open_orders(self.trading_pair)
 
             # 2. Fetch Orders from DB
             db_orders = self.db.get_all_active_orders(self.bot_id)
@@ -217,13 +217,15 @@ class OrderManager:
                 if grid_level:
                     # --- DUPLICATE CHECK ---
                     if grid_level.price in resumed_grid_prices:
-                        self.logger.warning(f"⚠️ Duplicate order found for grid {grid_level.price} (Order {order_id}). Cancelling...")
+                        self.logger.warning(
+                            f"⚠️ Duplicate order found for grid {grid_level.price} (Order {order_id}). Cancelling..."
+                        )
                         try:
                             await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
                         except Exception as e:
                             self.logger.error(f"Failed to cancel duplicate order {order_id}: {e}")
                         continue
-                    
+
                     resumed_grid_prices.add(grid_level.price)
                     # -----------------------
 
@@ -247,6 +249,11 @@ class OrderManager:
 
                     self.order_book.add_order(order_obj, grid_level)
                     self.grid_manager.mark_order_pending(grid_level, order_obj)
+
+                    # FIX: Sync with BalanceTracker
+                    # deduct_from_balance=False because these funds are ALREADY locked on exchange
+                    # and therefore missing from the 'free balance' we initialized with.
+                    self.balance_tracker.register_open_order(order_obj, deduct_from_balance=False)
                     matched_count += 1
 
             self.logger.info(f"✅ Resumed {matched_count} orders from Hot Boot.")
@@ -438,7 +445,7 @@ class OrderManager:
         await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange_service, current_price)
 
         # Fetch orders
-        exchange_orders = await self.order_execution_strategy.exchange_service.fetch_open_orders(self.trading_pair)
+        exchange_orders = await self.order_execution_strategy.exchange_service.refresh_open_orders(self.trading_pair)
 
         # --- SAFETY CHECK: PAGINATION WARNING ---
         if len(exchange_orders) >= 100:

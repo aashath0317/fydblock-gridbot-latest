@@ -302,6 +302,39 @@ class BalanceTracker:
             f"Reserved {quantity} crypto for a sell order. Remaining crypto balance: {self.crypto_balance}.",
         )
 
+    def register_open_order(self, order: Order, deduct_from_balance: bool = True) -> None:
+        """
+        Registers an existing open order (e.g. from Hot Boot) with the tracker,
+        moving funds from 'balance' to 'reserved'.
+        If deduct_from_balance is False, we assume funds were already deducted (e.g. not in free balance).
+        """
+        if order.side == OrderSide.BUY:
+            cost = order.remaining * order.price
+            if deduct_from_balance:
+                if self.balance >= cost:
+                    self.balance -= cost
+                else:
+                    self.logger.warning(
+                        f"⚠️ Inconsistency during Hot Boot: registered buy order cost {cost} > available balance {self.balance}. "
+                        f"Forcing reserve (Balance may go negative)."
+                    )
+                    self.balance -= cost
+
+            self.reserved_fiat += cost
+            self.logger.info(
+                f"Registered Open BUY {order.identifier}: Reserved {cost:.2f} {self.quote_currency} (Deducted: {deduct_from_balance})"
+            )
+
+        elif order.side == OrderSide.SELL:
+            amount = order.remaining
+            if deduct_from_balance:
+                self.crypto_balance -= amount
+
+            self.reserved_crypto += amount
+            self.logger.info(
+                f"Registered Open SELL {order.identifier}: Reserved {amount:.6f} {self.base_currency} (Deducted: {deduct_from_balance})"
+            )
+
     def get_adjusted_fiat_balance(self) -> float:
         """
         Returns the fiat balance, including reserved funds.
