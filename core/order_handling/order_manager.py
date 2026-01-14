@@ -101,7 +101,7 @@ class OrderManager:
         # Max attempts to clean up (avoid infinite loops if exchange is broken)
         for attempt in range(5):
             # 1. Fetch ALL open orders (using the new pagination logic in service)
-            open_orders = await self.order_execution_strategy.exchange_service.fetch_open_orders(self.trading_pair)
+            open_orders = await self.order_execution_strategy.exchange_service.refresh_open_orders(self.trading_pair)
 
             # Filter for THIS bot
             my_orders = [o for o in open_orders if o.get("clientOrderId", "").startswith(f"G_{self.bot_id}_")]
@@ -145,7 +145,11 @@ class OrderManager:
 
             self.logger.info("Initializing Grid Orders (DB-Aware)...")
 
-            # 3. Place Orders (Now safely into an empty account)
+            # 3. Smart Rebalance: Ensure we have the funds BEFORE we try to place orders
+            # This handles the "Auto-Buy/Sell" requirement to fix deficits.
+            await self.ensure_funds_for_grid(current_price)
+
+            # 4. Place Orders (Now safely into an empty account)
             # FIX: Use Dynamic Dead Zone from GridManager
             safe_buy_limit, safe_sell_limit = self.grid_manager.get_dead_zone_thresholds(current_price)
 
@@ -285,6 +289,7 @@ class OrderManager:
                 self.db.update_order_status(order.identifier, "FILLED")
 
             # 2. Update Memory / Balances
+            # Pass fee data if available
             await self.balance_tracker.update_balance_on_order_completion(order)
             grid_level = self.order_book.get_grid_level_for_order(order)
 
@@ -334,16 +339,32 @@ class OrderManager:
 
         # --- PROFIT SYNC ---
         if paired_buy_level:
-            # Calculate Profit: (Sell Price - Buy Grid Price) * Amount
+            # Calculate Gross Profit
             gross_profit = (order.average - paired_buy_level.price) * order.filled
 
+            # Calculate Fees (Estimate)
+            # Buy Fee: based on the original buy price
+            buy_fee = self.balance_tracker.fee_calculator.calculate_fee(paired_buy_level.price * order.filled)
+            # Sell Fee: based on the sell price (or use actual fee if available, but estimate for consistency)
+            sell_fee = self.balance_tracker.fee_calculator.calculate_fee(order.average * order.filled)
+
+            total_estimated_fees = buy_fee + sell_fee
+            net_profit = gross_profit - total_estimated_fees
+
+            # --- RESERVE ALLOCATION (10%) ---
+            reserve_amount = 0.0
+            if net_profit > 0:
+                reserve_amount = net_profit * 0.10
+                self.balance_tracker.allocate_profit_to_reserve(reserve_amount)
+
             self.logger.info(
-                f"💰 PROFIT SECURED: +{gross_profit:.4f} {self.trading_pair.split('/')[1]} "
-                f"(Buy @ {paired_buy_level.price:.2f} -> Sell @ {order.average:.2f})"
+                f"💰 PROFIT SECURED: +{net_profit:.4f} {self.trading_pair.split('/')[1]} "
+                f"(Gross: {gross_profit:.4f}, Fees: {total_estimated_fees:.4f}, Reserve: {reserve_amount:.4f})"
             )
 
             if self.bot_id:
-                await self._sync_profit_to_backend(order, gross_profit)
+                # Sync Net Profit to backend
+                await self._sync_profit_to_backend(order, net_profit)
         else:
             self.logger.warning("Could not calculate profit: No paired buy level found.")
         # -------------------
@@ -605,7 +626,140 @@ class OrderManager:
             if not success:
                 break
 
-    # --- Misc Methods ---
+    async def ensure_funds_for_grid(self, current_price: float) -> None:
+        """
+        Checks if sufficient funds exist for the active grid.
+        If not, attempts to rebalance (market buy/sell) to fix the deficit.
+        """
+        required_fiat, required_crypto = self.calculate_grid_requirements(current_price)
+
+        # Check against BalanceTracker
+        deficit = self.balance_tracker.check_rebalance_needs(required_fiat, required_crypto, current_price)
+
+        if deficit:
+            self.logger.info(f"⚖️ Deficit Detected: {deficit}")
+            await self.execute_rebalance(deficit, current_price)
+            # We assume rebalance works. The next iteration/step will use the new funds.
+
+    def calculate_grid_requirements(self, current_price: float) -> tuple[float, float]:
+        """
+        Calculates the total Fiat and Crypto needed to support the current grid levels.
+        Returns: (required_fiat, required_crypto)
+        """
+        required_fiat = 0.0
+        required_crypto = 0.0
+
+        total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
+
+        # Dynamic Dead Zone
+        safe_buy_limit, safe_sell_limit = self.grid_manager.get_dead_zone_thresholds(current_price)
+
+        # 1. Sum up BUY requirements
+        for price in self.grid_manager.sorted_buy_grids:
+            if price >= safe_buy_limit:
+                continue
+            # Calculate cost for this level
+            raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+            required_fiat += raw_quantity * price
+
+        # 2. Sum up SELL requirements
+        for price in self.grid_manager.sorted_sell_grids:
+            if price <= safe_sell_limit:
+                continue
+
+            raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+            required_crypto += raw_quantity
+
+        return required_fiat, required_crypto
+
+    # ==============================================================================
+    #  MISC METHODS
+    # ==============================================================================
+
+    async def execute_rebalance(self, deficit: dict, current_price: float) -> bool:
+        """
+        Executes a MARKET order to fix a balance deficit.
+        """
+        if not deficit:
+            return False
+
+        action_type = deficit.get("type")
+        required_amount = deficit.get("amount", 0.0)
+        reason = deficit.get("reason", "Unknown")
+
+        self.logger.warning(
+            f"⚖️ REBALANCING: Attempting to fix deficit: {reason} (Action: {action_type}, Amount: {required_amount:.6f})"
+        )
+
+        try:
+            order = None
+            if action_type == "BUY_CRYPTO":
+                # We need to buy `amount` crypto.
+                # Check fiat balance first (redundant but safe)
+                cost = required_amount * current_price
+                if self.balance_tracker.balance < cost:
+                    self.logger.error(
+                        f"❌ CANNOT REBALANCE: Need {required_amount} crypto (Cost: {cost:.2f}) "
+                        f"but only have {self.balance_tracker.balance:.2f} fiat. Manual intervention required."
+                    )
+                    return False
+
+                # Convert crypto amount to fiat cost for 'quote' based market buy?
+                # Usually execute_market_order takes 'amount' as crypto quantity for BUY/SELL if side is base.
+                # Let's assume quantity is "Amount of Base Currency".
+                # Adjust quantity for precision
+                adjusted_qty = self.order_validator.adjust_and_validate_buy_quantity(
+                    self.balance_tracker.balance, required_amount, current_price
+                )
+
+                order = await self.order_execution_strategy.execute_market_order(
+                    OrderSide.BUY,
+                    self.trading_pair,
+                    amount=adjusted_qty,
+                    price=current_price,
+                )
+
+            elif action_type == "SELL_CRYPTO":
+                # We need to sell `amount` crypto to raise fiat.
+                if self.balance_tracker.crypto_balance < required_amount:
+                    self.logger.error(
+                        f"❌ CANNOT REBALANCE: Need to sell {required_amount} crypto "
+                        f"but only have {self.balance_tracker.crypto_balance:.6f}. Manual intervention required."
+                    )
+                    return False
+
+                adjusted_qty = self.order_validator.adjust_and_validate_sell_quantity(
+                    self.balance_tracker.crypto_balance, required_amount
+                )
+
+                order = await self.order_execution_strategy.execute_market_order(
+                    OrderSide.SELL,
+                    self.trading_pair,
+                    amount=adjusted_qty,
+                    price=current_price,
+                )
+
+            if order:
+                self.logger.info(f"✅ Rebalance Order Placed: {order.side} {order.amount} @ {order.average}")
+                self.order_book.add_order(order)
+                if self.bot_id:
+                    self.db.add_order(self.bot_id, order.identifier, current_price, order.side.value, order.amount)
+
+                # NOTE: We do not add this to 'grid_levels' pending. It's a structural adjustment.
+                # However, we MUST event bus it so balance tracker updates.
+                if order.status == OrderStatus.CLOSED:
+                    await self.event_bus.publish(Events.ORDER_FILLED, order)
+                    await self.notification_handler.async_send_notification(
+                        NotificationType.ORDER_PLACED,
+                        order_details=f"⚖️ Smart Rebalance Triggered: {order.side.name} {order.amount:.4f} {self.trading_pair.split('/')[0]}",
+                    )
+                return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to execute rebalance: {e}")
+            return False
+
+        return False
 
     async def perform_initial_purchase(self, current_price: float) -> None:
         grid_prices = self.grid_manager.grid_levels.keys()
@@ -724,7 +878,9 @@ class OrderManager:
 
         # 1. Fetch Source of Truth from Exchange
         try:
-            exchange_orders = await self.order_execution_strategy.exchange_service.fetch_open_orders(self.trading_pair)
+            exchange_orders = await self.order_execution_strategy.exchange_service.refresh_open_orders(
+                self.trading_pair
+            )
 
             # 2. Fetch Source of Truth from DB
             db_orders = self.db.get_all_active_orders(self.bot_id)
@@ -836,7 +992,7 @@ class OrderManager:
 
         try:
             # 1. Fetch EVERYTHING
-            open_orders = await self.order_execution_strategy.exchange_service.fetch_open_orders(self.trading_pair)
+            open_orders = await self.order_execution_strategy.exchange_service.refresh_open_orders(self.trading_pair)
 
             if not open_orders:
                 self.logger.info("✅ Nuclear Cleanup Verified: 0 Open Orders found.")

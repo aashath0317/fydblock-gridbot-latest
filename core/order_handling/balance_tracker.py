@@ -20,6 +20,8 @@ class BalanceTracker:
         trading_mode: TradingMode,
         base_currency: str,
         quote_currency: str,
+        db=None,  # BotDatabase
+        bot_id: int | None = None,
     ):
         """
         Initializes the BalanceTracker.
@@ -30,6 +32,8 @@ class BalanceTracker:
             trading_mode: "BACKTEST", "LIVE" or "PAPER_TRADING".
             base_currency: The base currency symbol.
             quote_currency: The quote currency symbol.
+            db: The persistent database instance.
+            bot_id: The ID of the bot owning this tracker.
         """
         self.logger = logging.getLogger(self.__class__.__name__)
         self.event_bus: EventBus = event_bus
@@ -37,6 +41,8 @@ class BalanceTracker:
         self.trading_mode: TradingMode = trading_mode
         self.base_currency: str = base_currency
         self.quote_currency: str = quote_currency
+        self.db = db
+        self.bot_id = bot_id
 
         self.balance: float = 0.0
         self.crypto_balance: float = 0.0
@@ -45,6 +51,13 @@ class BalanceTracker:
         self.reserved_crypto: float = 0.0
         self.investment_cap: float = float("inf")
         self.operational_reserve: float = 0.0  # Dynamic Fee Stabilization Reserve
+
+    def _persist_balances(self):
+        """Saves current balance state to DB."""
+        if self.db and self.bot_id:
+            # We persist what we OWN (Total Fiat, Total Crypto, Reserve)
+            # Reserve usually refers to the 'Operational Reserve' (Fee Reserve), not locked order funds.
+            self.db.update_balances(self.bot_id, self.balance, self.crypto_balance, self.operational_reserve)
 
         # REMOVED: Automatic subscription. OrderManager will call update manually to ensure sequence.
         # self.event_bus.subscribe(Events.ORDER_FILLED, self._update_balance_on_order_completion)
@@ -71,6 +84,20 @@ class BalanceTracker:
             f"{self.operational_reserve:.2f} {self.quote_currency} (Fee Reserve) / "
             f"{self.crypto_balance} {self.base_currency}"
         )
+        self._persist_balances()
+
+    def initialize_balances(self, fiat_balance: float, crypto_balance: float):
+        """
+        Manually initializes the balance state.
+        Called by the Strategy during startup after validating real-world funds.
+        """
+        self.balance = fiat_balance
+        self.crypto_balance = crypto_balance
+        self.logger.info(
+            f"✅ Balances synced with Wallet: {self.balance:.2f} {self.quote_currency}, "
+            f"{self.crypto_balance} {self.base_currency}"
+        )
+        self._persist_balances()
 
     def attempt_fee_recovery(self, required_amount: float) -> bool:
         """
@@ -88,6 +115,7 @@ class BalanceTracker:
             self.operational_reserve -= deficit
             self.balance += deficit
             self.logger.info(f"?? RESCUE: Auto-injected {deficit:.6f} from Operational Reserve to cover shortfall.")
+            self._persist_balances()
             return True
 
         return False
@@ -156,6 +184,7 @@ class BalanceTracker:
 
                 self.balance = new_fiat
                 self.crypto_balance = new_crypto
+                self._persist_balances()
         except Exception as e:
             self.logger.error(f"Failed to sync balances: {e}")
 
@@ -173,37 +202,75 @@ class BalanceTracker:
             (BUY/SELL), filled quantity, and price.
         """
         if order.side == OrderSide.BUY:
-            self._update_after_buy_order_filled(order.filled, order.price)
+            self._update_after_buy_order_filled(order.filled, order.price, order.fee)
         elif order.side == OrderSide.SELL:
             self._update_after_sell_order_filled(order.filled, order.price)
 
-    def _update_after_buy_order_filled(
-        self,
-        quantity: float,
-        price: float,
-    ) -> None:
+    def _update_after_buy_order_filled(self, quantity: float, price: float, fee_data: dict | None = None) -> None:
         """
-        Updates the balances after a buy order is completed, including handling reserved funds.
-
-        Deducts the total cost (price * quantity + fee) from the reserved fiat balance,
-        releases any unused reserved fiat back to the main balance, adds the purchased
-        crypto quantity to the crypto balance, and tracks the fees incurred.
-
-        Args:
-            quantity: The quantity of crypto purchased.
-            price: The price at which the crypto was purchased (per unit).
+        Updates the balances after a buy order is completed.
+        Handles fee deduction from either Reserve (Fiat) or Base (Crypto).
         """
-        fee = self.fee_calculator.calculate_fee(quantity * price)
-        total_cost = quantity * price + fee
+        # Default Fee Calculation (if no actual data provided)
+        estimated_fee = self.fee_calculator.calculate_fee(quantity * price)
 
-        self.reserved_fiat -= total_cost
+        # 1. Total Cost in Fiat (Price * Qty)
+        # Note: If fee is in Quote, usually the exchange *deducts* it from the acquired amount
+        # OR takes it from the Quote balance.
+        # For Spot Grid, usually:
+        # Buy ETH/USDT -> Pay USDT, Receive ETH.
+        # Fee is often taken from ETH received (Base) OR USDT paid (Quote).
+
+        cost_in_fiat = quantity * price
+
+        # Check actual fee data if available
+        fee_in_base = 0.0
+        fee_in_quote = 0.0
+
+        if fee_data and fee_data.get("cost") is not None:
+            # Use real fee info
+            cost = float(fee_data["cost"])
+            currency = fee_data.get("currency", "")
+
+            if currency == self.base_currency:
+                fee_in_base = cost
+                self.logger.info(f"🧾 Fee paid in Base Currency ({self.base_currency}): {fee_in_base}")
+            elif currency == self.quote_currency:
+                fee_in_quote = cost
+                self.logger.info(f"🧾 Fee paid in Quote Currency ({self.quote_currency}): {fee_in_quote}")
+            else:
+                # BNB Deduct or other
+                self.logger.info(f"🧾 Fee paid in external currency ({currency}): {cost}")
+        else:
+            # Fallback: Assume fee is in Quote (old behavior)
+            fee_in_quote = estimated_fee
+
+        # 2. Update Fiat Reserve
+        # We reserved 'quantity * price' roughly.
+        # If fee is in Quote, cost is Price*Qty + Fee (if additive) or included.
+        # usually Buy Cost = Price * Qty. Fee is separate or deducted.
+        # Safe assumption: We release the locked amount.
+        self.reserved_fiat -= cost_in_fiat
+
+        # Handle "Fee in Quote" extra cost if handled that way
+        if fee_in_quote > 0:
+            if self.reserved_fiat >= fee_in_quote:
+                self.reserved_fiat -= fee_in_quote
+            else:
+                self.balance -= fee_in_quote
+
         if self.reserved_fiat < 0:
-            self.balance += self.reserved_fiat  # Adjust with excess reserved fiat
+            self.balance += self.reserved_fiat  # Release excess or cover small deficit
             self.reserved_fiat = 0
 
-        self.crypto_balance += quantity
-        self.total_fees += fee
-        self.logger.info(f"Buy order completed: {quantity} crypto purchased at {price}.")
+        # 3. Update Crypto Balance
+        # Net Crypto = Quantity - Fee (if fee is in Base)
+        net_crypto = quantity - fee_in_base
+        self.crypto_balance += net_crypto
+
+        self.total_fees += fee_in_quote + (fee_in_base * price)
+        self.logger.info(f"Buy filled: +{net_crypto:.6f} {self.base_currency} (Gross: {quantity}, Fee: {fee_in_base}).")
+        self._persist_balances()
 
     def _update_after_sell_order_filled(
         self,
@@ -239,9 +306,30 @@ class BalanceTracker:
         self.total_fees += fee
 
         self.logger.info(
-            f"Sell order completed: {quantity} crypto sold at {price}. "
-            f"Recycled {allocation:.4f} to Reserve. Net Proceeds: {net_proceeds:.4f}"
+            f"Sell order completed. Recycled {allocation:.4f} to Reserve. Net Proceeds: {net_proceeds:.4f}"
         )
+        self._persist_balances()
+
+    def allocate_profit_to_reserve(self, amount: float) -> None:
+        """
+        Allocates a specific amount of fiat profit to the operational reserve.
+        This effectively 'banks' the profit, preventing it from being reinvested.
+        """
+        if amount <= 0:
+            return
+
+        if self.balance < amount:
+            self.logger.warning(
+                f"⚠️ Cannot allocate {amount} profit to reserve. "
+                f"Available balance {self.balance} is less than profit (Funds likely reused). "
+                f"Allocating max available."
+            )
+            amount = self.balance
+
+        self.balance -= amount
+        self.operational_reserve += amount
+        self.logger.info(f"🏦 Banked Profit: Moved {amount:.4f} {self.quote_currency} to Reserve.")
+        self._persist_balances()
 
     def update_after_initial_purchase(self, initial_order: Order):
         """
@@ -263,6 +351,7 @@ class BalanceTracker:
             f"Updated balances. Crypto balance: {self.crypto_balance}, "
             f"Fiat balance: {self.balance}, Total fees: {self.total_fees}",
         )
+        self._persist_balances()
 
     def reserve_funds_for_buy(
         self,
@@ -280,6 +369,7 @@ class BalanceTracker:
         self.reserved_fiat += amount
         self.balance -= amount
         self.logger.info(f"Reserved {amount} fiat for a buy order. Remaining fiat balance: {self.balance}.")
+        self._persist_balances()
 
     def reserve_funds_for_sell(
         self,
@@ -301,6 +391,7 @@ class BalanceTracker:
         self.logger.info(
             f"Reserved {quantity} crypto for a sell order. Remaining crypto balance: {self.crypto_balance}.",
         )
+        self._persist_balances()
 
     def register_open_order(self, order: Order, deduct_from_balance: bool = True) -> None:
         """
@@ -324,6 +415,7 @@ class BalanceTracker:
             self.logger.info(
                 f"Registered Open BUY {order.identifier}: Reserved {cost:.2f} {self.quote_currency} (Deducted: {deduct_from_balance})"
             )
+            self._persist_balances()
 
         elif order.side == OrderSide.SELL:
             amount = order.remaining
@@ -334,6 +426,7 @@ class BalanceTracker:
             self.logger.info(
                 f"Registered Open SELL {order.identifier}: Reserved {amount:.6f} {self.base_currency} (Deducted: {deduct_from_balance})"
             )
+            self._persist_balances()
 
     def get_adjusted_fiat_balance(self) -> float:
         """
@@ -364,3 +457,50 @@ class BalanceTracker:
             float: The total account value in fiat terms.
         """
         return self.get_adjusted_fiat_balance() + self.get_adjusted_crypto_balance() * price
+
+    def check_rebalance_needs(self, required_fiat: float, required_crypto: float, current_price: float) -> dict | None:
+        """
+        Checks if the current balances are sufficient for the required grid.
+        Returns a 'deficit' dictionary if rebalancing is needed, else None.
+
+        Deficit format:
+        {
+            "type": "SELL_CRYPTO" | "BUY_CRYPTO",  # Action needed to fix deficit
+            "amount": float,                       # Amount of CRYPTO to buy/sell
+            "reason": str
+        }
+        """
+        # 1. Check Crypto Deficit (for Sell Orders)
+        # We need `required_crypto` available.
+        if self.crypto_balance < required_crypto:
+            shortfall = required_crypto - self.crypto_balance
+            # Ensure shortfall is significant (> 1% of required or some min value)
+            if shortfall > (required_crypto * 0.01):
+                self.logger.warning(
+                    f"⚠️ Rebalance Needed: Crypto Shortfall. Have {self.crypto_balance}, Need {required_crypto}."
+                )
+                return {
+                    "type": "BUY_CRYPTO",
+                    "amount": shortfall,
+                    "reason": f"Insufficient {self.base_currency} for grid.",
+                }
+
+        # 2. Check Fiat Deficit (for Buy Orders)
+        # We need `required_fiat` available.
+        if self.balance < required_fiat:
+            shortfall = required_fiat - self.balance
+            if shortfall > (required_fiat * 0.01):
+                # We need to raise 'shortfall' USDT.
+                # Amount of crypto to SELL = shortfall / current_price
+                crypto_to_sell = shortfall / current_price if current_price > 0 else 0
+                if crypto_to_sell > 0:
+                    self.logger.warning(
+                        f"⚠️ Rebalance Needed: Fiat Shortfall. Have {self.balance}, Need {required_fiat}."
+                    )
+                    return {
+                        "type": "SELL_CRYPTO",
+                        "amount": crypto_to_sell,
+                        "reason": f"Insufficient {self.quote_currency} for grid.",
+                    }
+
+        return None

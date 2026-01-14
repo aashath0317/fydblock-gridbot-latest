@@ -17,6 +17,7 @@ class OrderStatusTracker:
         order_book: OrderBook,
         order_execution_strategy,
         event_bus: EventBus,
+        trading_pair: str,
         polling_interval: float = 15.0,
     ):
         """
@@ -32,6 +33,7 @@ class OrderStatusTracker:
         self.order_execution_strategy = order_execution_strategy
         self.event_bus = event_bus
         self.polling_interval = polling_interval
+        self.trading_pair = trading_pair
         self._monitoring_task = None
         self._active_tasks = set()
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -173,6 +175,10 @@ class OrderStatusTracker:
                             if isinstance(order_data, dict)
                             else getattr(order_data, "pair", None)
                         )
+
+                        # Fallback to known trading pair if missing in update (common in some WS streams)
+                        if not symbol:
+                            symbol = self.trading_pair
 
                         if not symbol:
                             self.logger.error(f"Cannot recover orphan order {order_id}: Symbol missing in update data.")

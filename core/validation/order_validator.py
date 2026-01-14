@@ -69,13 +69,20 @@ class OrderValidator:
             InsufficientCryptoBalanceError: If the crypto balance is insufficient to place any valid order.
             InvalidOrderQuantityError: If the adjusted quantity is invalid.
         """
-        if crypto_balance < order_quantity * self.threshold_ratio:
-            raise InsufficientCryptoBalanceError(
-                f"Crypto balance {crypto_balance:.6f} is far below the required quantity {order_quantity:.6f} "
-                f"(threshold ratio: {self.threshold_ratio}).",
-            )
+        if crypto_balance < order_quantity:
+            # Check for "micro-shortfall" or Rounding Error (within 1% tolerance)
+            # If the shortfall is tiny, we clamp the order to the available balance
+            if crypto_balance >= order_quantity * 0.99:
+                adjusted_quantity = crypto_balance  # Use everything we have
+            else:
+                # Real Insufficient Balance
+                raise InsufficientCryptoBalanceError(
+                    f"Crypto balance {crypto_balance:.6f} < required {order_quantity:.6f}."
+                )
+        else:
+            adjusted_quantity = order_quantity
 
-        adjusted_quantity = min(order_quantity, crypto_balance - self.tolerance)
+        # Enforce minimums or other checks
         self._validate_quantity(adjusted_quantity, is_buy=False)
         return adjusted_quantity
 

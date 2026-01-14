@@ -18,6 +18,7 @@ class OrderStatus(Enum):
     CLOSED = "closed"
     CANCELED = "canceled"
     EXPIRED = "expired"
+    PARTIALLY_FILLED = "partially_filled"
     REJECTED = "rejected"
     UNKNOWN = "unknown"
 

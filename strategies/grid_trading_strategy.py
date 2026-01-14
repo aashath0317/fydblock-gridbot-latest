@@ -8,6 +8,7 @@ from config.trading_mode import TradingMode
 from core.bot_management.event_bus import EventBus, Events
 from core.grid_management.grid_manager import GridManager
 from core.order_handling.balance_tracker import BalanceTracker
+from core.order_handling.order import OrderSide
 from core.order_handling.order_manager import OrderManager
 from core.services.exchange_interface import ExchangeInterface
 from strategies.plotter import Plotter
@@ -46,6 +47,9 @@ class GridTradingStrategy(TradingStrategyInterface):
         self.data = self._initialize_historical_data()
         self.live_trading_metrics = []
         self._running = True
+
+        # Subscribe to Order Fills for Dynamic Trailing
+        self.event_bus.subscribe(Events.ORDER_FILLED, self._handle_order_filled)
 
     def _initialize_historical_data(self) -> pd.DataFrame | None:
         if self.trading_mode != TradingMode.BACKTEST:
@@ -125,43 +129,71 @@ class GridTradingStrategy(TradingStrategyInterface):
             balances = await self.exchange_service.get_balance()
             base_currency, quote_currency = self.trading_pair.split("/")
 
-            # 1. Get Actual Wallet Balances
-            actual_crypto_balance = float(balances.get(base_currency, {}).get("free", 0.0))
-            actual_fiat_balance = float(balances.get(quote_currency, {}).get("free", 0.0))
+            # 1. Get Actual Wallet Balances (Free & Total)
+            # Free: Available for new orders
+            # Total: Free + Locked in Open Orders (Net Worth)
+            free_crypto_balance = float(balances.get(base_currency, {}).get("free", 0.0))
+            free_fiat_balance = float(balances.get(quote_currency, {}).get("free", 0.0))
+
+            total_crypto_balance = float(balances.get(base_currency, {}).get("total", 0.0))
+            total_fiat_balance = float(balances.get(quote_currency, {}).get("total", 0.0))
 
             # 2. Get User's Investment Limit
             investment_amount = self.config_manager.get_investment_amount()
-            self.logger.info(f"   ?? Wallet Has: {actual_fiat_balance} {quote_currency}")
+            self.logger.info(f"   ?? Wallet Free: {free_fiat_balance} {quote_currency}")
+            self.logger.info(
+                f"   ?? Wallet Net Worth: {total_fiat_balance} {quote_currency} (Fiat) + {total_crypto_balance} {base_currency} (Crypto)"
+            )
             self.logger.info(f"   ?? User Allocated: {investment_amount} {quote_currency}")
 
             # 3. Check for Active Orders (Hot Boot detection)
             has_active_orders = self.order_manager.has_active_orders()
 
-            # 4. Validate Funds
-            # FIX: If we have active orders, we expect the wallet balance to be lower (funds locked).
-            # So we SKIP the strict check in that case.
-            if actual_fiat_balance < investment_amount:
-                if has_active_orders:
-                    self.logger.warning(
-                        f"🔥 Hot Boot Detected: Wallet balance ({actual_fiat_balance}) < Investment ({investment_amount}). "
-                        f"Assuming difference is locked in active orders. Proceeding."
-                    )
-                else:
-                    self.logger.error(
-                        f"? INSUFFICIENT FUNDS: Wallet has {actual_fiat_balance} {quote_currency}, "
-                        f"but strategy requires {investment_amount} {quote_currency}."
-                    )
-                    self._running = False
-                    return
+            # 4. Validate Funds (Equity Check uses NET WORTH)
+            # Calculate Total Equity (Total Fiat + Total Crypto Value)
+            current_price = await self.exchange_service.get_current_price(self.trading_pair)
+            crypto_value = total_crypto_balance * current_price
+            total_equity = total_fiat_balance + crypto_value
 
-            # 4. Cap the Bot's Balance to the Investment Amount
+            # Tolerance for price fluctuations/fees (e.g. 98% of investment is okay)
+            required_equity = investment_amount * 0.98
+
+            self.logger.info(
+                f"   💰 Total Equity: {total_equity:.2f} {quote_currency} "
+                f"(Fiat: {total_fiat_balance:.2f}, Crypto Value: {crypto_value:.2f})"
+            )
+
+            if total_equity < required_equity:
+                # If we have active orders, we might be mid-trade, so we are lenient?
+                # But for now, we trust Total Equity.
+                error_msg = (
+                    f"❌ INSUFFICIENT FUNDS: Total Equity ({total_equity:.2f}) < "
+                    f"Investment ({investment_amount:.2f}). "
+                    f"Wallet Total: {total_fiat_balance:.2f} {quote_currency} + "
+                    f"{total_crypto_balance:.4f} {base_currency}."
+                )
+                self.logger.error(error_msg)
+                raise Exception(error_msg)
+
+            # If Equity is sufficient but Fiat is low, we warn but PROCEED.
+            # The bot will place Sell orders with the crypto and Buy orders with the fiat.
+            if total_fiat_balance < investment_amount * 0.1:  # warn if very low fiat
+                self.logger.warning(
+                    f"⚠️ Low Fiat Balance ({total_fiat_balance:.2f}). "
+                    f"Bot will rely heavily on existing Crypto ({total_crypto_balance:.4f}) for Sell orders."
+                )
+
+            # 5. Initialize Tracker with FREE/AVAILABLE values
+            # The Order Manager will account for the "Locked" funds as it reconciles orders.
+            # Balance Tracker only cares about what it can SPEND right now.
+            self.balance_tracker.initialize_balances(free_fiat_balance, free_crypto_balance)
             # We ignore any extra money in the wallet so the bot doesn't touch it.
             effective_fiat_balance = investment_amount
 
             # NOTE: For safety, we usually start with 0 crypto in the bot's internal tracker
             # unless we specifically want to use existing bags.
             # Here we pass the wallet's crypto, but the bot will primarily use the allocated USDT.
-            effective_crypto_balance = actual_crypto_balance
+            effective_crypto_balance = free_crypto_balance
 
             self.logger.info(
                 f"   ? Bot Initialized with: {effective_fiat_balance} {quote_currency} (Capped at investment)"
@@ -440,6 +472,161 @@ class GridTradingStrategy(TradingStrategyInterface):
             )
             return True
         return False
+
+    async def _handle_order_filled(self, order) -> None:
+        """
+        Handles order fills to trigger Dynamic Trailing (Infinity Grid).
+        """
+        if not self._running:
+            return
+
+        # 1. Identify if this order is an "Edge" order (Top Sell or Bottom Buy)
+        # We check against the CURRENT grid state (before this fill potentially changed it?)
+        # Actually, if the order fills, the current price is at that level.
+        # We need to know if it was the Highest Sell or Lowest Buy.
+
+        sorted_grids = sorted(self.grid_manager.price_grids)
+        if not sorted_grids:
+            return
+
+        highest_price = sorted_grids[-1]
+        lowest_price = sorted_grids[0]
+
+        # Use a small tolerance for floating point comparison
+        is_highest_sell = order.side == OrderSide.SELL and abs(order.price - highest_price) < 1e-6
+        is_lowest_buy = order.side == OrderSide.BUY and abs(order.price - lowest_price) < 1e-6
+
+        if is_highest_sell:
+            await self._trail_up(order)
+        elif is_lowest_buy:
+            await self._trail_down(order)
+
+    async def _trail_up(self, filled_order) -> None:
+        self.logger.info(f"🚀 Trailing UP triggered by fill at {filled_order.price}")
+
+        # 1. Inventory Adjustment (Re-buy Base Currency)
+        # "The bot immediately performs a Market Buy... for the same quantity... that was just sold."
+        try:
+            # We use the raw amount from the filled order
+            quantity_to_buy = filled_order.amount
+
+            # Use OrderManager strategies to execute market buy
+            # We treat this as a helper operation, not a grid order
+            # Note: We must ensure we have enough USDT. But we just sold, so we should have it.
+            buy_order = await self.order_manager.order_execution_strategy.execute_market_order(
+                OrderSide.BUY, self.trading_pair, quantity_to_buy, filled_order.price
+            )
+
+            if buy_order:
+                self.logger.info(f"   Inventory Re-buy Successful: {buy_order.filled} @ {buy_order.average}")
+                # Update Balance Tracker (Deduct cost, Add crypto)
+                # cost = amount * price + fee
+                # BalanceTracker expects an Order object.
+                # We can manually register it or use register_open_order logic (but it's filled)
+                # Let's manually trigger update
+                await self.balance_tracker.update_balance_on_order_completion(buy_order)
+            else:
+                self.logger.error("   Inventory Re-buy Failed: No order returned.")
+
+        except Exception as e:
+            self.logger.error(f"   Failed to re-buy inventory: {e}", exc_info=True)
+            # Proceed? SRS says logic continues.
+
+        # 2. Grid Shift (Remove Low, Add High)
+        removed_price, new_top_price = self.grid_manager.extend_grid_up()
+
+        # 3. Cancel the Lowest Buy Order (at removed_price)
+        # We must release the funds locked by this order
+        try:
+            # Find the order in OrderBook
+            orders = self.order_manager.order_book.get_open_orders()
+            target_order = None
+            for o in orders:
+                if abs(o.price - removed_price) < 1e-6 and o.side == OrderSide.BUY:
+                    target_order = o
+                    break
+
+            if target_order:
+                self.logger.info(f"   Cancelling Lowest Buy Order at {removed_price}...")
+                await self.order_manager.order_execution_strategy.cancel_order(
+                    target_order.identifier, self.trading_pair
+                )
+
+                # Manually Release Reserved Funds (Since OrderManager event doesn't do it)
+                cost = target_order.remaining * target_order.price
+                self.balance_tracker.reserved_fiat -= cost
+                self.balance_tracker.balance += cost
+                self.logger.info(f"   Released {cost:.2f} reserved fiat.")
+
+                # Force status update locally (OrderManager event will eventually confirm)
+                target_order.status = "CANCELLED"
+            else:
+                self.logger.warning(f"   Could not find active order at removed grid {removed_price} to cancel.")
+
+        except Exception as e:
+            self.logger.error(f"   Failed to cancel lowest buy order: {e}", exc_info=True)
+
+        # 4. Place New Sell Order at Top
+        self.logger.info(f"   Placing New Top Sell Order at {new_top_price}...")
+        await self.order_manager._place_limit_order_safe(new_top_price, OrderSide.SELL)
+
+    async def _trail_down(self, filled_order) -> None:
+        self.logger.info(f"📉 Trailing DOWN triggered by fill at {filled_order.price}")
+
+        # 1. Grid Shift First? No, SRS says: "Identify Highest Sell -> Cancel -> Market Sell"
+
+        # Get the Highest Sell Price BEFORE shifting?
+        # GridManager hasn't shifted yet.
+        highest_price = sorted(self.grid_manager.price_grids)[-1]
+
+        # 2. Cancel Highest Sell Order
+        quantity_released = 0.0
+        try:
+            orders = self.order_manager.order_book.get_open_orders()
+            target_order = None
+            for o in orders:
+                if abs(o.price - highest_price) < 1e-6 and o.side == OrderSide.SELL:
+                    target_order = o
+                    break
+
+            if target_order:
+                self.logger.info(f"   Cancelling Highest Sell Order at {highest_price}...")
+                await self.order_manager.order_execution_strategy.cancel_order(
+                    target_order.identifier, self.trading_pair
+                )
+
+                # Manually Release Reserved Funds
+                quantity_released = target_order.remaining
+                self.balance_tracker.reserved_crypto -= quantity_released
+                self.balance_tracker.crypto_balance += quantity_released
+                self.logger.info(f"   Released {quantity_released:.6f} reserved crypto.")
+
+                target_order.status = "CANCELLED"
+            else:
+                self.logger.warning(f"   Could not find active order at highest grid {highest_price} to cancel.")
+
+        except Exception as e:
+            self.logger.error(f"   Failed to cancel highest sell order: {e}", exc_info=True)
+
+        # 3. Inventory Adjustment (Liquidation)
+        # "Immediately performs a Market Sell of that released Base Currency"
+        if quantity_released > 0:
+            try:
+                sell_order = await self.order_manager.order_execution_strategy.execute_market_order(
+                    OrderSide.SELL, self.trading_pair, quantity_released, filled_order.price
+                )
+                if sell_order:
+                    self.logger.info(f"   Inventory Liquidation Successful: {sell_order.filled} @ {sell_order.average}")
+                    await self.balance_tracker.update_balance_on_order_completion(sell_order)
+            except Exception as e:
+                self.logger.error(f"   Failed to liquidate inventory: {e}", exc_info=True)
+
+        # 4. Grid Shift (Remove High, Add Low)
+        removed_price, new_bottom_price = self.grid_manager.extend_grid_down()
+
+        # 5. Place New Buy Order at Bottom
+        self.logger.info(f"   Placing New Bottom Buy Order at {new_bottom_price}...")
+        await self.order_manager._place_limit_order_safe(new_bottom_price, OrderSide.BUY)
 
     def get_formatted_orders(self):
         return self.trading_performance_analyzer.get_formatted_orders()

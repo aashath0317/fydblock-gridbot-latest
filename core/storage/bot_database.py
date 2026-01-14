@@ -24,21 +24,34 @@ class BotDatabase:
             )
         """)
 
-        # Schema Migration: Add config_json to existing table if missing
-        try:
-            cursor.execute("ALTER TABLE bots ADD COLUMN config_json TEXT")
-        except sqlite3.OperationalError:
-            # Column likely already exists
-            pass
-
-        # 2. Grid Orders Table
-        # We enforce a UNIQUE constraint on (bot_id, price, status)
-        # so we physically cannot duplicate an open order at the same price.
+        # 2. System Logs Table (Logging)
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS grid_orders (
+            CREATE TABLE IF NOT EXISTS system_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bot_id INTEGER,
-                order_id TEXT,
+                severity TEXT,
+                message TEXT,
+                fix_action TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Schema Migration: Add config_json to existing table if missing
+        cursor.execute("PRAGMA table_info(bots)")
+        bot_columns = [info[1] for info in cursor.fetchall()]
+        if "config_json" not in bot_columns:
+            try:
+                cursor.execute("ALTER TABLE bots ADD COLUMN config_json TEXT")
+                self.logger.info("🔄 DB: Migrated bots table - Added 'config_json'")
+            except Exception as e:
+                self.logger.error(f"Failed to add config_json to bots: {e}")
+                self.logger.error(f"Failed to add config_json to bots: {e}")
+
+        # 3. Grid Orders Table (Active Orders)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS grid_orders (
+                bot_id INTEGER,
+                order_id TEXT PRIMARY KEY,
                 price REAL,
                 side TEXT,
                 quantity REAL,
@@ -47,25 +60,8 @@ class BotDatabase:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_grid_orders_bot_price_status ON grid_orders (bot_id, price, status)"
-        )
 
-        # 2. System Logs Table (New)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS system_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bot_id INTEGER,
-                severity TEXT,
-                message TEXT,
-                fix_action TEXT,
-                read_status BOOLEAN DEFAULT 0,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_logs_bot_timestamp ON system_logs (bot_id, timestamp)")
-
-        # 3. Trade History Table (New)
+        # 5. Trade History Table (New)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS trade_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +77,37 @@ class BotDatabase:
                 executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_bot_time ON trade_history (bot_id, executed_at)")
+
+        # 4. Bot Balances Table (New)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_balances (
+                bot_id INTEGER PRIMARY KEY,
+                fiat_balance REAL,
+                crypto_balance REAL,
+                reserve_amount REAL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Robust Migration for bot_balances
+        cursor.execute("PRAGMA table_info(bot_balances)")
+        balance_columns = [info[1] for info in cursor.fetchall()]
+
+        if "reserve_amount" not in balance_columns:
+            try:
+                cursor.execute("ALTER TABLE bot_balances ADD COLUMN reserve_amount REAL DEFAULT 0.0")
+                self.logger.info("🔄 DB: Migrated bot_balances table - Added 'reserve_amount'")
+            except Exception as e:
+                self.logger.error(f"Failed to add reserve_amount column: {e}")
+
+        if "updated_at" not in balance_columns:
+            try:
+                # SQLite limitation: ALTER TABLE ADD COLUMN cannot have non-constant default like CURRENT_TIMESTAMP
+                # We add it as NULLable (default NULL) since we explicitly set it on INSERT/UPDATE anyway.
+                cursor.execute("ALTER TABLE bot_balances ADD COLUMN updated_at TIMESTAMP")
+                self.logger.info("🔄 DB: Migrated bot_balances table - Added 'updated_at'")
+            except Exception as e:
+                self.logger.error(f"Failed to add updated_at column: {e}")
 
         conn.commit()
         conn.close()
@@ -224,6 +250,107 @@ class BotDatabase:
         conn.close()
         return result[0] if result else None
 
+    # --- Bot Balances Persistence (New) ---
+    def _repair_schema(self, missing_column: str = None):
+        """Attempts to repair schema if columns are missing or PK is invalid."""
+        self.logger.warning(f"🔧 DB: Attempting schema repair. Detected issue: {missing_column}")
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            # 1. Check if bot_id is Primary Key
+            cursor.execute("PRAGMA table_info(bot_balances)")
+            columns = cursor.fetchall()
+            # col format: (cid, name, type, notnull, dflt_value, pk)
+            bot_id_pk = False
+            for col in columns:
+                if col[1] == "bot_id" and col[5] >= 1:  # pk > 0 means it is a PK
+                    bot_id_pk = True
+                    break
+
+            if not bot_id_pk:
+                self.logger.warning("️⚠️ DB: 'bot_balances' table missing Primary Key on bot_id. Recreating table...")
+                cursor.execute("DROP TABLE IF EXISTS bot_balances")
+                cursor.execute("""
+                    CREATE TABLE bot_balances (
+                        bot_id INTEGER PRIMARY KEY,
+                        fiat_balance REAL,
+                        crypto_balance REAL,
+                        reserve_amount REAL DEFAULT 0.0,
+                        updated_at TIMESTAMP
+                    )
+                """)
+                self.logger.info("✅ DB: Recreated 'bot_balances' with correct schema.")
+                conn.commit()
+                return  # Table recreated, no need to add columns
+
+            # 2. Check for missing columns (if table wasn't dropped)
+            existing_col_names = [col[1] for col in columns]
+
+            # Force add columns if they are suspected missing
+            columns_to_check = [("reserve_amount", "REAL DEFAULT 0.0"), ("updated_at", "TIMESTAMP")]
+
+            for col, type_def in columns_to_check:
+                if col not in existing_col_names:
+                    try:
+                        cursor.execute(f"ALTER TABLE bot_balances ADD COLUMN {col} {type_def}")
+                        self.logger.info(f"🔧 DB: Repaired schema - Added '{col}'")
+                    except sqlite3.OperationalError:
+                        pass
+            conn.commit()
+        except Exception as e:
+            self.logger.error(f"Failed to repair schema: {e}")
+        finally:
+            conn.close()
+
+    def update_balances(self, bot_id: int, fiat: float, crypto: float, reserve: float):
+        """Upserts the bot's known balances."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO bot_balances (bot_id, fiat_balance, crypto_balance, reserve_amount, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(bot_id) DO UPDATE SET
+                    fiat_balance=excluded.fiat_balance,
+                    crypto_balance=excluded.crypto_balance,
+                    reserve_amount=excluded.reserve_amount,
+                    updated_at=CURRENT_TIMESTAMP
+            """,
+                (bot_id, fiat, crypto, reserve),
+            )
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            err_msg = str(e).lower()
+            if "no column" in err_msg or "on conflict" in err_msg or "constraint" in err_msg:
+                self.logger.warning(f"⚠️ DB Schema Mismatch/Corruption detected: {e}. Triggering repair/recreation...")
+                conn.close()  # Close current connection before repair
+                self._repair_schema()
+                # Use recursive call to retry once.
+                return self.update_balances(bot_id, fiat, crypto, reserve)
+            else:
+                self.logger.error(f"Failed to update balances (OperationalError): {e}")
+        except Exception as e:
+            self.logger.error(f"Failed to update balances: {e}")
+        finally:
+            # Only close if not already closed/retried
+            try:
+                conn.close()
+            except:
+                pass
+
+    def get_balances(self, bot_id: int):
+        """Returns the last saved balances: (fiat, crypto, reserve) or None."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM bot_balances WHERE bot_id = ?", (bot_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return dict(row)
+        return None
+
     # --- System Logs Methods ---
     def log_event(self, bot_id: int, severity: str, message: str, fix_action: str = None):
         """Inserts a structured log event."""
@@ -240,7 +367,8 @@ class BotDatabase:
             conn.commit()
         except Exception as e:
             # Fallback to standard logging if DB fails
-            self.logger.error(f"Failed to write to DB Log: {e}")
+            # Avoid using self.logger.error here as it might trigger recursion if this IS the db logger
+            print(f"CRITICAL: Failed to write to DB Log: {e}")
         finally:
             conn.close()
 

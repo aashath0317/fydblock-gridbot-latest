@@ -195,6 +195,7 @@ async def recover_active_bots():
                         event_bus=event_bus,
                         no_plot=True,
                         bot_id=bot_id,
+                        db=db,
                     )
 
                     # Force Hot Boot
@@ -290,6 +291,7 @@ async def start_bot(req: BotRequest):
             event_bus=event_bus,
             no_plot=True,
             bot_id=req.bot_id,
+            db=db,
         )
 
         # Update DB Status & Config immediately to Lock it and ensure persistence
@@ -603,6 +605,10 @@ async def run_backtest(req: BacktestRequest):
             notification_handler=notification_handler,
             event_bus=event_bus,
             no_plot=True,
+            # Backtest doesn't use the persistence DB for balances in the same way,
+            # but we can pass it if we want logs. For now, let's pass None or db.
+            # Passing None to avoid polluting the prod DB with backtest data.
+            db=None,
         )
 
         logger.info(f"Starting backtest for {req.pair}...")

@@ -205,7 +205,9 @@ class LiveExchangeService(ExchangeInterface):
 
             except asyncio.CancelledError:
                 self.logger.info("User stream task cancelled.")
-                self.connection_active = False
+                # FIX: Do NOT set self.connection_active = False here.
+                # This shared flag controls the Ticker Stream too. If we kill it here,
+                # the Ticker Stream exits and closes the Exchange Session while we still need it.
                 break
 
             except Exception as e:

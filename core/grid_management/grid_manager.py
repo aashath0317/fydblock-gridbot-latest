@@ -584,3 +584,105 @@ class GridManager:
             config_json = json.dumps(self.config_manager.config)
             db.update_bot_status(self.bot_id, "RUNNING", config_json)
             self.logger.info("💾 Grid Configuration Persisted to DB.")
+
+    def calculate_next_price_up(self, current_highest: float) -> float:
+        """Calculates the next grid price ABOVE the current highest."""
+        _, _, num_grids, spacing_type = self._extract_grid_config()
+        # Note: num_grids in config is technically intervals or levels?
+        # In _calculate... we generate num_grids + 1 points.
+        # Spacing is derived from current range.
+
+        # We need the current Grid Gap or Ratio
+        sorted_grids = sorted(self.price_grids)
+        if len(sorted_grids) < 2:
+            return current_highest * 1.01  # Fallback
+
+        if spacing_type == SpacingType.ARITHMETIC:
+            gap = sorted_grids[-1] - sorted_grids[-2]
+            return current_highest + gap
+        else:  # GEOMETRIC
+            # Be careful with floating point math.
+            if sorted_grids[-2] == 0:
+                ratio = 1.01
+            else:
+                ratio = sorted_grids[-1] / sorted_grids[-2]
+            return current_highest * ratio
+
+    def calculate_next_price_down(self, current_lowest: float) -> float:
+        """Calculates the next grid price BELOW the current lowest."""
+        _, _, num_grids, spacing_type = self._extract_grid_config()
+
+        sorted_grids = sorted(self.price_grids)
+        if len(sorted_grids) < 2:
+            return current_lowest * 0.99
+
+        if spacing_type == SpacingType.ARITHMETIC:
+            gap = sorted_grids[1] - sorted_grids[0]
+            return current_lowest - gap
+        else:  # GEOMETRIC
+            if sorted_grids[0] == 0:
+                ratio = 1.01
+            else:
+                ratio = sorted_grids[1] / sorted_grids[0]
+            return current_lowest / ratio
+
+    def extend_grid_up(self) -> tuple[float, float]:
+        """
+        Shifts the grid UP by one level (Infinity Grid).
+        Removes Lowest -> Adds New Highest.
+        Returns (removed_price, added_price)
+        """
+        sorted_grids = sorted(self.price_grids)
+        lowest_price = sorted_grids[0]
+        highest_price = sorted_grids[-1]
+
+        # 1. Calculate New Top
+        new_top = self.calculate_next_price_up(highest_price)
+
+        # 2. Modify State
+        if lowest_price in self.price_grids:
+            self.price_grids.remove(lowest_price)
+        if lowest_price in self.grid_levels:
+            del self.grid_levels[lowest_price]
+
+        self.price_grids.append(new_top)
+        # Create new level as READY_TO_SELL (It's above price)
+        self.grid_levels[new_top] = GridLevel(new_top, GridCycleState.READY_TO_SELL)
+
+        # 3. Update Persisted Config (Shift Range)
+        # We set new bottom to the *new* lowest grid (which was the 2nd lowest)
+        new_bottom_config = sorted(self.price_grids)[0]
+        self._update_and_persist_config(new_bottom_config, new_top)
+
+        self.logger.info(f"🕸️ Infinity Grid Shift UP: Removed {lowest_price:.4f}, Added {new_top:.4f}")
+        return lowest_price, new_top
+
+    def extend_grid_down(self) -> tuple[float, float]:
+        """
+        Shifts the grid DOWN by one level (Infinity Grid).
+        Removes Highest -> Adds New Lowest.
+        Returns (removed_price, added_price)
+        """
+        sorted_grids = sorted(self.price_grids)
+        lowest_price = sorted_grids[0]
+        highest_price = sorted_grids[-1]
+
+        # 1. Calculate New Bottom
+        new_bottom = self.calculate_next_price_down(lowest_price)
+
+        # 2. Modify State
+        if highest_price in self.price_grids:
+            self.price_grids.remove(highest_price)
+        if highest_price in self.grid_levels:
+            del self.grid_levels[highest_price]
+
+        self.price_grids.append(new_bottom)
+        # Create new level as READY_TO_BUY (It's below price)
+        self.grid_levels[new_bottom] = GridLevel(new_bottom, GridCycleState.READY_TO_BUY)
+
+        # 3. Update Config
+        new_top_config = sorted(self.price_grids)[-1]
+        self._update_and_persist_config(new_bottom, new_top_config)
+
+        self.logger.info(f"🕸️ Infinity Grid Shift DOWN: Removed {highest_price:.4f}, Added {new_bottom:.4f}")
+        return highest_price, new_bottom

@@ -42,19 +42,26 @@ class GridTradingBot:
         save_performance_results_path: str | None = None,
         no_plot: bool = False,
         bot_id: int | None = None,
+        db: Any = None,  # BotDatabase
     ):
         try:
             self.bot_id = bot_id
+            self.db = db
             self.logger = logging.getLogger(self.__class__.__name__)
             self.config_path = config_path
             self.config_manager = config_manager
-            self.notification_handler = notification_handler
+            # ... (retained code) ...
+            self.trading_mode: TradingMode = self.config_manager.get_trading_mode()
+            strategy_type: StrategyType = self.config_manager.get_strategy_type()
+            self.logger.info(
+                f"Starting Grid Trading Bot in {self.trading_mode.value} mode with strategy: {strategy_type.value}"
+            )
             self.event_bus = event_bus
             self.event_bus.subscribe(Events.STOP_BOT, self._handle_stop_bot_event)
             self.event_bus.subscribe(Events.START_BOT, self._handle_start_bot_event)
+            self.notification_handler = notification_handler  # FIX: Assign this!
             self.save_performance_results_path = save_performance_results_path
             self.no_plot = no_plot
-            self.trading_mode: TradingMode = self.config_manager.get_trading_mode()
             base_currency: str = self.config_manager.get_base_currency()
             quote_currency: str = self.config_manager.get_quote_currency()
 
@@ -85,6 +92,8 @@ class GridTradingBot:
                 trading_mode=self.trading_mode,
                 base_currency=base_currency,
                 quote_currency=quote_currency,
+                db=self.db,
+                bot_id=self.bot_id,
             )
             order_book = OrderBook()
 
@@ -92,6 +101,7 @@ class GridTradingBot:
                 order_book=order_book,
                 order_execution_strategy=order_execution_strategy,
                 event_bus=self.event_bus,
+                trading_pair=self.trading_pair,
                 polling_interval=5.0,
             )
 
