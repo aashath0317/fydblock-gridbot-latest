@@ -3,6 +3,7 @@ import logging
 import math
 import time
 
+
 import aiohttp
 import pandas as pd
 
@@ -62,8 +63,6 @@ class OrderManager:
 
         self.event_bus.subscribe(Events.ORDER_FILLED, self._on_order_filled)
         self.event_bus.subscribe(Events.ORDER_CANCELLED, self._on_order_cancelled)
-
-    import time
 
     def _throttled_warning(self, msg: str, key: str, interval: int = 60):
         """Logs a warning only if 'interval' seconds have passed since the last log for 'key'."""
@@ -276,6 +275,16 @@ class OrderManager:
     async def _on_order_cancelled(self, order: Order) -> None:
         if self.bot_id:
             self.db.update_order_status(order.identifier, "CANCELLED")
+
+        # FIX: Release Reserved Funds
+        if order.side == OrderSide.BUY:
+            # For BUY, we reserved (Price * Amount)
+            # Use remaining amount to calculate what to release
+            release_amount = order.remaining * order.price
+            self.balance_tracker.release_reserve_for_buy(release_amount)
+        elif order.side == OrderSide.SELL:
+            # For SELL, we reserved (Amount) of crypto
+            self.balance_tracker.release_reserve_for_sell(order.remaining)
 
         await self.notification_handler.async_send_notification(
             NotificationType.ORDER_CANCELLED,
@@ -518,10 +527,11 @@ class OrderManager:
                         self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
 
         # Balance Check before recovery loop to stop spam
-        MIN_FIAT_THRESHOLD = 5.0
-        MIN_CRYPTO_THRESHOLD = 0.05
-        has_fiat = self.balance_tracker.balance > MIN_FIAT_THRESHOLD
-        has_crypto = self.balance_tracker.crypto_balance > MIN_CRYPTO_THRESHOLD
+        # Balance Check before recovery loop to stop spam
+        min_fiat_threshold = 5.0
+        min_crypto_threshold = 0.05
+        has_fiat = self.balance_tracker.balance > min_fiat_threshold
+        has_crypto = self.balance_tracker.crypto_balance > min_crypto_threshold
 
         # Dynamic Dead Zone: Use the GridManager's logic
         safe_buy_limit, safe_sell_limit = self.grid_manager.get_dead_zone_thresholds(current_price)
@@ -531,6 +541,20 @@ class OrderManager:
 
         # Dynamic Dead Zone: Use the GridManager's logic
         safe_buy_limit, safe_sell_limit = self.grid_manager.get_dead_zone_thresholds(current_price)
+
+        # --- Count Active Grid Orders ---
+        # Only count orders that match a valid grid level.
+        # This prevents orphaned orders or manual trades from blocking the grid logic.
+        active_grid_order_count = 0
+        valid_grid_prices = list(self.grid_manager.grid_levels.keys())
+        for o in exchange_orders:
+            try:
+                op = float(o["price"])
+                if any(math.isclose(op, gp, rel_tol=1e-3) for gp in valid_grid_prices):
+                    active_grid_order_count += 1
+            except (ValueError, KeyError):
+                pass
+        # --------------------------------
 
         # Check BUY Grids
         for price in self.grid_manager.sorted_buy_grids:
@@ -549,9 +573,9 @@ class OrderManager:
             # --- STRICT ORDER COUNT GUARD ---
             # If we are already at (or above) capacity, do NOT place new orders.
             # This prevents the "46th order" bug.
-            if len(exchange_orders) >= self.grid_manager.num_grids:
+            if active_grid_order_count >= self.grid_manager.num_grids:
                 self._throttled_warning(
-                    f"🛑 Max orders reached ({len(exchange_orders)}/{self.grid_manager.num_grids}). Skipping BUY at {price}.",
+                    f"🛑 Max orders reached ({active_grid_order_count}/{self.grid_manager.num_grids}). Skipping BUY at {price}.",
                     f"max_orders_buy_{self.bot_id}",
                 )
                 break
@@ -595,9 +619,9 @@ class OrderManager:
                 continue
 
             # --- STRICT ORDER COUNT GUARD ---
-            if len(exchange_orders) >= self.grid_manager.num_grids:
+            if active_grid_order_count >= self.grid_manager.num_grids:
                 self._throttled_warning(
-                    f"🛑 Max orders reached ({len(exchange_orders)}/{self.grid_manager.num_grids}). Skipping SELL at {price}.",
+                    f"🛑 Max orders reached ({active_grid_order_count}/{self.grid_manager.num_grids}). Skipping SELL at {price}.",
                     f"max_orders_sell_{self.bot_id}",
                 )
                 break

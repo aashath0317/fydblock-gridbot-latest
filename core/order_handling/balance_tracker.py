@@ -393,6 +393,38 @@ class BalanceTracker:
         )
         self._persist_balances()
 
+    def release_reserve_for_buy(self, amount: float) -> None:
+        """
+        Releases reserved fiat when a buy order is cancelled.
+
+        Args:
+            amount: The amount of fiat to release.
+        """
+        # Ensure we don't release more than reserved (sanity check)
+        amount_to_release = min(amount, self.reserved_fiat)
+
+        self.reserved_fiat -= amount_to_release
+        self.balance += amount_to_release
+        self.logger.info(f"Released {amount_to_release} fiat from reserve (Cancelled Buy). Balance: {self.balance}.")
+        self._persist_balances()
+
+    def release_reserve_for_sell(self, quantity: float) -> None:
+        """
+        Releases reserved crypto when a sell order is cancelled.
+
+        Args:
+            quantity: The quantity of crypto to release.
+        """
+        # Ensure we don't release more than reserved
+        qty_to_release = min(quantity, self.reserved_crypto)
+
+        self.reserved_crypto -= qty_to_release
+        self.crypto_balance += qty_to_release
+        self.logger.info(
+            f"Released {qty_to_release} crypto from reserve (Cancelled Sell). Crypto Balance: {self.crypto_balance}."
+        )
+        self._persist_balances()
+
     def register_open_order(self, order: Order, deduct_from_balance: bool = True) -> None:
         """
         Registers an existing open order (e.g. from Hot Boot) with the tracker,
