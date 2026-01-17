@@ -151,7 +151,7 @@ class BalanceTracker:
         Forces an update of the available (free) balance from the exchange.
         This ensures the bot doesn't try to spend funds it doesn't actually have.
         """
-        if self.trading_mode != TradingMode.LIVE:
+        if self.trading_mode not in [TradingMode.LIVE, TradingMode.PAPER_TRADING]:
             return
 
         try:
@@ -245,19 +245,25 @@ class BalanceTracker:
             # Fallback: Assume fee is in Quote (old behavior)
             fee_in_quote = estimated_fee
 
-        # 2. Update Fiat Reserve
-        # We reserved 'quantity * price' roughly.
-        # If fee is in Quote, cost is Price*Qty + Fee (if additive) or included.
-        # usually Buy Cost = Price * Qty. Fee is separate or deducted.
-        # Safe assumption: We release the locked amount.
+        # 2. Update Fiat Reserve & Operational Reserve
+        # Buy Cost usually comes from 'reserved_fiat' (Funds locked for this Grid).
         self.reserved_fiat -= cost_in_fiat
 
-        # Handle "Fee in Quote" extra cost if handled that way
+        # Handle "Fee in Quote"
+        # Logic: Try to pay fee from Operational Reserve (Fee Reserve) first.
+        # If not enough, pay from Balance or Reserved Fiat.
         if fee_in_quote > 0:
-            if self.reserved_fiat >= fee_in_quote:
-                self.reserved_fiat -= fee_in_quote
+            if self.operational_reserve >= fee_in_quote:
+                self.operational_reserve -= fee_in_quote
+                self.logger.info(f"Paid {fee_in_quote:.4f} fee from Operational Reserve.")
             else:
-                self.balance -= fee_in_quote
+                # Reserve empty, fallback to balance
+                remaining_fee = fee_in_quote - self.operational_reserve
+                self.operational_reserve = 0.0
+
+                # Deduct from general balance (or remaining reserved fiat if applicable)
+                self.balance -= remaining_fee
+                self.logger.info(f"Paid fee partially/fully from Balance ({remaining_fee:.4f}).")
 
         if self.reserved_fiat < 0:
             self.balance += self.reserved_fiat  # Release excess or cover small deficit
@@ -289,47 +295,53 @@ class BalanceTracker:
             self.crypto_balance += abs(self.reserved_crypto)  # Adjust with excess reserved crypto
             self.reserved_crypto = 0
 
-        # --- Dynamic Fee Stabilization (FR-01/02) ---
-        # 1. Calculate Replacement Cost (Fee * Safety Multiplier)
-        # We assume we need to buy back roughly same amount, so fee will be similar.
-        safety_multiplier = 1.1
-        replacement_cost = fee * safety_multiplier
+        if self.reserved_crypto < 0:
+            self.crypto_balance += abs(self.reserved_crypto)  # Adjust with excess reserved crypto
+            self.reserved_crypto = 0
 
-        # 2. Allocate to Reserve
-        # Ensure we don't take more than the proceeds (sanity check)
-        allocation = min(replacement_cost, sale_proceeds)
+        # --- Standard Sell Completion ---
+        # Proceeds go to Balance (Fiat)
+        # Note: Profit Tax (10%) is handled separately by OrderManager -> allocate_profit_to_reserve
+        # So here we just free up the *entire* proceeds to 'balance'.
+        # If OrderManager takes 10% later, it calls allocate_profit_to_reserve, which
+        # MOVES it from 'balance' to 'operational_reserve'.
 
-        self.operational_reserve += allocation
-        net_proceeds = sale_proceeds - allocation
-
-        self.balance += net_proceeds
+        self.balance += sale_proceeds
         self.total_fees += fee
 
-        self.logger.info(
-            f"Sell order completed. Recycled {allocation:.4f} to Reserve. Net Proceeds: {net_proceeds:.4f}"
-        )
+        self.logger.info(f"Sell order completed. Proceeds: {sale_proceeds:.4f} {self.quote_currency} added to balance.")
         self._persist_balances()
 
     def allocate_profit_to_reserve(self, amount: float) -> None:
         """
         Allocates a specific amount of fiat profit to the operational reserve.
-        This effectively 'banks' the profit, preventing it from being reinvested.
+        Subject to a Cap: Stop allocating if Reserve >= 1% of Investment.
         """
         if amount <= 0:
             return
 
-        if self.balance < amount:
-            self.logger.warning(
-                f"⚠️ Cannot allocate {amount} profit to reserve. "
-                f"Available balance {self.balance} is less than profit (Funds likely reused). "
-                f"Allocating max available."
-            )
-            amount = self.balance
+        # 1. Check Cap (1% of Investment)
+        target_cap = self.investment_cap * 0.01
+        if self.operational_reserve >= target_cap:
+            return  # Reserve is full
 
-        self.balance -= amount
-        self.operational_reserve += amount
-        self.logger.info(f"🏦 Banked Profit: Moved {amount:.4f} {self.quote_currency} to Reserve.")
-        self._persist_balances()
+        # 2. Partial Allocation if near cap
+        space_remaining = target_cap - self.operational_reserve
+        to_allocate = min(amount, space_remaining)
+
+        if self.balance < to_allocate:
+            self.logger.warning(
+                f"⚠️ Cannot allocate {to_allocate} profit to reserve. Available balance {self.balance} is low."
+            )
+            to_allocate = self.balance  # Take what we can
+
+        if to_allocate > 0:
+            self.balance -= to_allocate
+            self.operational_reserve += to_allocate
+            self.logger.info(
+                f"🏦 Banked Profit: Moved {to_allocate:.4f} {self.quote_currency} to Reserve (Cap: {target_cap:.2f})."
+            )
+            self._persist_balances()
 
     def update_after_initial_purchase(self, initial_order: Order):
         """

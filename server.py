@@ -498,6 +498,84 @@ async def get_bot_logs(bot_id: int, limit: int = 50):
     return {"logs": logs}
 
 
+@app.get("/bot/{bot_id}/stats")
+async def get_bot_stats(bot_id: int):
+    """
+    Returns aggregated stats for a specific bot:
+    - Holdings (Free + Locked)
+    - Sparkline (Profit History)
+    Used by the Node.js backend to display dashboards.
+    """
+    try:
+        import sqlite3
+
+        # 1. Initialize Response Structure
+        stats = {
+            "holdings": {
+                "base": 0.0,
+                "quote": 0.0,
+                "free_base": 0.0,
+                "free_quote": 0.0,
+                "locked_base": 0.0,
+                "locked_quote": 0.0,
+                "reserve": 0.0,
+            },
+            "sparkline": [],
+        }
+
+        conn = sqlite3.connect(db.db_path)
+        cursor = conn.cursor()
+
+        # 2. Get Free Balances (bot_balances)
+        cursor.execute(
+            "SELECT fiat_balance, crypto_balance, reserve_amount FROM bot_balances WHERE bot_id = ?", (bot_id,)
+        )
+        bal_row = cursor.fetchone()
+        if bal_row:
+            print(f"DEBUG: Found balance row for {bot_id}: {bal_row}")
+            stats["holdings"]["free_quote"] = float(bal_row[0] or 0)
+            stats["holdings"]["free_base"] = float(bal_row[1] or 0)
+            stats["holdings"]["reserve"] = float(bal_row[2] or 0)  # Added Reserve
+
+        # 3. Get Locked Funds (grid_orders)
+        cursor.execute("SELECT side, quantity, price FROM grid_orders WHERE bot_id = ? AND status = 'OPEN'", (bot_id,))
+        orders = cursor.fetchall()
+        for side, quantity, price in orders:
+            amt = float(quantity or 0)
+            prc = float(price or 0)
+            if side == "sell":
+                # Locked Base (Crypto)
+                stats["holdings"]["locked_base"] += amt
+            elif side == "buy":
+                # Locked Quote (Fiat)
+                stats["holdings"]["locked_quote"] += amt * prc
+
+        # 4. Calculate Totals
+        stats["holdings"]["base"] = stats["holdings"]["free_base"] + stats["holdings"]["locked_base"]
+        stats["holdings"]["quote"] = stats["holdings"]["free_quote"] + stats["holdings"]["locked_quote"]
+
+        # 5. Sparkline is now handled by Backend (Postgres), so we return empty here
+        stats["sparkline"] = []
+
+        conn.close()
+        return stats
+
+    except Exception as e:
+        logger.error(f"Error fetching stats for bot {bot_id}: {e}", exc_info=True)
+        # Return empty structure on error to prevent frontend crash
+        return {
+            "holdings": {
+                "base": 0,
+                "quote": 0,
+                "free_base": 0,
+                "free_quote": 0,
+                "locked_base": 0,
+                "locked_quote": 0,
+            },
+            "sparkline": [],
+        }
+
+
 @app.get("/allocations")
 async def get_allocations(mode: str = "live"):
     """
