@@ -306,15 +306,8 @@ class OrderManager:
                 self.logger.warning(
                     f"No grid level found by ID for filled order {order.identifier}. Attempting price match..."
                 )
-                # Try to fuzzy match by price
-                closest_grid_price = min(self.grid_manager.grid_levels.keys(), key=lambda x: abs(x - order.price))
-                if abs(closest_grid_price - order.price) / order.price < 0.001:  # 0.1% tolerance
-                    grid_level = self.grid_manager.grid_levels[closest_grid_price]
-                    self.logger.info(f"Orphan order matched to grid level {closest_grid_price}. Adopting...")
-                    self.order_book.add_order(order, grid_level)
-                else:
-                    self.logger.warning(f"Could not match orphan order {order} to any grid level.")
-                    return
+                self.logger.warning(f"Ignored unknown order {order.identifier} (Not in OrderBook/DB).")
+                return
 
             await self._handle_order_completion(order, grid_level)
 
@@ -331,11 +324,33 @@ class OrderManager:
         self.logger.info(f"Buy order completed at grid level {grid_level}.")
         self.grid_manager.complete_order(grid_level, OrderSide.BUY)
 
-        paired_sell_level = self.grid_manager.get_paired_sell_level(grid_level)
+        # --- FIX: Determine Sell Level FIRST (with fallback) ---
+        paired_sell_level = self._get_or_create_paired_sell_level(grid_level)
+
         if paired_sell_level and self.grid_manager.can_place_order(paired_sell_level, OrderSide.SELL):
             await self._place_sell_order(grid_level, paired_sell_level, order.filled)
         else:
             self.logger.warning(f"No valid sell grid level found for buy grid level {grid_level}.")
+
+        # --- SAVE TRADE HISTORY (BUY) ---
+        if self.bot_id:
+            trade_record = {
+                "bot_id": self.bot_id,
+                "order_id": order.identifier,
+                "pair": self.trading_pair,
+                "side": "buy",
+                "price": order.average or order.price,
+                "quantity": order.filled,
+                "fee_amount": 0.0,  # TODO: Parse fee from order if available
+                "fee_currency": self.trading_pair.split("/")[0],
+                "realized_pnl": 0.0,
+            }
+            if order.fee:
+                trade_record["fee_amount"] = float(order.fee.get("cost", 0.0))
+                trade_record["fee_currency"] = order.fee.get("currency", "")
+
+            self.db.add_trade_history(trade_record)
+        # --------------------------------
 
     async def _handle_sell_order_completion(self, order: Order, grid_level: GridLevel) -> None:
         self.logger.info(f"Sell order completed at grid level {grid_level}.")
@@ -374,6 +389,21 @@ class OrderManager:
             if self.bot_id:
                 # Sync Net Profit to backend
                 await self._sync_profit_to_backend(order, net_profit)
+
+                # --- SAVE TRADE HISTORY (SELL) ---
+                trade_record = {
+                    "bot_id": self.bot_id,
+                    "order_id": order.identifier,
+                    "pair": self.trading_pair,
+                    "side": "sell",
+                    "price": order.average or order.price,
+                    "quantity": order.filled,
+                    "fee_amount": total_estimated_fees,
+                    "fee_currency": self.trading_pair.split("/")[1],
+                    "realized_pnl": net_profit,
+                }
+                self.db.add_trade_history(trade_record)
+                # ---------------------------------
         else:
             self.logger.warning("Could not calculate profit: No paired buy level found.")
         # -------------------
@@ -392,6 +422,16 @@ class OrderManager:
         fallback_buy_level = self.grid_manager.get_grid_level_below(sell_grid_level)
         if fallback_buy_level:
             return fallback_buy_level
+        return None
+
+    def _get_or_create_paired_sell_level(self, buy_grid_level: GridLevel) -> GridLevel | None:
+        paired_sell_level = buy_grid_level.paired_sell_level
+        if paired_sell_level and self.grid_manager.can_place_order(paired_sell_level, OrderSide.SELL):
+            return paired_sell_level
+
+        fallback_sell_level = self.grid_manager.get_grid_level_above(buy_grid_level)
+        if fallback_sell_level:
+            return fallback_sell_level
         return None
 
     # ==============================================================================
@@ -526,18 +566,12 @@ class OrderManager:
                         self.logger.error(f"Failed to verify missing order {order_id}: {e}. Marking CLOSED_UNKNOWN.")
                         self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
 
-        # Balance Check before recovery loop to stop spam
-        # Balance Check before recovery loop to stop spam
+        # Balance Check Limits (soft check only needed later)
+        # We don't block the loop on this anymore.
         min_fiat_threshold = 5.0
         min_crypto_threshold = 0.05
         has_fiat = self.balance_tracker.balance > min_fiat_threshold
         has_crypto = self.balance_tracker.crypto_balance > min_crypto_threshold
-
-        # Dynamic Dead Zone: Use the GridManager's logic
-        safe_buy_limit, safe_sell_limit = self.grid_manager.get_dead_zone_thresholds(current_price)
-
-        # Balance Check Limits (soft check only needed later)
-        # We don't block the loop on this anymore.
 
         # Dynamic Dead Zone: Use the GridManager's logic
         safe_buy_limit, safe_sell_limit = self.grid_manager.get_dead_zone_thresholds(current_price)
@@ -813,13 +847,30 @@ class OrderManager:
                 )
                 self.order_book.add_order(buy_order)
                 # FIX: Redundant update removed. Event bus handles it via _on_order_filled.
-                if self.trading_mode == TradingMode.BACKTEST:
-                    await self._simulate_fill(buy_order, buy_order.timestamp)
-
                 await self.notification_handler.async_send_notification(
                     NotificationType.ORDER_PLACED,
                     order_details=f"Rebalanced Portfolio: Bought {amount_to_buy:.4f} SOL",
                 )
+
+                # --- SAVE TRADE HISTORY (INITIAL BUY) ---
+                if self.bot_id:
+                    trade_record = {
+                        "bot_id": self.bot_id,
+                        "order_id": buy_order.identifier,
+                        "pair": self.trading_pair,
+                        "side": "buy",
+                        "price": buy_order.average or buy_order.price,
+                        "quantity": buy_order.filled,
+                        "fee_amount": 0.0,  # TODO: Parse fee
+                        "fee_currency": self.trading_pair.split("/")[0],
+                        "realized_pnl": 0.0,
+                    }
+                    if buy_order.fee:
+                        trade_record["fee_amount"] = float(buy_order.fee.get("cost", 0.0))
+                        trade_record["fee_currency"] = buy_order.fee.get("currency", "")
+
+                    self.db.add_trade_history(trade_record)
+                # ----------------------------------------
             except Exception as e:
                 self.logger.error(f"Failed to execute initial purchase: {e}")
                 raise e
@@ -914,14 +965,9 @@ class OrderManager:
             orders_to_cancel = []
             prefix = f"G_{self.bot_id}_"
 
-            # Create a set of strict grid prices for orphan matching
-            # We use a small tolerance for float comparison
-            active_grid_prices = set(self.grid_manager.grid_levels.keys())
-
             for o in exchange_orders:
                 oid = o["id"]
                 client_oid = o.get("clientOrderId", "")
-                price = float(o.get("price", 0.0))
 
                 # Match A: ID is in our DB
                 if oid in db_order_ids:
@@ -929,28 +975,18 @@ class OrderManager:
                     continue
 
                 # Match B: Prefix matches (even if not in DB, we own it)
-                if client_oid.startswith(prefix):
+                if str(client_oid).startswith(prefix):
                     orders_to_cancel.append(o)
                     continue
 
-                # Match C: Orphaned Grid Match (Price matches a Grid Level)
-                # This catches orders from a previous run where DB was lost/cleared but orders remain on exchange
-                # Tolerance: 0.1% or similar
-                # Only if we are fairly sure it's ours.
-                # FIX: Check if price matches ANY grid level we currently care about.
-                matched_grid = False
-                for gp in active_grid_prices:
-                    if abs(price - gp) / gp < 0.001:  # 0.1% tolerance
-                        matched_grid = True
-                        break
-
-                if matched_grid:
-                    self.logger.warning(f"🧟 Found POTENTIAL ORPHAN order {oid} at {price}. Marking for cleanup.")
-                    orders_to_cancel.append(o)
-                    continue
+                # Match C: REMOVED.
+                # Do NOT match by price/grid level. It causes cross-bot cancellation
+                # if two bots share similar grid ranges on the same pair.
+                # If it's not in DB and doesn't have our prefix, leave it alone.
+                # continue
 
             self.logger.info(
-                f"🔎 Found {len(orders_to_cancel)} active orders on exchange to cancel (DB, Prefix, or Orphan Match)."
+                f"🔎 Found {len(orders_to_cancel)} active orders on exchange to cancel (DB or Prefix Match)."
             )
 
             for order_data in orders_to_cancel:
@@ -1008,11 +1044,14 @@ class OrderManager:
 
     async def force_nuclear_cleanup(self) -> None:
         """
-        ☢️ NUCLEAR OPTION: Cancels ALL open orders for this trading pair on the account.
-        Ignores Bot ID, prefixes, or DB records.
-        Used only for explicit Bot Deletion to ensure a completely clean slate.
+        ☢️ NUCLEAR OPTION (SCOPED): Cancels open orders for this bot.
+        Uses Client Order ID Prefix or DB Matching to ensure we don't kill other bots' orders.
         """
-        self.logger.warning(f"☢️ NUCLEAR CLEANUP TRIGGERED for {self.trading_pair}. Wiping EVERYTHING.")
+        self.logger.warning(f"☢️ NUCLEAR CLEANUP TRIGGERED for {self.trading_pair} (Bot {self.bot_id}).")
+
+        if not self.bot_id:
+            self.logger.error("❌ Cannot run nuclear cleanup without Bot ID.")
+            return
 
         try:
             # 1. Fetch EVERYTHING
@@ -1021,14 +1060,44 @@ class OrderManager:
             if not open_orders:
                 self.logger.info("✅ Nuclear Cleanup Verified: 0 Open Orders found.")
                 # Ensure DB is wiped too
-                if self.bot_id:
-                    self.db.clear_all_orders(self.bot_id)
+                self.db.clear_all_orders(self.bot_id)
                 return
 
-            self.logger.info(f"☢️ Found {len(open_orders)} orders to wipe. Proceeding...")
+            self.logger.info(f"🔎 Scanning {len(open_orders)} orders for Bot {self.bot_id}...")
 
-            # 2. Cancel EVERYTHING
+            # 2. Filter Orders (Safety First)
+            # We cancel if:
+            # A) Order ID is in our DB for this bot.
+            # B) clientOrderId starts with our prefix (G_{bot_id}_)
+
+            db_orders = self.db.get_all_active_orders(self.bot_id)
+            db_ids = set(db_orders.keys())
+            prefix = f"G_{self.bot_id}_"
+
+            orders_to_nuke = []
+
             for order in open_orders:
+                oid = order["id"]
+                cid = order.get("clientOrderId", "")
+
+                if oid in db_ids:
+                    orders_to_nuke.append(order)
+                elif str(cid).startswith(prefix):
+                    orders_to_nuke.append(order)
+                else:
+                    # Optional: Check for orphaned price match if strictly needed,
+                    # but typically prefix is enough and safer.
+                    pass
+
+            if not orders_to_nuke:
+                self.logger.info("✅ No matching orders found to nuke. Safe.")
+                self.db.clear_all_orders(self.bot_id)
+                return
+
+            self.logger.info(f"☢️ Nuking {len(orders_to_nuke)} confirmed orders for Bot {self.bot_id}...")
+
+            # 3. Cancel Filtered Orders
+            for order in orders_to_nuke:
                 order_id = order["id"]
                 try:
                     await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
@@ -1036,9 +1105,8 @@ class OrderManager:
                 except Exception as e:
                     self.logger.error(f"Failed to nuke order {order_id}: {e}")
 
-            # 3. Wipe DB
-            if self.bot_id:
-                self.db.clear_all_orders(self.bot_id)
+            # 4. Wipe DB
+            self.db.clear_all_orders(self.bot_id)
 
             self.logger.info("✅ Nuclear Cleanup Complete.")
 

@@ -1,20 +1,20 @@
 import asyncio
-from contextlib import asynccontextmanager
+import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
-from adapter.config_adapter import DictConfigManager
+import ccxt.async_support as ccxt  # Use Async CCXT for public data
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from adapter.config_adapter import DictConfigManager
 from config.config_validator import ConfigValidator
 from core.bot_management.event_bus import EventBus
 from core.bot_management.grid_trading_bot import GridTradingBot
 from core.bot_management.notification.notification_handler import NotificationHandler
 from core.services.exchange_service_factory import ExchangeServiceFactory
 from core.storage.bot_database import BotDatabase
-
-
 from utils.logging_config import setup_logging
 
 
@@ -104,52 +104,38 @@ def create_config(exchange, pair, api_key, api_secret, passphrase, mode, strateg
     }
 
 
-from core.health_monitor import HealthMonitor
-from core.logging.db_logger import DBLoggingHandler
-
-# --- Persistent State Manager ---
+# --- Global Services ---
 db = BotDatabase()
 
-# --- Global Services ---
-health_monitor = HealthMonitor(db)
-
-
 # --- Lifecycle Management ---
-import json
 
 
-# --- Lifecycle Management ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 0. Setup Logging
-    root_logger = logging.getLogger()
-    db_handler = DBLoggingHandler(db=db)
-    db_handler.setLevel(logging.INFO)
-    root_logger.addHandler(db_handler)
+    # Startup
+    logger.info("Server starting up...")
 
-    # 1. Startup: Recover Bots
-    logger.info("?? Server Starting: Checking for Active Bots (Hot Boot)...")
-    await health_monitor.start()
+    # Global db is already initialized
+
+    # Resume active bots
+
+    # Resume active bots
+    # Resume active bots
+    # We call the specialized recovery function that handles Hot Boot recreation from config_json
     await recover_active_bots()
 
     yield
 
-    # 2. Shutdown: Graceful Stop
-    logger.info("?? Server shutting down. Gracefully pausing active bots...")
-    await health_monitor.stop()
-
-    tasks = []
+    # Shutdown
+    logger.info("Server shutting down...")
     for bot_id, instance in active_instances.items():
-        bot = instance["bot"]
-        logger.info(f"Pausing Bot {bot_id} (Orders remain active)...")
-        # We DO NOT sell assets or cancel orders on server shutdown,
-        # allowing for zero-downtime updates.
-        # We just stop the loop and let the DB keep status='RUNNING'
-        # so next boot picks it up.
-        tasks.append(bot._stop(sell_assets=False, cancel_orders=False))
+        logger.info(f"Stopping bot {bot_id}...")
+        try:
+            bot = instance["bot"]
+            bot.stop()  # Assuming stop() exists and handles sync/async
+        except Exception as e:
+            logger.error(f"Error stopping bot {bot_id}: {e}")
 
-    if tasks:
-        await asyncio.gather(*tasks)
     logger.info("All bots paused.")
 
 
@@ -406,6 +392,13 @@ async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotReques
         del active_instances[bot_id]
         db.update_bot_status(bot_id, "DELETED")
 
+        # Cleanup Grid Orders
+        try:
+            db.clear_all_orders(bot_id)
+            logger.info(f"✅ Cleaned up grid_orders for deleted Bot {bot_id}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup orders for bot {bot_id}: {e}")
+
         return {"status": "deleted", "liquidation_attempted": liquidate}
 
     else:
@@ -479,6 +472,13 @@ async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotReques
                 logger.error(f"Offline Liquidation Failed: {e}", exc_info=True)
                 liq_msg = f"Failed: {e!s}"
 
+        # Cleanup Grid Orders
+        try:
+            db.clear_all_orders(bot_id)
+            logger.info(f"✅ Cleaned up grid_orders for deleted Bot {bot_id}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup orders for bot {bot_id}: {e}")
+
         return {"status": "deleted", "message": "Bot marked DELETED.", "offline_liquidation": liq_msg}
 
 
@@ -532,23 +532,58 @@ async def get_bot_stats(bot_id: int):
         )
         bal_row = cursor.fetchone()
         if bal_row:
-            print(f"DEBUG: Found balance row for {bot_id}: {bal_row}")
+            logger.debug(f"DEBUG: Found balance row for {bot_id}: {bal_row}")
             stats["holdings"]["free_quote"] = float(bal_row[0] or 0)
             stats["holdings"]["free_base"] = float(bal_row[1] or 0)
             stats["holdings"]["reserve"] = float(bal_row[2] or 0)  # Added Reserve
 
-        # 3. Get Locked Funds (grid_orders)
+        # 3. Get Locked Funds (grid_orders) & Order Counts
         cursor.execute("SELECT side, quantity, price FROM grid_orders WHERE bot_id = ? AND status = 'OPEN'", (bot_id,))
         orders = cursor.fetchall()
+
+        buy_orders = 0
+        sell_orders = 0
+        grid_lines = []
+
         for side, quantity, price in orders:
             amt = float(quantity or 0)
             prc = float(price or 0)
+
+            # Add to lines for chart
+            grid_lines.append({"side": side, "price": prc, "qty": amt})
+
             if side == "sell":
                 # Locked Base (Crypto)
                 stats["holdings"]["locked_base"] += amt
+                sell_orders += 1
             elif side == "buy":
                 # Locked Quote (Fiat)
                 stats["holdings"]["locked_quote"] += amt * prc
+                buy_orders += 1
+
+        # Add order counts and lines to stats
+        stats["open_orders"] = {
+            "buy": buy_orders,
+            "sell": sell_orders,
+            "total": buy_orders + sell_orders,
+            "lines": grid_lines,
+        }
+
+        # 3.5 Get Execution History (Trades)
+        try:
+            cursor.execute(
+                "SELECT side, quantity, price, executed_at FROM trade_history WHERE bot_id = ? ORDER BY executed_at DESC LIMIT 50",
+                (bot_id,),
+            )
+            trades = cursor.fetchall()
+            stats["recent_trades"] = []
+            for t_side, t_qty, t_price, t_ts in trades:
+                stats["recent_trades"].append(
+                    {"side": t_side, "qty": float(t_qty or 0), "price": float(t_price or 0), "timestamp": t_ts}
+                )
+        except Exception as e:
+            logger.warning(f"Failed to fetch trades for bot {bot_id}: {e}")
+            stats["recent_trades"] = []
 
         # 4. Calculate Totals
         stats["holdings"]["base"] = stats["holdings"]["free_base"] + stats["holdings"]["locked_base"]
@@ -695,4 +730,41 @@ async def run_backtest(req: BacktestRequest):
 
     except Exception as e:
         logger.error(f"Backtest failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/market/candles")
+async def get_market_candles(symbol: str, exchange: str, timeframe: str = "1h", limit: int = 300):
+    """
+    Fetches OHLCV candles via CCXT (Async).
+    Used by the Frontend (via Node Proxy) to render charts.
+    """
+    try:
+        clean_exchange = exchange.replace("_paper", "").lower()
+        if not getattr(ccxt, clean_exchange, None):
+            raise HTTPException(status_code=400, detail="Exchange not supported")
+
+        # Initialize Async Exchange
+        exchange_class = getattr(ccxt, clean_exchange)
+        exchange_instance = exchange_class({"enableRateLimit": True})
+
+        try:
+            # Fetch Candles
+            if exchange_instance.has["fetchOHLCV"]:
+                candles = await exchange_instance.fetch_ohlcv(symbol, timeframe, limit=limit)
+
+                # Format: [timestamp, open, high, low, close, volume]
+                # Frontend expects: { time: usage, open, high, low, close }
+                formatted = []
+                for c in candles:
+                    # c[0] is ms timestamp. Lightweight Charts prefers seconds.
+                    formatted.append({"time": int(c[0] / 1000), "open": c[1], "high": c[2], "low": c[3], "close": c[4]})
+                return formatted
+            else:
+                raise HTTPException(status_code=400, detail="Exchange does not support candles")
+        finally:
+            await exchange_instance.close()
+
+    except Exception as e:
+        logger.error(f"Candle fetch failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

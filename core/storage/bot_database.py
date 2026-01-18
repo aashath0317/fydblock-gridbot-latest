@@ -443,3 +443,12 @@ class BotDatabase:
         rows = [dict(row) for row in cursor.fetchall()]
         conn.close()
         return rows
+
+    def get_active_bots(self):
+        """Retrieve all bots with status 'RUNNING'."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT bot_id, status, config_json, updated_at FROM bots WHERE status = 'RUNNING'")
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
