@@ -367,6 +367,7 @@ class GridTradingStrategy(TradingStrategyInterface):
                 self.logger.info("Initial purchase complete. Placing grid orders...")
                 await self.order_manager.initialize_grid_orders(current_price)
 
+            await self.event_bus.publish(Events.INITIALIZATION_COMPLETE)
             return True
 
         except Exception as e:

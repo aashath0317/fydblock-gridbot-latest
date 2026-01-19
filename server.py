@@ -107,13 +107,102 @@ def create_config(exchange, pair, api_key, api_secret, passphrase, mode, strateg
 # --- Global Services ---
 db = BotDatabase()
 
+
+# --- Solvency Monitor ---
+async def solvency_check_loop():
+    """
+    Background Task:
+    Monitors global exchange balances vs total bot allocations.
+    If a deficit is detected (User Withdraw request), it forces a proportional
+    reduction (haircut) on all active bots to prevent 'Insufficient Funds' errors.
+    """
+    while True:
+        try:
+            await asyncio.sleep(60)  # Check every minute
+
+            if not active_instances:
+                continue
+
+            # Group bots by Exchange Account
+            # (Assuming single account for now per API limitations, but good to be extensible)
+            # We use the FIRST active bot to fetch the Global Balance.
+            first_bot_id = next(iter(active_instances))
+            bot_instance = active_instances[first_bot_id]["bot"]
+
+            # 1. Get Global Available Balance (Real World)
+            # We need a fresh check.
+            try:
+                # Correction: Access exchange_service directly from the strategy
+                ex_balances = await bot_instance.strategy.exchange_service.get_balance()
+                # Assuming all bots trade USDT for now.
+                # TODO: Handle multi-collateral.
+                quote = "USDT"
+                global_free = float(ex_balances.get("free", {}).get(quote, 0.0))
+            except Exception as e:
+                logger.warning(f"Solvency Check failed to fetch exchange balance: {e}")
+                continue
+
+            # 2. Sum Total Claims separately for LIVE and PAPER
+            live_demand = 0.0
+            live_reserve = 0.0
+            live_bots = []
+
+            paper_demand = 0.0
+            # Paper bots are effectively self-funded, but we track them for consistency
+
+            for b_id, item in active_instances.items():
+                b = item["bot"]
+                # FIX: Access quote_currency from BalanceTracker
+                try:
+                    b_quote = b.strategy.balance_tracker.quote_currency
+                except AttributeError:
+                    continue
+
+                # Check mode
+                is_paper = getattr(b, "mode", "live") == "paper_trading"
+
+                if b_quote == quote:
+                    b_bal = b.strategy.balance_tracker.balance
+                    b_res = b.strategy.balance_tracker.operational_reserve
+
+                    if is_paper:
+                        paper_demand += b_bal + b_res
+                    else:
+                        live_demand += b_bal
+                        live_reserve += b_res
+                        live_bots.append(b)
+
+            # 3. Perform Solvency Check for LIVE BOTS Only
+            # (Paper bots run on virtual ledgers, so they don't share a real constraint)
+            total_live_demand = live_demand + live_reserve
+
+            if total_live_demand > (global_free + 1.0):
+                shortfall = total_live_demand - global_free
+                ratio = global_free / total_live_demand if total_live_demand > 0 else 0
+
+                logger.warning(
+                    f"🚨 SOLVENCY CRISIS (LIVE): Global Free {global_free:.2f} < Demand {total_live_demand:.2f}. "
+                    f"Shortfall: {shortfall:.2f}. Applying Haircut Ratio: {ratio:.4f}"
+                )
+
+                for b in live_bots:
+                    b.strategy.balance_tracker.adjust_capital_allocation(ratio)
+
+            # else:
+            #     logger.info(f"✅ Solvency Check Passed: Free {global_free:.2f} >= Demand {total_demand:.2f}")
+
+        except Exception as e:
+            logger.error(f"Error in Solvency Monitor: {e}")
+
+
 # --- Lifecycle Management ---
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Server starting up...")
+
+    # Start Solvency Monitor
+    asyncio.create_task(solvency_check_loop())
 
     # Global db is already initialized
 
@@ -132,7 +221,8 @@ async def lifespan(app: FastAPI):
         logger.info(f"Stopping bot {bot_id}...")
         try:
             bot = instance["bot"]
-            bot.stop()  # Assuming stop() exists and handles sync/async
+            # Graceful shutdown: Stop tasks but keep orders on exchange for Hot Boot
+            await bot.stop(cancel_orders=False)
         except Exception as e:
             logger.error(f"Error stopping bot {bot_id}: {e}")
 
@@ -257,11 +347,12 @@ async def start_bot(req: BotRequest):
 
     try:
         # Check if this is a Hot Boot (was previously RUNNING)
+        # We also recover interrupted STARTING attempts
         prev_status = db.get_bot_status(req.bot_id)
-        is_hot_boot = prev_status == "RUNNING"
+        is_hot_boot = prev_status in ["RUNNING", "STARTING"]
 
         if is_hot_boot:
-            logger.info(f"🔥 Bot {req.bot_id} matched in DB as RUNNING. Initiating Hot Boot.")
+            logger.info(f"🔥 Bot {req.bot_id} matched in DB as {prev_status}. Initiating Hot Boot.")
 
         # Initialize Components
         validator = ConfigValidator()
@@ -280,8 +371,10 @@ async def start_bot(req: BotRequest):
             db=db,
         )
 
-        # Update DB Status & Config immediately to Lock it and ensure persistence
-        db.update_bot_status(req.bot_id, "RUNNING", config_json=json.dumps(config_dict))
+        # Update DB Status to STARTING (Loading State)
+        # We start as STARTING. The Bot itself will flip to RUNNING once orders are placed.
+        # However, we preserve the config locking.
+        db.update_bot_status(req.bot_id, "STARTING", config_json=json.dumps(config_dict))
 
         # Hack/Fix: Set a temporary attribute on the strategy instance.
         bot.strategy.use_hot_boot = is_hot_boot
@@ -290,7 +383,7 @@ async def start_bot(req: BotRequest):
 
         active_instances[req.bot_id] = {"bot": bot, "task": task, "event_bus": event_bus}
 
-        return {"status": "started", "bot_id": req.bot_id, "hot_boot": is_hot_boot}
+        return {"status": "starting", "bot_id": req.bot_id, "hot_boot": is_hot_boot}
 
     except Exception as e:
         logger.error(f"Failed to start bot {req.bot_id}: {e}", exc_info=True)
@@ -306,10 +399,10 @@ async def stop_bot(bot_id: int):
         if status in ["STOPPED", "CRASHED", "DELETED"]:
             return {"status": "already_stopped", "message": f"Bot {bot_id} is already {status}"}
 
-        # If DB says RUNNING but not in memory -> Zombie state
+        # If DB says RUNNING/STARTING but not in memory -> Zombie state
         # We force update to STOPPED to match reality
         db.update_bot_status(bot_id, "STOPPED")
-        return {"status": "stopped", "message": "Bot was zombie (DB=RUNNING, Memory=None). Forced STOPPED."}
+        return {"status": "stopped", "message": f"Bot was zombie (DB={status}, Memory=None). Forced STOPPED."}
 
     instance = active_instances[bot_id]
     bot = instance["bot"]

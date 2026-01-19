@@ -166,6 +166,20 @@ class BotDatabase:
 
         return None
 
+    def get_order(self, order_id: str):
+        """
+        Retrieves a specific order by its ID.
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM grid_orders WHERE order_id = ?", (order_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return dict(row)
+        return None
+
     def get_all_active_orders(self, bot_id: int):
         """Returns map of active orders for initialization."""
         conn = sqlite3.connect(self.db_path)

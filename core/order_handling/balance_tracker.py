@@ -126,6 +126,7 @@ class BalanceTracker:
     ) -> tuple[float, float]:
         """
         Fetches live balances from the exchange asynchronously.
+        For PAPER_TRADING, it attempts to load from the DB to preserve simulation state.
 
         Args:
             exchange_service: The exchange instance.
@@ -133,6 +134,26 @@ class BalanceTracker:
         Returns:
             tuple: The quote and base currency balances.
         """
+        # FIX: For Paper Trading, we must NOT overwrite with Real Wallet Balance
+        # We should load from DB if available, or default to Investment amount if fresh.
+        if self.trading_mode == TradingMode.PAPER_TRADING:
+            saved = self.db.get_balances(self.bot_id) if self.db else None
+            if saved:
+                # { "fiat_balance": X, "crypto_balance": Y, "reserve_amount": Z }
+                fiat = float(saved.get("fiat_balance", 0.0))
+                crypto = float(saved.get("crypto_balance", 0.0))
+                self.logger.info(
+                    f"💾 Loaded PAPER Balances from DB: {fiat} {self.quote_currency}, {crypto} {self.base_currency}"
+                )
+                return fiat, crypto
+            else:
+                # If no DB entry, it might be a fresh start.
+                # However, the caller usually initializes with investment_amount.
+                # Returning 0, 0 here prevents overwriting with Real Wallet,
+                # but we usually rely on 'initialize_balances' for the initial set.
+                # Let's return the current self.balance (in-memory) if non-zero, or just 0.0
+                return self.balance, self.crypto_balance
+
         balances = await exchange_service.get_balance()
 
         if not balances or "free" not in balances:
@@ -548,3 +569,30 @@ class BalanceTracker:
                     }
 
         return None
+
+    def adjust_capital_allocation(self, ratio: float) -> None:
+        """
+        Global Solvency Mechanism:
+        Reduces the specific bot's liquid capital and reserves by a ratio < 1.0.
+        Used when the user withdraws funds externally, causing a global deficit.
+        """
+        if ratio >= 1.0 or ratio <= 0.0:
+            return
+
+        old_bal = self.balance
+        old_res = self.operational_reserve
+
+        # Apply Haircut
+        self.balance *= ratio
+        self.operational_reserve *= ratio
+
+        # We do NOT touch 'reserved_fiat' or 'reserved_crypto' as those back REAL open orders.
+        # If the user withdrew funds backing open orders, those orders will just fail on execution.
+        # But we validly shrink the 'buffer' (Balance + Fee Reserve) to match reality.
+
+        self.logger.warning(
+            f"📉 Solvency Adjustment (Ratio {ratio:.4f}): "
+            f"Balance {old_bal:.4f} -> {self.balance:.4f}, "
+            f"Reserve {old_res:.4f} -> {self.operational_reserve:.4f}"
+        )
+        self._persist_balances()

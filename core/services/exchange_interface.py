@@ -18,6 +18,7 @@ class ExchangeInterface(ABC):
         order_type: str,
         amount: float,
         price: float | None = None,
+        params: dict = None,
     ) -> dict[str, str | float]:
         """Places an order, returning a dictionary with order details including id and status."""
         pass

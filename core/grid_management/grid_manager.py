@@ -327,6 +327,14 @@ class GridManager:
             return self.grid_levels[lower_price]
         return None
 
+    def get_grid_level_above(self, grid_level: GridLevel) -> GridLevel | None:
+        sorted_levels = sorted(self.grid_levels.keys())
+        current_index = sorted_levels.index(grid_level.price)
+        if current_index < len(sorted_levels) - 1:
+            higher_price = sorted_levels[current_index + 1]
+            return self.grid_levels[higher_price]
+        return None
+
     def mark_order_pending(
         self,
         grid_level: GridLevel,

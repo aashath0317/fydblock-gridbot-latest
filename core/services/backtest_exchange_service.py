@@ -174,7 +174,11 @@ class BacktestExchangeService(ExchangeInterface):
         order_type: str,
         amount: float,
         price: float | None = None,
+        params: dict = None,
     ) -> dict[str, str | float]:
+        # Backtest implementation...
+        params = params or {}
+        # ... logic ...
         raise NotImplementedError("place_order is not used in backtesting")
 
     async def get_balance(self) -> dict[str, Any]:

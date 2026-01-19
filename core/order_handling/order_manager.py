@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import math
-import time
+import uuid
 
 
 import aiohttp
@@ -103,7 +103,7 @@ class OrderManager:
             open_orders = await self.order_execution_strategy.exchange_service.refresh_open_orders(self.trading_pair)
 
             # Filter for THIS bot
-            my_orders = [o for o in open_orders if o.get("clientOrderId", "").startswith(f"G_{self.bot_id}_")]
+            my_orders = [o for o in open_orders if o.get("clientOrderId", "").startswith(f"G{self.bot_id}x")]
 
             # Also check DB for legacy orders we might track
             db_orders = self.db.get_all_active_orders(self.bot_id)
@@ -184,9 +184,17 @@ class OrderManager:
 
             # 3. Reconcile & Rebuild State
             matched_count = 0
-            resumed_grid_prices = set()
+            resumed_grid_prices = {}
+
+            prefix = f"G{self.bot_id}x" if self.bot_id else None
 
             for order_data in open_orders:
+                # SAFETY: Only process orders that belong to THIS bot instance
+                if prefix:
+                    cid = order_data.get("clientOrderId") or ""
+                    if not str(cid).startswith(prefix):
+                        continue
+
                 order_id = order_data["id"]
                 price = float(order_data["price"])
                 side_str = order_data["side"].upper()  # buy/sell
@@ -202,8 +210,12 @@ class OrderManager:
                     # Check if it's a grid order by price logic
                     closest_grid = min(self.grid_manager.price_grids, key=lambda x: abs(x - price))
                     if abs(closest_grid - price) / price < 0.001:  # 0.1% tolerance
-                        self.logger.info(f"   Claiming orphaned order {order_id} at {price}")
-                        self.db.add_order(self.bot_id, order_id, price, side.value, float(order_data["amount"]))
+                        # FIX: Check if we already have it to avoid UNIQUE constraint error
+                        if not self.db.get_order(order_id):
+                            self.logger.info(f"   Claiming orphaned order {order_id} at {price}")
+                            self.db.add_order(self.bot_id, order_id, price, side.value, float(order_data["amount"]))
+                        else:
+                            self.logger.info(f"   Order {order_id} at {price} already in DB. Resuming...")
                     else:
                         self.logger.info(f"   Ignoring unrelated order {order_id} at {price}")
                         continue
@@ -219,9 +231,19 @@ class OrderManager:
 
                 if grid_level:
                     # --- DUPLICATE CHECK ---
+                    # --- DUPLICATE CHECK ---
                     if grid_level.price in resumed_grid_prices:
+                        existing_order_id = resumed_grid_prices[grid_level.price]
+
+                        # Fix: Check if it's the SAME order ID (Duplicate entry in list)
+                        if existing_order_id == order_id:
+                            self.logger.warning(
+                                f"⚠️ Identical order entry found for {grid_level.price} (Order {order_id}). Ignoring duplicate entry."
+                            )
+                            continue
+
                         self.logger.warning(
-                            f"⚠️ Duplicate order found for grid {grid_level.price} (Order {order_id}). Cancelling..."
+                            f"⚠️ Duplicate order found for grid {grid_level.price} (Order {order_id} vs Existing {existing_order_id}). Cancelling..."
                         )
                         try:
                             await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
@@ -229,7 +251,8 @@ class OrderManager:
                             self.logger.error(f"Failed to cancel duplicate order {order_id}: {e}")
                         continue
 
-                    resumed_grid_prices.add(grid_level.price)
+                    resumed_grid_prices[grid_level.price] = order_id
+                    # -----------------------
                     # -----------------------
 
                     # Reconstruct Order Object
@@ -306,8 +329,31 @@ class OrderManager:
                 self.logger.warning(
                     f"No grid level found by ID for filled order {order.identifier}. Attempting price match..."
                 )
-                self.logger.warning(f"Ignored unknown order {order.identifier} (Not in OrderBook/DB).")
-                return
+                # --- ORPHAN RECOVERY: Approximate Price Match ---
+                # Fallback: Find a grid level with a price close to order.price
+                tolerance = 0.001  # 0.1% tolerance
+                matched_level = None
+                for price, level in self.grid_manager.grid_levels.items():
+                    if abs(price - order.price) < (price * tolerance):
+                        # Ensure logic validity:
+                        # If BUY filled, level should be WAITING_FOR_BUY_FILL or similar.
+                        # If SELL filled, level should be WAITING_FOR_SELL_FILL.
+                        # We accept it even if state is "READY_..." if we trust the fill more.
+                        matched_level = level
+                        break
+
+                if matched_level:
+                    self.logger.info(
+                        f"✅ Recovered orphan order {order.identifier} by matching price {order.price} to grid level {matched_level.price}"
+                    )
+                    grid_level = matched_level
+                    # Auto-adopt: Update order book mapping so future lookups work
+                    self.order_book.add_order(order, grid_level)
+                else:
+                    self.logger.warning(
+                        f"Ignored unknown order {order.identifier} (Not in OrderBook/DB and no price match)."
+                    )
+                    return
 
             await self._handle_order_completion(order, grid_level)
 
@@ -465,7 +511,19 @@ class OrderManager:
                     self.balance_tracker.crypto_balance, quantity
                 )
 
-            order = await self.order_execution_strategy.execute_limit_order(side, self.trading_pair, qty, price)
+            # --- ISOLATION FIX: Generate Client Order ID ---
+            client_order_id = None
+            if self.bot_id:
+                # Format: G<bot_id>x<short_uuid> (Alphanumeric only for OKX)
+                short_uuid = uuid.uuid4().hex[:8]
+                client_order_id = f"G{self.bot_id}x{short_uuid}"
+
+            params = {"clientOrderId": client_order_id} if client_order_id else None
+            # -----------------------------------------------
+
+            order = await self.order_execution_strategy.execute_limit_order(
+                side, self.trading_pair, qty, price, params=params
+            )
 
             if order:
                 if self.bot_id:
@@ -478,7 +536,7 @@ class OrderManager:
 
                 self.grid_manager.mark_order_pending(grid_level, order)
                 self.order_book.add_order(order, grid_level)
-                self.logger.info(f"Placed & Saved {side.name} order at {price}")
+                self.logger.info(f"Placed & Saved {side.name} order at {price} (CID: {client_order_id})")
 
                 if order.status == OrderStatus.CLOSED:
                     await self.event_bus.publish(Events.ORDER_FILLED, order)
@@ -514,13 +572,37 @@ class OrderManager:
 
         await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange_service, current_price)
 
-        # Fetch orders
-        exchange_orders = await self.order_execution_strategy.exchange_service.refresh_open_orders(self.trading_pair)
+        exchange_orders_raw = await self.order_execution_strategy.exchange_service.refresh_open_orders(
+            self.trading_pair
+        )
+
+        # --- ISOLATION FIX: Strict Filter by Client Order ID ---
+        exchange_orders = []
+        if self.bot_id:
+            prefix = f"G{self.bot_id}x"
+            for o in exchange_orders_raw:
+                cid = o.get("clientOrderId") or ""
+                # Strict check: Must start with my prefix
+                if str(cid).startswith(prefix):
+                    exchange_orders.append(o)
+                # Fallback: If order has NO clientOrderId (e.g. manually placed or legacy),
+                # we might want to ignore it to be safe, OR claim it if price matches perfectly?
+                # For now, let's log debug and IGNORE to ensure strict isolation.
+                # If a user wants to "adopt" an order, they should use the specific "Import" feature (not built yet)
+                # or we rely on the logic below (price matching) IF we decide to be lenient.
+                # DECISION: Be Strict. If it's not marked as mine, I don't touch it.
+                # EXCEPT: If I have it in my DB!
+                # If I have an order in DB that matches this ID, I must track it even if CID is missing (legacy).
+                elif self.db.get_order(o["id"]):
+                    exchange_orders.append(o)
+        else:
+            # No bot_id (e.g. backtest), take everything
+            exchange_orders = exchange_orders_raw
 
         # --- SAFETY CHECK: PAGINATION WARNING ---
-        if len(exchange_orders) >= 100:
+        if len(exchange_orders_raw) >= 2000:
             self.logger.warning(
-                "⚠️ API returned 100+ orders. Pagination limit might be hit! Skipping integrity check to prevent duplicates."
+                "⚠️ API returned 2000+ orders. Pagination limit might be hit! Skipping integrity check to prevent duplicates."
             )
             return  # Stop here. Do not mark things as missing.
         # ----------------------------------------
@@ -581,8 +663,17 @@ class OrderManager:
         # This prevents orphaned orders or manual trades from blocking the grid logic.
         active_grid_order_count = 0
         valid_grid_prices = list(self.grid_manager.grid_levels.keys())
+        # FIX: Ensure we only count OUR orders towards the limit
+        prefix = f"G{self.bot_id}x" if self.bot_id else None
+
         for o in exchange_orders:
             try:
+                # Filter by Bot ID if available
+                if prefix:
+                    cid = o.get("clientOrderId") or ""
+                    if not str(cid).startswith(prefix):
+                        continue
+
                 op = float(o["price"])
                 if any(math.isclose(op, gp, rel_tol=1e-3) for gp in valid_grid_prices):
                     active_grid_order_count += 1
@@ -639,6 +730,9 @@ class OrderManager:
             success = await self._place_limit_order_safe(price, OrderSide.BUY)
             if not success:
                 break
+            else:
+                # CRITICAL FIX: Increment count so subsequent loops don't overfill
+                active_grid_order_count += 1
 
         # Check SELL Grids
         for price in self.grid_manager.sorted_sell_grids:
@@ -683,6 +777,9 @@ class OrderManager:
             success = await self._place_limit_order_safe(price, OrderSide.SELL)
             if not success:
                 break
+            else:
+                # CRITICAL FIX: Increment count so subsequent loops don't overfill
+                active_grid_order_count += 1
 
     async def ensure_funds_for_grid(self, current_price: float) -> None:
         """
@@ -835,6 +932,16 @@ class OrderManager:
 
         if shortfall_value > 10.0:
             amount_to_buy = (shortfall_value / current_price) * 1.01
+
+            # --- ISOLATION FIX: Generate Client Order ID for Initial Buy ---
+            client_order_id = None
+            if self.bot_id:
+                short_uuid = uuid.uuid4().hex[:8]
+                client_order_id = f"G{self.bot_id}x{short_uuid}"
+
+            params = {"clientOrderId": client_order_id} if client_order_id else None
+            # ---------------------------------------------------------------
+
             try:
                 adjusted_quantity = self.order_validator.adjust_and_validate_buy_quantity(
                     self.balance_tracker.balance, amount_to_buy, current_price
@@ -844,6 +951,7 @@ class OrderManager:
                     self.trading_pair,
                     amount=adjusted_quantity,
                     price=current_price,
+                    params=params,
                 )
                 self.order_book.add_order(buy_order)
                 # FIX: Redundant update removed. Event bus handles it via _on_order_filled.
@@ -963,7 +1071,7 @@ class OrderManager:
 
             # 3. Identify Orders to Cancel
             orders_to_cancel = []
-            prefix = f"G_{self.bot_id}_"
+            prefix = f"G{self.bot_id}x"
 
             for o in exchange_orders:
                 oid = o["id"]
@@ -1072,7 +1180,7 @@ class OrderManager:
 
             db_orders = self.db.get_all_active_orders(self.bot_id)
             db_ids = set(db_orders.keys())
-            prefix = f"G_{self.bot_id}_"
+            prefix = f"G{self.bot_id}x"
 
             orders_to_nuke = []
 

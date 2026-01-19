@@ -6,12 +6,8 @@ from ..order import Order, OrderSide
 class OrderExecutionStrategyInterface(ABC):
     @abstractmethod
     async def execute_market_order(
-        self,
-        order_side: OrderSide,
-        pair: str,
-        quantity: float,
-        price: float,
-    ) -> Order | None:
+        self, order_side: OrderSide, pair: str, amount: float, price: float = None, params: dict = None
+    ) -> Order:
         pass
 
     @abstractmethod
@@ -19,8 +15,9 @@ class OrderExecutionStrategyInterface(ABC):
         self,
         order_side: OrderSide,
         pair: str,
-        quantity: float,
+        amount: float,
         price: float,
+        params: dict = None,
     ) -> Order | None:
         pass
 
@@ -31,7 +28,7 @@ class OrderExecutionStrategyInterface(ABC):
         pair: str,
     ) -> Order | None:
         pass
-        
+
     @abstractmethod
     async def cancel_order(
         self,

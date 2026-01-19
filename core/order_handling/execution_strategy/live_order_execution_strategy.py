@@ -30,10 +30,11 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
         pair: str,
         amount: float,
         price: float = None,
+        params: dict = None,
     ) -> Order:
         try:
             raw_order = await self.exchange_service.place_order(
-                pair, OrderType.MARKET.value.lower(), order_side.value.lower(), amount, price
+                pair, OrderType.MARKET.value.lower(), order_side.value.lower(), amount, price, params
             )
 
             # --- SAFE PARSING START ---
@@ -103,6 +104,7 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
         pair: str,
         amount: float,
         price: float,
+        params: dict = None,
     ) -> Order | None:
         try:
             raw_order = await self.exchange_service.place_order(
@@ -111,6 +113,7 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
                 order_side.value.lower(),
                 amount,
                 price,
+                params,
             )
             # FIX: Pass amount and price as fallback
             order_result = await self._parse_order_result(raw_order, fallback_amount=amount, fallback_price=price)

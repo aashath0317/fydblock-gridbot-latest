@@ -59,6 +59,7 @@ class GridTradingBot:
             self.event_bus = event_bus
             self.event_bus.subscribe(Events.STOP_BOT, self._handle_stop_bot_event)
             self.event_bus.subscribe(Events.START_BOT, self._handle_start_bot_event)
+            self.event_bus.subscribe(Events.INITIALIZATION_COMPLETE, self._handle_initialization_complete)
             self.notification_handler = notification_handler  # FIX: Assign this!
             self.save_performance_results_path = save_performance_results_path
             self.no_plot = no_plot
@@ -162,6 +163,9 @@ class GridTradingBot:
                 self.integrity_task = asyncio.create_task(self._start_integrity_loop())
             # --------------------------------------------------
 
+            # NOTE: Status update is now handled by _handle_initialization_complete via EventBus
+            # This ensures we only set RUNNING after orders are actually placed.
+
             await self.strategy.run()
 
             if not self.no_plot:
@@ -187,6 +191,35 @@ class GridTradingBot:
     async def _handle_start_bot_event(self, reason: str) -> None:
         self.logger.info(f"Handling START_BOT event: {reason}")
         await self.restart()
+
+    async def _handle_initialization_complete(self, _=None) -> None:
+        """
+        Callback for when Strategy finishes placing initial orders.
+        This signals that the bot is fully operational and the UI should stop loading.
+        """
+        if self.db:
+            self.logger.info("✅ Initialization Complete Event Received. Marking Bot as RUNNING.")
+            self.db.update_bot_status(self.bot_id, "RUNNING")
+            
+            # --- SYNC with Node.js Backend ---
+            try:
+                import aiohttp
+                import os
+                
+                # Default to localhost:5000 if not set (Node Backend)
+                API_URL = os.getenv("BACKEND_API_URL", "http://localhost:5000/api")
+                sync_url = f"{API_URL}/user/bot-status"
+                
+                async with aiohttp.ClientSession() as session:
+                    payload = {"bot_id": self.bot_id, "status": "RUNNING"}
+                    async with session.post(sync_url, json=payload) as resp:
+                        if resp.status == 200:
+                            self.logger.info(f"🔄 Synced status with Backend: {self.bot_id} -> RUNNING")
+                        else:
+                            self.logger.warning(f"⚠️ Status Sync Failed: HTTP {resp.status}")
+                            
+            except Exception as e:
+                 self.logger.error(f"❌ Failed to sync status with Node Backend: {e}")
 
     async def _stop(self, sell_assets: bool = False, cancel_orders: bool = True) -> None:
         if not self.is_running:
@@ -222,6 +255,10 @@ class GridTradingBot:
             self.logger.error(f"Error while stopping components: {e}", exc_info=True)
 
         self.logger.info("Grid Trading Bot has been stopped.")
+
+    async def stop(self, cancel_orders: bool = True) -> None:
+        """Public method to stop the bot (delegates to internal _stop)."""
+        await self._stop(cancel_orders=cancel_orders)
 
     async def restart(self) -> None:
         if self.is_running:

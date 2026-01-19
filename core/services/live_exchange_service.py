@@ -241,9 +241,11 @@ class LiveExchangeService(ExchangeInterface):
         order_side: str,
         amount: float,
         price: float | None = None,
+        params: dict = None,
     ) -> dict[str, str | float]:
         try:
-            order = await self.exchange.create_order(pair, order_type, order_side, amount, price)
+            params = params or {}
+            order = await self.exchange.create_order(pair, order_type, order_side, amount, price, params)
             return order
 
         except NetworkError as e:
@@ -341,6 +343,11 @@ class LiveExchangeService(ExchangeInterface):
                 if not orders:
                     break
 
+                # Prevent infinite loop if API returns same data despite cursor
+                if all_orders and orders[-1]["id"] == all_orders[-1]["id"]:
+                    self.logger.warning("Recursion detected in pagination (Same Order ID). Stopping.")
+                    break
+
                 all_orders.extend(orders)
 
                 # If we got fewer than the limit, it means we reached the last page
@@ -349,7 +356,7 @@ class LiveExchangeService(ExchangeInterface):
 
                 # Safety break to prevent infinite loops (e.g. API bug)
                 if len(all_orders) > 2000:
-                    self.logger.warning("Fetched >2000 orders. Stopping pagination to prevent overflow.")
+                    self.logger.warning("Fetched >2000 open orders. Stopping pagination to prevent overflow.")
                     break
 
             # self.logger.info(f"Fetched total {len(all_orders)} open orders from exchange.") (Avoid Spamming)
