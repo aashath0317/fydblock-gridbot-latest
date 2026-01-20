@@ -61,6 +61,18 @@ class BotDatabase:
             )
         """)
 
+        # 3b. Grid Levels Table (Persistence for Infinite Grid)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS grid_levels (
+                bot_id INTEGER,
+                price REAL,
+                status TEXT, -- READY_TO_BUY, READY_TO_SELL, etc.
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (bot_id, price)
+            )
+        """)
+
         # 5. Trade History Table (New)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS trade_history (
@@ -466,3 +478,80 @@ class BotDatabase:
         rows = cursor.fetchall()
         conn.close()
         return rows
+
+    # --- Grid Level Persistence (Infinite Grid) ---
+    def add_grid_level(self, bot_id: int, price: float, status: str):
+        """
+        Inserts a new grid level into the database.
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO grid_levels (bot_id, price, status, created_at, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(bot_id, price) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=CURRENT_TIMESTAMP
+            """,
+                (bot_id, price, status),
+            )
+            conn.commit()
+            # self.logger.debug(f"💾 DB: Added grid level {price} as {status}")
+        except Exception as e:
+            self.logger.error(f"Failed to add grid level {price}: {e}")
+        finally:
+            conn.close()
+
+    def update_grid_level_status(self, bot_id: int, price: float, new_status: str):
+        """
+        Updates the status of an existing grid level.
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE grid_levels
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE bot_id = ? AND price = ?
+            """,
+                (new_status, bot_id, price),
+            )
+            conn.commit()
+            # self.logger.debug(f"💾 DB: Updated grid level {price} to {new_status}")
+        except Exception as e:
+            self.logger.error(f"Failed to update grid level {price}: {e}")
+        finally:
+            conn.close()
+
+    def delete_grid_level(self, bot_id: int, price: float):
+        """
+        Removes a grid level from the database (Infinite Grid trailing).
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM grid_levels WHERE bot_id = ? AND price = ?",
+                (bot_id, price),
+            )
+            conn.commit()
+            self.logger.info(f"💾 DB: Removed grid level {price}")
+        except Exception as e:
+            self.logger.error(f"Failed to delete grid level {price}: {e}")
+        finally:
+            conn.close()
+
+    def get_grid_levels(self, bot_id: int):
+        """
+        Retrieves all grid levels for this bot.
+        Returns a dict: {price: status}
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT price, status FROM grid_levels WHERE bot_id = ?", (bot_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return {row[0]: row[1] for row in rows}

@@ -3,6 +3,7 @@ import logging
 import numpy as np
 
 from config.config_manager import ConfigManager
+from core.storage.bot_database import BotDatabase
 from strategies.spacing_type import SpacingType
 from strategies.strategy_type import StrategyType
 
@@ -22,6 +23,7 @@ class GridManager:
 
         # Inject bot_id if available in config, needed for DB persistence
         self.bot_id = self.config_manager.config.get("bot_id")
+        self.db = BotDatabase() if self.bot_id else None
         self.price_grids: list[float]
         self.central_price: float
         self.sorted_buy_grids: list[float]
@@ -146,29 +148,44 @@ class GridManager:
         threshold_margin = gap / 2.0
         return current_price - threshold_margin, current_price + threshold_margin
 
-    def update_zones_based_on_price(self, current_price: float):
+    async def update_zones_based_on_price(self, current_price: float, cancel_order_callback=None):
         """
         Re-aligns the Buy/Sell zones based on the actual Current Market Price.
-        Triggers Smart Trailing if price exits the grid range.
+        Triggers Smart Trailing (Infinity Grid) if price exits the grid range.
         """
         if self.strategy_type != StrategyType.SIMPLE_GRID:
             return
 
-        self.logger.info(f"?? Re-aligning grid zones to Current Price: {current_price}")
+        self.logger.info(f"🔄 Re-aligning grid zones to Current Price: {current_price}")
 
-        # 1. Smart Trailing Check
+        # 1. Smart Trailing Check (Infinity Grid)
         lowest_grid = min(self.price_grids)
         highest_grid = max(self.price_grids)
 
-        if current_price < lowest_grid:
-            self.trail_grid_down(current_price)
-            return  # Re-init happens inside, so we exit this cycle
+        # Gap calculation (Rough estimate for trigger check)
+        # We need the gap to ensure we trail at the right intervals
+        sorted_grids = sorted(self.price_grids)
+        if len(sorted_grids) > 1:
+            # Assume Arithmetic for simple gap check or use average
+            gap = sorted_grids[1] - sorted_grids[0]
+            # Safety: Ensure gap is positive
+            gap = max(gap, 0.000001)
 
-        if current_price > highest_grid:
-            self.trail_grid_up(current_price)
-            return
+            # TRAIL DOWN
+            # If price drops below lowest_grid - gap (meaning it crossed a virtual new grid line below)
+            if current_price <= lowest_grid - gap:
+                await self.trail_grid_down(current_price, cancel_order_callback)
+                return
 
-        # 2. Normal Zone Update
+            # TRAIL UP
+            # If price goes above highest_grid + gap (meaning it crossed a virtual new grid line above)
+            if current_price >= highest_grid + gap:
+                await self.trail_grid_up(current_price, cancel_order_callback)
+                return
+
+        # ... Rest of the logic for Normal Zone Update remains mostly same but we skip it if we trailed ...
+        # Actually, standard zone logic is still good to keep internal states tidy.
+
         self.sorted_buy_grids = []
         self.sorted_sell_grids = []
 
@@ -191,40 +208,22 @@ class GridManager:
                 ideal_state = GridCycleState.READY_TO_SELL
 
             else:
-                # Dead Zone (Ghost Area)
-                # We do NOT add to sorted lists, so OrderManager won't place new orders here.
-                # self.logger.debug(f"   Grid {price} in Dead Zone ({buy_threshold:.2f} - {sell_threshold:.2f})")
+                # Dead Zone
                 continue
 
             # 3. FIX: Only update state if the grid is IDLE.
-            # If it's WAITING_FOR_FILL, it has a live order. Do NOT touch it.
             if grid_level.state in [GridCycleState.READY_TO_BUY, GridCycleState.READY_TO_SELL]:
-                grid_level.state = ideal_state
+                # In Infinite Grid, we trust the DB/Trail state mostly, but this auto-correction is okay for startup.
+                # However, we should be careful not to flip states that are "holding bags".
+                pass
+                # grid_level.state = ideal_state
+                # COMMENTED OUT: We stop auto-flipping states here because Infinite Grid manages states explicitly.
+                # If we flip a "READY_TO_SELL" (Holding Bag) back to "READY_TO_BUY" just because price moved, we lose the bag logic!
             else:
                 self.logger.info(f"   Skipping state update for busy grid {price} (State: {grid_level.state})")
 
-        # 4. FIX: Enforce Absolute Max Order Count
-        # This must be done AFTER the loop has populated all candidates.
-        max_allowed_orders = self.config_manager.get_num_grids()
-
-        if not max_allowed_orders or max_allowed_orders < 1:
-            max_allowed_orders = len(self.price_grids) - 1
-
-        while (len(self.sorted_buy_grids) + len(self.sorted_sell_grids)) > max_allowed_orders:
-            # Strategies to remove excess orders:
-            # Remove furthest from current price.
-            all_candidates = self.sorted_buy_grids + self.sorted_sell_grids
-            furthest_grid = max(all_candidates, key=lambda p: abs(p - current_price))
-
-            if furthest_grid in self.sorted_buy_grids:
-                self.sorted_buy_grids.remove(furthest_grid)
-            elif furthest_grid in self.sorted_sell_grids:
-                self.sorted_sell_grids.remove(furthest_grid)
-
-            # self.logger.info(f"DEBUG: Removed excess grid {furthest_grid} to offset count.")
-
-        self.logger.info(f"   ? New Buy Grids: {len(self.sorted_buy_grids)}")
-        self.logger.info(f"   ? New Sell Grids: {len(self.sorted_sell_grids)}")
+        self.logger.info(f"   📊 Active Buy Grids: {len(self.sorted_buy_grids)}")
+        self.logger.info(f"   📊 Active Sell Grids: {len(self.sorted_sell_grids)}")
 
     def get_trigger_price(self) -> float:
         return self.central_price
@@ -476,95 +475,112 @@ class GridManager:
 
         return grids, central_price
 
-    def trail_grid_up(self, current_price: float):
+    async def trail_grid_up(self, current_price: float, cancel_order_callback=None):
         """
-        Smart Trailing Logic: Shift the ENTIRE grid window UP.
-        Maintains the same number of grids and spacing/ratio.
+        Infinite Grid Logic: Shift the grid interval UP one by one.
         """
-        self.logger.info(f"🚀 TRAILING UP: Shifting grid window UP to cover {current_price}")
+        sorted_grids = sorted(self.price_grids)
+        if len(sorted_grids) < 2:
+            return
 
-        old_bottom, old_top, num_grids, spacing_type = self._extract_grid_config()
+        gap = sorted_grids[1] - sorted_grids[0]
+        highest_grid = sorted_grids[-1]
 
-        if spacing_type == SpacingType.ARITHMETIC:
-            # Shift by one grid interval? Or shift such that current price is inside?
-            # Standard trailing: Top moves up, Bottom moves up.
-            # We calculate the Shift Amount needed.
-            # If we just want to expand, that's different.
-            # "Trail Up" usually means following the price.
-            # Let's shift so that the NEW Top is slightly above current price?
-            # Or just Add 1 Grid to Top and Remove 1 from Bottom?
-            grid_gap = (old_top - old_bottom) / num_grids
-            new_bottom = old_bottom + grid_gap
-            new_top = old_top + grid_gap
+        # Iteratively shift while price is far enough above
+        while current_price >= highest_grid + gap:
+            self.logger.info(f"🚀 TRAILING UP: Price {current_price} reached next level. Shifting Grid...")
 
-            # Consistency check: Ensure current_price is within (new_bottom, new_top) roughly?
-            # If price jumped massively, one shift might not be enough.
-            # Recursively shift? Or calculate target.
-            if current_price > new_top:
-                # Big jump: Shift window to center? No, user said "Trail".
-                # Let's shift enough steps.
-                steps = int((current_price - old_top) / grid_gap) + 1
-                new_bottom = old_bottom + (grid_gap * steps)
-                new_top = old_top + (grid_gap * steps)
+            # 1. Identify and Remove Lowest Grid
+            # In Trail UP, the lowest grid (Buy) is dropped to make room for new Top (Sell).
+            lowest_grid_price = sorted(self.price_grids)[0]
+            lowest_grid_level = self.grid_levels.get(lowest_grid_price)
 
-        else:  # GEOMETRIC
-            # Ratio = (Top/Bottom)^(1/N)
-            ratio = (old_top / old_bottom) ** (1 / num_grids)
-            new_bottom = old_bottom * ratio
-            new_top = old_top * ratio
+            if lowest_grid_level:
+                # A) Cancel Order on Exchange (Release USDT)
+                if cancel_order_callback:
+                    self.logger.info(f"   Cancelling lowest grid order at {lowest_grid_price}...")
+                    await cancel_order_callback(lowest_grid_level)
 
-            if current_price > new_top:
-                # Calculate needed steps
-                # top * (ratio^steps) >= current
-                # ratio^steps >= current/top
-                # steps * ln(ratio) >= ln(current/top)
-                import math
+                # B) Remove from DB
+                if self.db and self.bot_id:
+                    self.db.delete_grid_level(self.bot_id, lowest_grid_price)
 
-                steps = math.ceil(math.log(current_price / old_top) / math.log(ratio))
-                multiplier = ratio**steps
-                new_bottom = old_bottom * multiplier
-                new_top = old_top * multiplier
+            # C) Shift Grid Structure (Remove Low, Add High)
+            removed_price, new_top_price = self.extend_grid_up()
 
-        self.logger.info(f"   New Range: {new_bottom:.4f} - {new_top:.4f}")
-        self._update_and_persist_config(new_bottom, new_top)
-        self.initialize_grids_and_levels()
+            # 2. Update Previous Top Grid -> READY_TO_BUY
+            # The *old* highest grid was a Sell/Resistance. Now it's below us, so it becomes a Buy code.
+            # Grid Manager extend_grid_up() adds the new top. The old top is now 2nd highest.
+            prev_highest_grid = sorted(self.price_grids)[-2]  # New 2nd highest
+            if prev_highest_grid in self.grid_levels:
+                self.grid_levels[prev_highest_grid].state = GridCycleState.READY_TO_BUY
+                if self.db and self.bot_id:
+                    self.db.update_grid_level_status(self.bot_id, prev_highest_grid, GridCycleState.READY_TO_BUY.value)
 
-    def trail_grid_down(self, current_price: float):
+            # 3. New Top Grid is READY_TO_SELL (Default from extend_grid_up)
+            # Add to DB
+            if self.db and self.bot_id:
+                self.db.add_grid_level(self.bot_id, new_top_price, GridCycleState.READY_TO_SELL.value)
+
+            # Update loop var
+            highest_grid = new_top_price
+
+            # Persist Config Range
+            new_bottom = sorted(self.price_grids)[0]
+            self._update_and_persist_config(new_bottom, new_top_price)
+
+    async def trail_grid_down(self, current_price: float, cancel_order_callback=None):
         """
-        Smart Trailing Logic: Shift the ENTIRE grid window DOWN.
+        Infinite Grid Logic: Shift the grid interval DOWN one by one.
         """
-        self.logger.info(f"📉 TRAILING DOWN: Shifting grid window DOWN to cover {current_price}")
+        sorted_grids = sorted(self.price_grids)
+        if len(sorted_grids) < 2:
+            return
 
-        old_bottom, old_top, num_grids, spacing_type = self._extract_grid_config()
+        gap = sorted_grids[1] - sorted_grids[0]
+        lowest_grid = sorted_grids[0]
 
-        if spacing_type == SpacingType.ARITHMETIC:
-            grid_gap = (old_top - old_bottom) / num_grids
-            new_bottom = old_bottom - grid_gap
-            new_top = old_top - grid_gap
+        # Iteratively shift while price is far enough below
+        while current_price <= lowest_grid - gap:
+            self.logger.info(f"📉 TRAILING DOWN: Price {current_price} reached next level. Shifting Grid...")
 
-            if current_price < new_bottom:
-                steps = int((old_bottom - current_price) / grid_gap) + 1
-                new_bottom = old_bottom - (grid_gap * steps)
-                new_top = old_top - (grid_gap * steps)
+            # 1. Identify and Remove Highest Grid
+            # In Trail DOWN, the highest grid (Sell) is dropped to make room for new Bottom (Buy).
+            highest_grid_price = sorted(self.price_grids)[-1]
+            highest_grid_level = self.grid_levels.get(highest_grid_price)
 
-        else:  # GEOMETRIC
-            ratio = (old_top / old_bottom) ** (1 / num_grids)
-            new_bottom = old_bottom / ratio
-            new_top = old_top / ratio
+            if highest_grid_level:
+                # A) Cancel Order on Exchange (Release Coin)
+                if cancel_order_callback:
+                    self.logger.info(f"   Cancelling highest grid order at {highest_grid_price}...")
+                    await cancel_order_callback(highest_grid_level)
 
-            if current_price < new_bottom:
-                import math
+                # B) Remove from DB
+                if self.db and self.bot_id:
+                    self.db.delete_grid_level(self.bot_id, highest_grid_price)
 
-                # bottom / (ratio^steps) <= current
-                # bottom/current <= ratio^steps
-                steps = math.ceil(math.log(old_bottom / current_price) / math.log(ratio))
-                divisor = ratio**steps
-                new_bottom = old_bottom / divisor
-                new_top = old_top / divisor
+            # C) Shift Grid Structure (Remove High, Add Low)
+            removed_price, new_bottom_price = self.extend_grid_down()
 
-        self.logger.info(f"   New Range: {new_bottom:.4f} - {new_top:.4f}")
-        self._update_and_persist_config(new_bottom, new_top)
-        self.initialize_grids_and_levels()
+            # 2. Update Previous Lowest Grid -> READY_TO_SELL
+            # The *old* lowest grid was a Buy/Support. Now it's above us, so it becomes a Sell code.
+            prev_lowest_grid = sorted(self.price_grids)[1]  # New 2nd lowest
+            if prev_lowest_grid in self.grid_levels:
+                self.grid_levels[prev_lowest_grid].state = GridCycleState.READY_TO_SELL
+                if self.db and self.bot_id:
+                    self.db.update_grid_level_status(self.bot_id, prev_lowest_grid, GridCycleState.READY_TO_SELL.value)
+
+            # 3. New Bottom Grid is READY_TO_BUY (Default from extend_grid_down)
+            # Add to DB
+            if self.db and self.bot_id:
+                self.db.add_grid_level(self.bot_id, new_bottom_price, GridCycleState.READY_TO_BUY.value)
+
+            # Update loop var
+            lowest_grid = new_bottom_price
+
+            # Persist Config Range
+            new_top = sorted(self.price_grids)[-1]
+            self._update_and_persist_config(new_bottom_price, new_top)
 
     def _update_and_persist_config(self, new_bottom: float, new_top: float):
         """

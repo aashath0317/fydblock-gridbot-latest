@@ -353,9 +353,45 @@ class GridTradingStrategy(TradingStrategyInterface):
         if grid_orders_initialized:
             return True
 
-        self.logger.info(f"?? Immediate Start Triggered! Current Price: {current_price} (Grid Center: {trigger_price})")
+        self.logger.info(f"🔄 Immediate Start Triggered! Current Price: {current_price} (Grid Center: {trigger_price})")
 
-        self.grid_manager.update_zones_based_on_price(current_price)
+        # Define callback for GridManager to release funds/assets when trailing
+        async def cancel_order_callback(grid_level):
+            try:
+                # Find the active order for this grid price
+                # We use a tolerance because Order price might be slightly different handling floats
+                target_order = self.order_manager.order_book.get_order_at_price(grid_level.price)
+
+                if target_order and target_order.status == "OPEN":
+                    self.logger.info(
+                        f"   [Callback] Cancelling Order {target_order.identifier} at {grid_level.price}..."
+                    )
+                    await self.order_manager.order_execution_strategy.cancel_order(
+                        target_order.identifier, self.trading_pair
+                    )
+
+                    # Manual Release of Funds (Crucial for immediate re-use in same tick)
+                    # OrderCancelled event might be too slow if we depend on WebSocket
+                    if target_order.side == OrderSide.BUY:
+                        cost = target_order.remaining * target_order.price
+                        self.balance_tracker.reserved_fiat = max(0, self.balance_tracker.reserved_fiat - cost)
+                        self.balance_tracker.balance += cost  # Add back to Free Fiat
+                    else:
+                        self.balance_tracker.reserved_crypto = max(
+                            0, self.balance_tracker.reserved_crypto - target_order.remaining
+                        )
+                        self.balance_tracker.crypto_balance += target_order.remaining  # Add back to Free Crypto
+
+                    # Mark locally as Cancelled so we don't try again
+                    target_order.status = "CANCELLED"
+                else:
+                    self.logger.warning(f"   [Callback] No OPEN order found at {grid_level.price} to cancel.")
+
+            except Exception as e:
+                self.logger.error(f"   [Callback] Failed to cancel order: {e}")
+
+        # Pass callback and AWAIT the async update
+        await self.grid_manager.update_zones_based_on_price(current_price, cancel_order_callback)
 
         try:
             if hot_boot:
