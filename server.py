@@ -688,12 +688,22 @@ async def get_bot_stats(bot_id: int):
         # 3.5 Get Execution History (Trades)
         try:
             cursor.execute(
-                "SELECT side, quantity, price, executed_at, fee_amount, fee_currency, realized_pnl FROM trade_history WHERE bot_id = ? ORDER BY executed_at DESC LIMIT 50",
+                "SELECT side, quantity, price, executed_at, fee_amount, fee_currency, realized_pnl, pair FROM trade_history WHERE bot_id = ? ORDER BY executed_at DESC LIMIT 50",
                 (bot_id,),
             )
             trades = cursor.fetchall()
             stats["recent_trades"] = []
-            for t_side, t_qty, t_price, t_ts, t_fee, t_fee_curr, t_pnl in trades:
+            for t_side, t_qty, t_price, t_ts, t_fee, t_fee_curr, t_pnl, t_pair in trades:
+                # Fix UNKNOWN currency
+                final_fee_curr = t_fee_curr
+                if not final_fee_curr or final_fee_curr == "UNKNOWN":
+                    # Fallback to pair deduction
+                    if t_pair and "/" in t_pair:
+                        base, quote = t_pair.split("/")
+                        final_fee_curr = base if t_side == "buy" else quote
+                    else:
+                        final_fee_curr = "USDT"  # Ultimate fallback
+
                 stats["recent_trades"].append(
                     {
                         "side": t_side,
@@ -701,7 +711,7 @@ async def get_bot_stats(bot_id: int):
                         "price": float(t_price or 0),
                         "timestamp": t_ts,
                         "fee": float(t_fee or 0),
-                        "fee_currency": t_fee_curr or "USDT",
+                        "fee_currency": final_fee_curr,
                         "profit": float(t_pnl or 0),
                     }
                 )

@@ -405,7 +405,14 @@ class OrderManager:
             }
             if order.fee:
                 trade_record["fee_amount"] = float(order.fee.get("cost", 0.0))
-                trade_record["fee_currency"] = order.fee.get("currency", "")
+                currency = order.fee.get("currency", "")
+                if currency and currency.upper() != "UNKNOWN":
+                    trade_record["fee_currency"] = currency
+            else:
+                # Fallback: Estimate Fee in Base Currency
+                # Fee = Quantity * Rate
+                rate = self.balance_tracker.fee_calculator.trading_fee
+                trade_record["fee_amount"] = order.filled * rate
 
             self.db.add_trade_history(trade_record)
         # --------------------------------
