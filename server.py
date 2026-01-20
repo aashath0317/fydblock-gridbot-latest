@@ -688,14 +688,22 @@ async def get_bot_stats(bot_id: int):
         # 3.5 Get Execution History (Trades)
         try:
             cursor.execute(
-                "SELECT side, quantity, price, executed_at FROM trade_history WHERE bot_id = ? ORDER BY executed_at DESC LIMIT 50",
+                "SELECT side, quantity, price, executed_at, fee_amount, fee_currency, realized_pnl FROM trade_history WHERE bot_id = ? ORDER BY executed_at DESC LIMIT 50",
                 (bot_id,),
             )
             trades = cursor.fetchall()
             stats["recent_trades"] = []
-            for t_side, t_qty, t_price, t_ts in trades:
+            for t_side, t_qty, t_price, t_ts, t_fee, t_fee_curr, t_pnl in trades:
                 stats["recent_trades"].append(
-                    {"side": t_side, "qty": float(t_qty or 0), "price": float(t_price or 0), "timestamp": t_ts}
+                    {
+                        "side": t_side,
+                        "qty": float(t_qty or 0),
+                        "price": float(t_price or 0),
+                        "timestamp": t_ts,
+                        "fee": float(t_fee or 0),
+                        "fee_currency": t_fee_curr or "USDT",
+                        "profit": float(t_pnl or 0),
+                    }
                 )
         except Exception as e:
             logger.warning(f"Failed to fetch trades for bot {bot_id}: {e}")

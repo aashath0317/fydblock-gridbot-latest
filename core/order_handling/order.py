@@ -45,7 +45,7 @@ class Order:
         cost: float | None = None,
         info: dict[str, str | float | dict] | None = None,
     ):
-        self.identifier = identifier
+        self.identifier = str(identifier)
         self.status = status  # 'open', 'closed', 'canceled', 'expired', 'rejected'
         self.order_type = order_type  # 'market', 'limit'
         self.side = side  # 'buy', 'sell'

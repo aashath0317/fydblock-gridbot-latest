@@ -319,12 +319,14 @@ class OrderManager:
     async def _on_order_filled(self, order: Order) -> None:
         try:
             # DEDUPLICATION: Skip if already processed (defense-in-depth)
-            if order.identifier in self._processed_order_fills:
+            # FIX: Enforce string type for consistent deduplication
+            order_id_str = str(order.identifier)
+            if order_id_str in self._processed_order_fills:
                 self.logger.debug(f"Order {order.identifier} already handled. Ignoring duplicate fill event.")
                 return
 
             # Mark as processed immediately
-            self._processed_order_fills.add(order.identifier)
+            self._processed_order_fills.add(order_id_str)
 
             # 1. Update DB Status immediately
             if self.bot_id:
