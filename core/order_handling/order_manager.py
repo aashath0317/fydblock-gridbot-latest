@@ -3,7 +3,6 @@ import logging
 import math
 import uuid
 
-
 import aiohttp
 import pandas as pd
 
@@ -60,6 +59,9 @@ class OrderManager:
         # --- Initialize Database ---
         self.db = BotDatabase()
         # ---------------------------
+
+        # Deduplication: Track processed fill events for defense-in-depth
+        self._processed_order_fills: set[str] = set()
 
         self.event_bus.subscribe(Events.ORDER_FILLED, self._on_order_filled)
         self.event_bus.subscribe(Events.ORDER_CANCELLED, self._on_order_cancelled)
@@ -316,6 +318,14 @@ class OrderManager:
 
     async def _on_order_filled(self, order: Order) -> None:
         try:
+            # DEDUPLICATION: Skip if already processed (defense-in-depth)
+            if order.identifier in self._processed_order_fills:
+                self.logger.debug(f"Order {order.identifier} already handled. Ignoring duplicate fill event.")
+                return
+
+            # Mark as processed immediately
+            self._processed_order_fills.add(order.identifier)
+
             # 1. Update DB Status immediately
             if self.bot_id:
                 self.db.update_order_status(order.identifier, "FILLED")
@@ -583,17 +593,7 @@ class OrderManager:
             for o in exchange_orders_raw:
                 cid = o.get("clientOrderId") or ""
                 # Strict check: Must start with my prefix
-                if str(cid).startswith(prefix):
-                    exchange_orders.append(o)
-                # Fallback: If order has NO clientOrderId (e.g. manually placed or legacy),
-                # we might want to ignore it to be safe, OR claim it if price matches perfectly?
-                # For now, let's log debug and IGNORE to ensure strict isolation.
-                # If a user wants to "adopt" an order, they should use the specific "Import" feature (not built yet)
-                # or we rely on the logic below (price matching) IF we decide to be lenient.
-                # DECISION: Be Strict. If it's not marked as mine, I don't touch it.
-                # EXCEPT: If I have it in my DB!
-                # If I have an order in DB that matches this ID, I must track it even if CID is missing (legacy).
-                elif self.db.get_order(o["id"]):
+                if str(cid).startswith(prefix) or self.db.get_order(o["id"]):
                     exchange_orders.append(o)
         else:
             # No bot_id (e.g. backtest), take everything
@@ -1188,9 +1188,7 @@ class OrderManager:
                 oid = order["id"]
                 cid = order.get("clientOrderId", "")
 
-                if oid in db_ids:
-                    orders_to_nuke.append(order)
-                elif str(cid).startswith(prefix):
+                if oid in db_ids or str(cid).startswith(prefix):
                     orders_to_nuke.append(order)
                 else:
                     # Optional: Check for orphaned price match if strictly needed,

@@ -1,14 +1,14 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
-from contextlib import asynccontextmanager
 from typing import Any
 
+from adapter.config_adapter import DictConfigManager
 import ccxt.async_support as ccxt  # Use Async CCXT for public data
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from adapter.config_adapter import DictConfigManager
 from config.config_validator import ConfigValidator
 from core.bot_management.event_bus import EventBus
 from core.bot_management.grid_trading_bot import GridTradingBot
@@ -39,6 +39,29 @@ logger = logging.getLogger("FydEngine")
 
 # Apply filter to uvicorn.error to suppress repetitive "Invalid HTTP request received"
 logging.getLogger("uvicorn.error").addFilter(DuplicateLogFilter())
+
+
+class EndpointAccessFilter(logging.Filter):
+    """
+    Filter to suppress successful access logs for specific endpoints (e.g., /stats polling).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            # Access logs usually have args like (client_addr, method, path, http_version, status_code)
+            # But uvicorn.access format might vary. The message string often contains the info.
+            # Typical msg: '%s - "%s %s HTTP/%s" %d'
+            # We check the message string for the target endpoint.
+            log_msg = record.getMessage()
+            if "GET /bot/" in log_msg and "/stats" in log_msg and "200" in log_msg:
+                return False
+            return True
+        except Exception:
+            return True
+
+
+# Apply filter to uvicorn.access to suppress spammy stats polling
+logging.getLogger("uvicorn.access").addFilter(EndpointAccessFilter())
 
 # Store active bots: { bot_id: { "bot": GridTradingBot, "task": asyncio.Task } }
 active_instances: dict[int, dict[str, Any]] = {}

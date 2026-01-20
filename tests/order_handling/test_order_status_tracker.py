@@ -1,5 +1,3 @@
-import asyncio
-import contextlib
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -154,3 +152,23 @@ class TestOrderStatusTracker:
             mock_logger_warning.assert_called_once_with("OrderStatusTracker stream is already running.")
 
         await tracker.stop_tracking()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_fill_events_are_ignored(self, setup_tracker):
+        """Test that duplicate filled events for the same order are ignored."""
+        tracker, order_book, _, event_bus = setup_tracker
+
+        order_data = {"id": "order_dup_1", "status": "closed", "filled": 1.0, "remaining": 0.0}
+        local_order = Mock()
+        order_book.get_order.return_value = local_order
+
+        # First call should process
+        await tracker._on_order_update(order_data)
+        assert event_bus.publish_sync.call_count == 1
+
+        # Second call should be ignored (duplicate)
+        await tracker._on_order_update(order_data)
+        assert event_bus.publish_sync.call_count == 1  # Still 1, not 2
+
+        # Verify the order was added to processed fills
+        assert "order_dup_1" in tracker._processed_fills

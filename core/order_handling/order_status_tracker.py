@@ -37,6 +37,8 @@ class OrderStatusTracker:
         self._monitoring_task = None
         self._active_tasks = set()
         self.logger = logging.getLogger(self.__class__.__name__)
+        # Deduplication: Track processed fill events to prevent duplicates
+        self._processed_fills: set[str] = set()
 
     async def _track_open_order_statuses(self) -> None:
         """
@@ -139,6 +141,11 @@ class OrderStatusTracker:
 
             # Normalize status to enum if possible or string check
             if status == OrderStatus.CLOSED or status == "closed":
+                # DEDUPLICATION: Skip if already processed
+                if order_id in self._processed_fills:
+                    self.logger.debug(f"Order {order_id} already processed. Skipping duplicate fill event.")
+                    return
+
                 self.order_book.update_order_status(order_id, OrderStatus.CLOSED)
                 # Ideally we want an Order object, but for now we might need to fetch it or construct it
                 # If we have it in order_book, we can get it
@@ -162,6 +169,8 @@ class OrderStatusTracker:
                     if ord_price and ord_price > 0:
                         local_order.price = ord_price
 
+                    # Mark as processed BEFORE publishing to prevent race conditions
+                    self._processed_fills.add(order_id)
                     self.event_bus.publish_sync(Events.ORDER_FILLED, local_order)
                     self.logger.info(f"Order {order_id} filled.")
                 else:
@@ -185,6 +194,8 @@ class OrderStatusTracker:
                         else:
                             remote_order = await self.order_execution_strategy.get_order(order_id, symbol)
                             if remote_order and remote_order.status == OrderStatus.CLOSED:
+                                # Mark as processed BEFORE publishing to prevent race conditions
+                                self._processed_fills.add(order_id)
                                 self.logger.info(f"Recovered orphan order {order_id}. Publishing FILLED event.")
                                 self.event_bus.publish_sync(Events.ORDER_FILLED, remote_order)
                     except Exception as rec_error:
