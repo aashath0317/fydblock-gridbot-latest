@@ -104,6 +104,7 @@ class GridTradingBot:
                 event_bus=self.event_bus,
                 trading_pair=self.trading_pair,
                 polling_interval=5.0,
+                bot_id=self.bot_id,
             )
 
             order_manager = OrderManager(
@@ -200,16 +201,17 @@ class GridTradingBot:
         if self.db:
             self.logger.info("✅ Initialization Complete Event Received. Marking Bot as RUNNING.")
             self.db.update_bot_status(self.bot_id, "RUNNING")
-            
+
             # --- SYNC with Node.js Backend ---
             try:
-                import aiohttp
                 import os
-                
+
+                import aiohttp
+
                 # Default to localhost:5000 if not set (Node Backend)
                 API_URL = os.getenv("BACKEND_API_URL", "http://localhost:5000/api")
                 sync_url = f"{API_URL}/user/bot-status"
-                
+
                 async with aiohttp.ClientSession() as session:
                     payload = {"bot_id": self.bot_id, "status": "RUNNING"}
                     async with session.post(sync_url, json=payload) as resp:
@@ -217,9 +219,9 @@ class GridTradingBot:
                             self.logger.info(f"🔄 Synced status with Backend: {self.bot_id} -> RUNNING")
                         else:
                             self.logger.warning(f"⚠️ Status Sync Failed: HTTP {resp.status}")
-                            
+
             except Exception as e:
-                 self.logger.error(f"❌ Failed to sync status with Node Backend: {e}")
+                self.logger.error(f"❌ Failed to sync status with Node Backend: {e}")
 
     async def _stop(self, sell_assets: bool = False, cancel_orders: bool = True) -> None:
         if not self.is_running:

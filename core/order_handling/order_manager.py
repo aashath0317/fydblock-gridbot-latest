@@ -328,6 +328,20 @@ class OrderManager:
             # Mark as processed immediately
             self._processed_order_fills.add(order_id_str)
 
+            # OWNERSHIP VALIDATION: Defense-in-depth
+            if self.bot_id:
+                info = order.info or {}
+                # Check common fields for client ID
+                client_oid = info.get("clientOrderId") or info.get("clOrdId") or info.get("client_oid")
+                expected_prefix = f"G{self.bot_id}x"
+
+                if client_oid and str(client_oid).startswith("G") and not str(client_oid).startswith(expected_prefix):
+                    # It starts with G (likely a bot order) but not OUR bot prefix
+                    self.logger.warning(
+                        f"Ignored foreign bot order {order.identifier}. CID '{client_oid}' does not match prefix '{expected_prefix}'."
+                    )
+                    return
+
             # 1. Update DB Status immediately
             if self.bot_id:
                 self.db.update_order_status(order.identifier, "FILLED")

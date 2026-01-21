@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -172,3 +172,52 @@ class TestOrderStatusTracker:
 
         # Verify the order was added to processed fills
         assert "order_dup_1" in tracker._processed_fills
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_ownership_validation():
+    # Setup
+    order_book = MagicMock()
+    # Order not in local book
+    order_book.get_order.return_value = None
+
+    strategy = AsyncMock()
+    event_bus = MagicMock()
+
+    # Initialize tracker with specific bot_id
+    tracker = OrderStatusTracker(order_book, strategy, event_bus, "SOL/USDT", bot_id=123)
+
+    # 1. Test IGNORING foreign order
+    foreign_order = MagicMock()
+    foreign_order.identifier = "foreign_1"
+    foreign_order.status = OrderStatus.CLOSED
+    # Simulate foreign prefix (e.g. Bot 999)
+    foreign_order.info = {"clientOrderId": "G999xForeignOrder"}
+
+    strategy.get_order.return_value = foreign_order
+
+    # Trigger update
+    await tracker._handle_order_status_change({"id": "foreign_1", "status": "closed"})
+
+    # Assert NOT published
+    assert event_bus.publish_sync.call_count == 0
+    assert "foreign_1" not in tracker._processed_fills
+
+    # 2. Test ACCEPTING own order
+    own_order = MagicMock()
+    own_order.identifier = "own_1"
+    own_order.status = OrderStatus.CLOSED
+    # Simulate matching prefix (Bot 123)
+    own_order.info = {"clientOrderId": "G123xOwnOrder"}
+
+    strategy.get_order.return_value = own_order
+
+    # Trigger update
+    await tracker._handle_order_status_change({"id": "own_1", "status": "closed"})
+
+    # Assert PUBLISHED
+    assert event_bus.publish_sync.call_count == 1
+    call_args = event_bus.publish_sync.call_args
+    assert call_args[0][0] == Events.ORDER_FILLED
+    assert call_args[0][1].identifier == "own_1"
+    assert "own_1" in tracker._processed_fills

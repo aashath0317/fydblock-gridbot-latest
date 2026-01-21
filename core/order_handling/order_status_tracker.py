@@ -19,6 +19,7 @@ class OrderStatusTracker:
         event_bus: EventBus,
         trading_pair: str,
         polling_interval: float = 15.0,
+        bot_id: str | int | None = None,
     ):
         """
         Initializes the OrderStatusTracker.
@@ -27,7 +28,9 @@ class OrderStatusTracker:
             order_book: OrderBook instance to manage and query orders.
             order_execution_strategy: Strategy for querying order statuses from the exchange.
             event_bus: EventBus instance for publishing state change events.
+            trading_pair: The trading pair (e.g., "BTC/USDT") this tracker is monitoring.
             polling_interval: Time interval (in seconds) between status checks.
+            bot_id: Optional identifier for the bot, used for ownership validation of orphan orders.
         """
         self.order_book = order_book
         self.order_execution_strategy = order_execution_strategy
@@ -198,6 +201,24 @@ class OrderStatusTracker:
                         else:
                             remote_order = await self.order_execution_strategy.get_order(order_id, symbol)
                             if remote_order and remote_order.status == OrderStatus.CLOSED:
+                                # OWNERSHIP VALIDATION: Check clientOrderId if bot_id is set
+                                if self.bot_id:
+                                    info = remote_order.info or {}
+                                    # Check common fields for client ID (CCXT standardizes to 'clientOrderId', exchange specific might be 'clOrdId')
+                                    client_oid = (
+                                        info.get("clientOrderId") or info.get("clOrdId") or info.get("client_oid")
+                                    )
+
+                                    # Expected prefix: "G<bot_id>x"
+                                    expected_prefix = f"G{self.bot_id}x"
+
+                                    if not client_oid or not str(client_oid).startswith(expected_prefix):
+                                        self.logger.warning(
+                                            f"Ignored orphan order {order_id}. Ownership mismatch. "
+                                            f"Expected prefix '{expected_prefix}', got CID '{client_oid}'."
+                                        )
+                                        return
+
                                 self.logger.info(f"Recovered orphan order {order_id}. Publishing FILLED event.")
                                 self.event_bus.publish_sync(Events.ORDER_FILLED, remote_order)
                     except Exception as rec_error:
