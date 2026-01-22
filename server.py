@@ -888,8 +888,14 @@ async def run_backtest(req: BacktestRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Global Exchange Cache
+exchange_cache = {}
+
+
 @app.get("/market/candles")
-async def get_market_candles(symbol: str, exchange: str, timeframe: str = "1h", limit: int = 300):
+async def get_market_candles(
+    symbol: str, exchange: str, timeframe: str = "1h", limit: int = 300, since: int | None = None
+):
     """
     Fetches OHLCV candles via CCXT (Async).
     Used by the Frontend (via Node Proxy) to render charts.
@@ -899,14 +905,18 @@ async def get_market_candles(symbol: str, exchange: str, timeframe: str = "1h", 
         if not getattr(ccxt, clean_exchange, None):
             raise HTTPException(status_code=400, detail="Exchange not supported")
 
-        # Initialize Async Exchange
-        exchange_class = getattr(ccxt, clean_exchange)
-        exchange_instance = exchange_class({"enableRateLimit": True})
+        # Reuse or Initialize Async Exchange
+        if clean_exchange not in exchange_cache:
+            exchange_class = getattr(ccxt, clean_exchange)
+            exchange_cache[clean_exchange] = exchange_class({"enableRateLimit": True})
+
+        exchange_instance = exchange_cache[clean_exchange]
 
         try:
             # Fetch Candles
             if exchange_instance.has["fetchOHLCV"]:
-                candles = await exchange_instance.fetch_ohlcv(symbol, timeframe, limit=limit)
+                # Pass 'since' if available
+                candles = await exchange_instance.fetch_ohlcv(symbol, timeframe, limit=limit, since=since)
 
                 # Format: [timestamp, open, high, low, close, volume]
                 # Frontend expects: { time: usage, open, high, low, close }
@@ -917,8 +927,11 @@ async def get_market_candles(symbol: str, exchange: str, timeframe: str = "1h", 
                 return formatted
             else:
                 raise HTTPException(status_code=400, detail="Exchange does not support candles")
-        finally:
-            await exchange_instance.close()
+        except Exception as e:
+            # If explicit error (like connection closed), maybe clear cache?
+            # logger.warning(f"Exchange error, clearing cache for {clean_exchange}")
+            # del exchange_cache[clean_exchange]
+            raise e
 
     except Exception as e:
         logger.error(f"Candle fetch failed: {e}")

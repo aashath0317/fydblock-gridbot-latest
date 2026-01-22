@@ -67,6 +67,7 @@ class BotDatabase:
                 bot_id INTEGER,
                 price REAL,
                 status TEXT, -- READY_TO_BUY, READY_TO_SELL, etc.
+                stock_on_hand REAL DEFAULT 0.0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (bot_id, price)
@@ -120,6 +121,16 @@ class BotDatabase:
                 self.logger.info("🔄 DB: Migrated bot_balances table - Added 'updated_at'")
             except Exception as e:
                 self.logger.error(f"Failed to add updated_at column: {e}")
+
+        # Schema Migration: Add stock_on_hand to grid_levels if missing
+        cursor.execute("PRAGMA table_info(grid_levels)")
+        grid_columns = [info[1] for info in cursor.fetchall()]
+        if "stock_on_hand" not in grid_columns:
+            try:
+                cursor.execute("ALTER TABLE grid_levels ADD COLUMN stock_on_hand REAL DEFAULT 0.0")
+                self.logger.info("🔄 DB: Migrated grid_levels table - Added 'stock_on_hand'")
+            except Exception as e:
+                self.logger.error(f"Failed to add stock_on_hand to grid_levels: {e}")
 
         conn.commit()
         conn.close()
@@ -480,7 +491,7 @@ class BotDatabase:
         return rows
 
     # --- Grid Level Persistence (Infinite Grid) ---
-    def add_grid_level(self, bot_id: int, price: float, status: str):
+    def add_grid_level(self, bot_id: int, price: float, status: str, stock_on_hand: float = 0.0):
         """
         Inserts a new grid level into the database.
         """
@@ -489,13 +500,14 @@ class BotDatabase:
         try:
             cursor.execute(
                 """
-                INSERT INTO grid_levels (bot_id, price, status, created_at, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                INSERT INTO grid_levels (bot_id, price, status, stock_on_hand, created_at, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT(bot_id, price) DO UPDATE SET
                     status=excluded.status,
+                    stock_on_hand=excluded.stock_on_hand,
                     updated_at=CURRENT_TIMESTAMP
             """,
-                (bot_id, price, status),
+                (bot_id, price, status, stock_on_hand),
             )
             conn.commit()
             # self.logger.debug(f"💾 DB: Added grid level {price} as {status}")
@@ -526,6 +538,28 @@ class BotDatabase:
         finally:
             conn.close()
 
+    def update_grid_stock(self, bot_id: int, price: float, stock_on_hand: float):
+        """
+        Updates the stock_on_hand for a grid level.
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE grid_levels
+                SET stock_on_hand = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE bot_id = ? AND price = ?
+            """,
+                (stock_on_hand, bot_id, price),
+            )
+            conn.commit()
+            self.logger.info(f"💾 DB: Updated stock for {price} to {stock_on_hand:.6f}")
+        except Exception as e:
+            self.logger.error(f"Failed to update stock for {price}: {e}")
+        finally:
+            conn.close()
+
     def delete_grid_level(self, bot_id: int, price: float):
         """
         Removes a grid level from the database (Infinite Grid trailing).
@@ -547,11 +581,12 @@ class BotDatabase:
     def get_grid_levels(self, bot_id: int):
         """
         Retrieves all grid levels for this bot.
-        Returns a dict: {price: status}
+        Returns a dict: {price: {"status": status, "stock": stock_on_hand}}
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT price, status FROM grid_levels WHERE bot_id = ?", (bot_id,))
+        cursor.execute("SELECT price, status, stock_on_hand FROM grid_levels WHERE bot_id = ?", (bot_id,))
         rows = cursor.fetchall()
         conn.close()
-        return {row[0]: row[1] for row in rows}
+        # Return enriched dict
+        return {row[0]: {"status": row[1], "stock": row[2] if row[2] is not None else 0.0} for row in rows}

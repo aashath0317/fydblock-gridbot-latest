@@ -162,7 +162,17 @@ class OrderManager:
             for price in self.grid_manager.sorted_sell_grids:
                 if price <= safe_sell_limit:
                     continue
-                await self._place_limit_order_safe(price, OrderSide.SELL)
+                # Phase 4 Update: Capture order and record stock
+                order = await self._place_limit_order_safe(price, OrderSide.SELL)
+                if order:
+                    # We successfully locked stock in a sell order.
+                    # According to the plan, we should record this as stock "allocated" to the key.
+                    # Even though it's locked, it is the Tracking Field for this grid.
+                    # If we cancel it later, we know how much we had.
+                    self.grid_manager.grid_levels[price].stock_on_hand = order.amount
+                    if self.bot_id:
+                        self.db.update_grid_stock(self.bot_id, price, order.amount)
+                    self.logger.info(f"🏁 Init: Recorded initial stock {order.amount} for grid {price}")
 
         finally:
             self.initializing = False
@@ -406,6 +416,37 @@ class OrderManager:
         else:
             self.logger.warning(f"No valid sell grid level found for buy grid level {grid_level}.")
 
+        # --- PRECISE COIN TRACKING (Phase 2) ---
+        # 1. Get the exact fill data
+        executed_qty = order.filled
+        fee_paid_in_coin = 0.0
+
+        if order.fee and order.fee.get("currency") == self.trading_pair.split("/")[0]:
+            # Fee was paid in Base Currency (e.g. SOL)
+            fee_paid_in_coin = float(order.fee.get("cost", 0.0))
+        elif not order.fee:
+            # Fallback estimation if no fee object (Assumes fee in base currency if buying)
+            # Typically exchanges charge fee in 'receiving' currency
+            # But we check config/trading logic.
+            # For safety, if we don't know, we assume 0.1% base deduction if not using BNb/etc.
+            # However, balance_tracker might know.
+            # Let's use a safe fallback: if no fee info, assume 0 for now or minimal?
+            # Better to use execution report.
+            pass
+
+        # 2. Calculate Net Coin Received
+        net_coin_received = executed_qty - fee_paid_in_coin
+
+        # 3. Save to DB Ledger & Memory
+        grid_level.stock_on_hand = net_coin_received
+        if self.bot_id:
+            self.db.update_grid_stock(self.bot_id, grid_level.price, net_coin_received)
+
+        self.logger.info(
+            f"🧬 Precise Tracking: Bought {executed_qty} - Fee {fee_paid_in_coin} = Stock {net_coin_received:.6f}"
+        )
+        # ---------------------------------------
+
         # --- SAVE TRADE HISTORY (BUY) ---
         if self.bot_id:
             trade_record = {
@@ -444,8 +485,23 @@ class OrderManager:
 
         # --- PROFIT SYNC ---
         if paired_buy_level:
-            # Calculate Gross Profit
-            gross_profit = (order.average - paired_buy_level.price) * order.filled
+            # --- PROFIT CALCULATION ---
+            # Determine logic based on Order Size Type (Base vs Quote)
+            # Base = Fixed Coin Amount (Standard Grid) -> Profit is Cash Flow (Realized PnL)
+            # Quote = Fixed USDT Amount (Accumulate Coin) -> Profit is Total Value Gain (Realized + Unrealized Dust)
+            order_size_type = self.grid_manager.config_manager.get_order_size_type()
+
+            if order_size_type == "quote":
+                # Formula: Revenue * (SellPrice - BuyPrice) / BuyPrice
+                # This calculates the value of the 'extra coin' gained at the current sell price
+                revenue = order.average * order.filled
+                gross_profit = revenue * (order.average - paired_buy_level.price) / paired_buy_level.price
+                self.logger.info(f"🧮 Quote Mode Profit: {gross_profit:.4f} (Based on Val. Gain)")
+            else:
+                # Standard: Price Diff * Quantity Sold
+                gross_profit = (order.average - paired_buy_level.price) * order.filled
+
+            # --------------------------
 
             # Calculate Fees (Estimate)
             # Buy Fee: based on the original buy price
@@ -537,6 +593,14 @@ class OrderManager:
 
         quantity = quantity_override if quantity_override > 0 else raw_quantity
 
+        # --- PRECISE COIN TRACKING (Phase 3) ---
+        # If Selling, check if we have specific stock tracking for this grid
+        dust_remainder = 0.0
+        if side == OrderSide.SELL and grid_level.stock_on_hand > 0:
+            self.logger.info(f"📉 Using Stock-On-Hand for Sell Order: {grid_level.stock_on_hand:.6f}")
+            quantity = grid_level.stock_on_hand
+        # ---------------------------------------
+
         try:
             if side == OrderSide.BUY:
                 qty = self.order_validator.adjust_and_validate_buy_quantity(
@@ -547,6 +611,8 @@ class OrderManager:
                     self.balance_tracker.crypto_balance, quantity
                 )
 
+                # (Dust management moved to after successful placement)
+
             # --- ISOLATION FIX: Generate Client Order ID ---
             client_order_id = None
             if self.bot_id:
@@ -555,13 +621,27 @@ class OrderManager:
                 client_order_id = f"G{self.bot_id}x{short_uuid}"
 
             params = {"clientOrderId": client_order_id} if client_order_id else None
-            # -----------------------------------------------
 
             order = await self.order_execution_strategy.execute_limit_order(
                 side, self.trading_pair, qty, price, params=params
             )
 
             if order:
+                # --- PRECISE COIN TRACKING UPDATE (Phase 3) ---
+                # Update stock ONLY after successful placement to prevent data loss.
+                if side == OrderSide.SELL and grid_level.stock_on_hand > 0:
+                    if qty < quantity:
+                        dust_remainder = quantity - qty
+                        grid_level.stock_on_hand = dust_remainder
+                        if self.bot_id:
+                            self.db.update_grid_stock(self.bot_id, price, dust_remainder)
+                        self.logger.info(f"🧹 Dust Management: Keeping {dust_remainder:.6f} as residue.")
+                    else:
+                        grid_level.stock_on_hand = 0.0
+                        if self.bot_id:
+                            self.db.update_grid_stock(self.bot_id, price, 0.0)
+                # ----------------------------------------------
+
                 if self.bot_id:
                     self.db.add_order(self.bot_id, order.identifier, price, side.value, order.amount)
 
@@ -583,6 +663,36 @@ class OrderManager:
             msg = str(e).lower()
             if "insufficient" in msg:
                 self.logger.warning(f"❌ Insufficient funds for {side.name} at {price}")
+
+                # --- PHASE 5: Sync Wallet Logic ---
+                if side == OrderSide.SELL and grid_level.stock_on_hand > 0:
+                    self.logger.warning("🔄 Syncing wallet to resolve insufficient funds...")
+
+                    # 1. Force Sync Wallet
+                    await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange_service, price)
+                    actual_balance = self.balance_tracker.crypto_balance
+
+                    # 2. Check Discrepancy
+                    if actual_balance < grid_level.stock_on_hand:
+                        diff = grid_level.stock_on_hand - actual_balance
+                        self.logger.warning(
+                            f"📉 Stock Mismatch: Wanted {grid_level.stock_on_hand}, Found {actual_balance}. "
+                            f"Adjusting stock down by {diff:.6f}."
+                        )
+
+                        # 3. Adjust Stock
+                        grid_level.stock_on_hand = actual_balance
+                        if self.bot_id:
+                            self.db.update_grid_stock(self.bot_id, price, actual_balance)
+
+                        # 4. Retry Order (Recursive One-Shot)
+                        # We only retry if we have meaningful balance left (e.g. > dust)
+                        if actual_balance > 0.0001:
+                            self.logger.info("🔁 Retrying Sell Order with synced balance...")
+                            return await self._place_limit_order_safe(price, side)
+                        else:
+                            self.logger.warning("🚫 Balance too low to retry.")
+                # ----------------------------------
             else:
                 self.logger.error(f"Failed to place safe order: {e}")
 
