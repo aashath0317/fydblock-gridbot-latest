@@ -125,10 +125,19 @@ class ConfigValidator:
         else:
             try:
                 SpacingType.from_string(spacing)
-
             except ValueError as e:
                 self.logger.error(str(e))
                 invalid_fields.append("grid_strategy.spacing")
+
+        # Infinity Grid Safety Check
+        order_size_type = grid.get("order_size_type", "quote")
+        trailing_up = grid.get("trailing_up", False)
+
+        # Normalize strings for comparison
+        if spacing and spacing.lower() == "arithmetic" and order_size_type.lower() == "base" and trailing_up:
+            error_msg = "Invalid Configuration: You cannot use Trailing Up with Arithmetic + Fixed Coin (Base) mode. Please switch to Fixed USDT (Quote) or Geometric."
+            self.logger.error(error_msg)
+            invalid_fields.append("grid_strategy.combination_forbidden")
 
         num_grids = grid.get("num_grids")
         if num_grids is None:

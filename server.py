@@ -73,6 +73,15 @@ class StrategyConfig(BaseModel):
     lower_price: float
     grids: int
     spacing: str | None = "geometric"
+    # Infinity Grid New Fields
+    order_size_type: str = "quote"  # "quote" (Fixed USDT) or "base" (Fixed Coin)
+    amount_per_grid: float = 0.0  # Optional: overrides default calculation if non-zero
+    grid_gap: float = 0.0  # Optional: explicitly set gap size (%, e.g 1.0, or amount, e.g 20)
+    trailing_up: bool = False  # Enable Infinity Grid Trailing Up
+    trailing_down: bool = False  # Enable Infinity Grid Trailing Down
+    # Initial Budget Allocation (from Frontend Projection)
+    initial_base_balance_allocation: float = 0.0
+    initial_quote_balance_allocation: float = 0.0
     # Optional fallback for compatibility
     investment: float | None = None
 
@@ -118,6 +127,11 @@ def create_config(exchange, pair, api_key, api_secret, passphrase, mode, strateg
             "num_grids": strategy_settings["grids"],
             "range": {"top": strategy_settings["upper_price"], "bottom": strategy_settings["lower_price"]},
             "investment": trading_settings.get("initial_balance", 0.0),
+            # Infinity Grid
+            "order_size_type": strategy_settings.get("order_size_type", "quote"),
+            "amount_per_grid": strategy_settings.get("amount_per_grid", 0.0),
+            "grid_gap": strategy_settings.get("grid_gap", 0.0),
+            "trailing_up": strategy_settings.get("trailing_up", False),
         },
         "risk_management": {
             "take_profit": {"enabled": False, "threshold": 0.0},
@@ -353,6 +367,13 @@ async def start_bot(req: BotRequest):
         "upper_price": req.strategy.upper_price,
         "lower_price": req.strategy.lower_price,
         "spacing": req.strategy.spacing,
+        "order_size_type": req.strategy.order_size_type,
+        "amount_per_grid": req.strategy.amount_per_grid,
+        "grid_gap": req.strategy.grid_gap,
+        "trailing_up": req.strategy.trailing_up,
+        "trailing_down": req.strategy.trailing_down,
+        "initial_base_balance_allocation": req.strategy.initial_base_balance_allocation,
+        "initial_quote_balance_allocation": req.strategy.initial_quote_balance_allocation,
     }
 
     mode_str = "paper_trading" if req.mode == "paper" else "live"

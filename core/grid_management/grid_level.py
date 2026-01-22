@@ -9,6 +9,7 @@ class GridCycleState(Enum):
     WAITING_FOR_BUY_FILL = "waiting_for_buy_fill"  # Buy order placed, waiting for execution
     READY_TO_SELL = "ready_to_sell"  # Level is ready for a sell order
     WAITING_FOR_SELL_FILL = "waiting_for_sell_fill"  # Sell order placed, waiting for execution
+    VIRTUAL_HOLD = "virtual_hold"  # Level is held virtually (bag) for infinite trailing
 
 
 class GridLevel:

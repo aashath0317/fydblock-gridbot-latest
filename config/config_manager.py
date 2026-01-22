@@ -135,6 +135,22 @@ class ConfigManager:
         grid_settings = self.get_grid_settings()
         return grid_settings.get("num_grids", None)
 
+    def get_order_size_type(self) -> str:
+        grid_settings = self.get_grid_settings()
+        return grid_settings.get("order_size_type", "quote")
+
+    def get_amount_per_grid(self) -> float:
+        grid_settings = self.get_grid_settings()
+        return grid_settings.get("amount_per_grid", 0.0)
+
+    def get_grid_gap(self) -> float:
+        grid_settings = self.get_grid_settings()
+        return grid_settings.get("grid_gap", 0.0)
+
+    def is_trailing_up_enabled(self) -> bool:
+        grid_settings = self.get_grid_settings()
+        return grid_settings.get("trailing_up", False)
+
     def get_grid_range(self):
         grid_settings = self.get_grid_settings()
         return grid_settings.get("range", {})

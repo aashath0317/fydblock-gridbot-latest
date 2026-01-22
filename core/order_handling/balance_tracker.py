@@ -1,4 +1,5 @@
 import logging
+import time
 
 from config.trading_mode import TradingMode
 from core.bot_management.event_bus import EventBus
@@ -51,6 +52,7 @@ class BalanceTracker:
         self.reserved_crypto: float = 0.0
         self.investment_cap: float = float("inf")
         self.operational_reserve: float = 0.0  # Dynamic Fee Stabilization Reserve
+        self._last_drift_warning_time = 0
 
     def _persist_balances(self):
         """Saves current balance state to DB."""
@@ -98,6 +100,32 @@ class BalanceTracker:
             f"{self.crypto_balance} {self.base_currency}"
         )
         self._persist_balances()
+
+    def load_persisted_balances(self) -> bool:
+        """
+        Loads the last known balance state from the database.
+        Returns True if successful, False otherwise.
+        """
+        if not self.db or not self.bot_id:
+            return False
+
+        try:
+            saved = self.db.get_balances(self.bot_id)
+            if saved:
+                # { "fiat_balance": X, "crypto_balance": Y, "reserve_amount": Z }
+                self.balance = float(saved.get("fiat_balance", 0.0))
+                self.crypto_balance = float(saved.get("crypto_balance", 0.0))
+                self.operational_reserve = float(saved.get("reserve_amount", 0.0))
+
+                self.logger.info(
+                    f"💾 Restored Isolated Balances from DB: Fiat={self.balance:.2f}, "
+                    f"Crypto={self.crypto_balance:.4f}, Reserve={self.operational_reserve:.2f}"
+                )
+                return True
+        except Exception as e:
+            self.logger.error(f"Failed to load persisted balances: {e}")
+
+        return False
 
     def attempt_fee_recovery(self, required_amount: float) -> bool:
         """
@@ -197,15 +225,21 @@ class BalanceTracker:
 
                 # Log only if there's a significant drift
                 if abs(new_fiat - self.balance) > 1.0 or abs(new_crypto - self.crypto_balance) > 0.01:
-                    self.logger.debug(
-                        f"⚖️ Balance Synced: {self.balance:.2f} -> {new_fiat:.2f} {self.quote_currency} "
-                        f"(Wallet Free: {free_fiat:.2f}, Total Crypto Val: {crypto_equity_value:.2f}) | "
-                        f"{self.crypto_balance:.4f} -> {new_crypto:.4f} {self.base_currency}"
-                    )
+                    current_time = time.time()
+                    if current_time - self._last_drift_warning_time > 60:
+                        self.logger.warning(
+                            f"⚠️ Wallet Balance Drift Detected (Multi-Bot Shared Wallet?): "
+                            f"Internal Fiat: {self.balance:.2f} vs Wallet Free: {new_fiat:.2f} | "
+                            f"Internal Crypto: {self.crypto_balance:.4f} vs Wallet Free: {new_crypto:.4f}. "
+                            f"Keeping Internal Ledger as Truth to prevent cross-bot contamination."
+                        )
+                        self._last_drift_warning_time = current_time
 
-                self.balance = new_fiat
-                self.crypto_balance = new_crypto
-                self._persist_balances()
+                # FIX: Disable Hard Sync. Do NOT overwrite internal ledger with shared wallet balance.
+                # This ensures each bot tracks its own "allocated" funds independently.
+                # self.balance = new_fiat
+                # self.crypto_balance = new_crypto
+                # self._persist_balances()
         except Exception as e:
             self.logger.error(f"Failed to sync balances: {e}")
 

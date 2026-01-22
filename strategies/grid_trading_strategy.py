@@ -147,7 +147,15 @@ class GridTradingStrategy(TradingStrategyInterface):
             self.logger.info(f"   ?? User Allocated: {investment_amount} {quote_currency}")
 
             # 3. Check for Active Orders (Hot Boot detection)
+            # FIX: Moved Logic Up to determine Balance Initialization
             has_active_orders = self.order_manager.has_active_orders()
+
+            if has_active_orders:
+                self.logger.info("🔥 Found active orders in Database. Enabling Smart Resume (Hot Boot).")
+                self.use_hot_boot = True
+            else:
+                self.logger.info("✨ No active orders found. Proceeding with Clean Start.")
+                self.use_hot_boot = False
 
             # 4. Validate Funds (Equity Check uses NET WORTH)
             # Calculate Total Equity (Total Fiat + Total Crypto Value)
@@ -164,8 +172,6 @@ class GridTradingStrategy(TradingStrategyInterface):
             )
 
             if total_equity < required_equity:
-                # If we have active orders, we might be mid-trade, so we are lenient?
-                # But for now, we trust Total Equity.
                 error_msg = (
                     f"❌ INSUFFICIENT FUNDS: Total Equity ({total_equity:.2f}) < "
                     f"Investment ({investment_amount:.2f}). "
@@ -176,7 +182,6 @@ class GridTradingStrategy(TradingStrategyInterface):
                 raise Exception(error_msg)
 
             # If Equity is sufficient but Fiat is low, we warn but PROCEED.
-            # The bot will place Sell orders with the crypto and Buy orders with the fiat.
             if total_fiat_balance < investment_amount * 0.1:  # warn if very low fiat
                 self.logger.warning(
                     f"⚠️ Low Fiat Balance ({total_fiat_balance:.2f}). "
@@ -184,16 +189,28 @@ class GridTradingStrategy(TradingStrategyInterface):
                 )
 
             # 5. Initialize Tracker with FREE/AVAILABLE values
-            # The Order Manager will account for the "Locked" funds as it reconciles orders.
-            # Balance Tracker only cares about what it can SPEND right now.
-            self.balance_tracker.initialize_balances(free_fiat_balance, free_crypto_balance)
-            # We ignore any extra money in the wallet so the bot doesn't touch it.
+            # FIX: Removed incorrect initialization with global wallet balance.
+            # self.balance_tracker.initialize_balances(free_fiat_balance, free_crypto_balance)
             effective_fiat_balance = investment_amount
 
-            # NOTE: For safety, we usually start with 0 crypto in the bot's internal tracker
-            # unless we specifically want to use existing bags.
-            # Here we pass the wallet's crypto, but the bot will primarily use the allocated USDT.
-            effective_crypto_balance = free_crypto_balance
+            # --- FIX: ISOLATE BOT ASSETS ---
+            # If Clean Start (New Bot), we ignore existing crypto in the wallet.
+            # If Hot Boot (Resume), we assume existing crypto is ours to manage.
+            if self.use_hot_boot:
+                # FIX: Try to load from DB first (Isolated Ledger) to avoid picking up other bots' funds from Wallet.
+                if self.balance_tracker.load_persisted_balances():
+                    effective_crypto_balance = self.balance_tracker.crypto_balance
+                    self.logger.info(
+                        f"   🔥 Hot Boot: Restored Isolated Crypto from DB: {effective_crypto_balance:.4f} {base_currency}"
+                    )
+                else:
+                    effective_crypto_balance = free_crypto_balance
+                    self.logger.info(
+                        f"   🔥 Hot Boot: DB Load Failed. Fallback to Wallet Crypto: {effective_crypto_balance:.4f} {base_currency}"
+                    )
+            else:
+                effective_crypto_balance = 0.0
+                self.logger.info(f"   ✨ Clean Start: Ignoring existing Wallet Crypto (Set to 0.0). Buying fresh.")
 
             self.logger.info(
                 f"   ? Bot Initialized with: {effective_fiat_balance} {quote_currency} (Capped at investment)"
@@ -210,16 +227,6 @@ class GridTradingStrategy(TradingStrategyInterface):
             self._running = False
             return
         # -----------------------------------
-
-        # --- SMART RESUME (HOT BOOT) ---
-        # FIX: Check if we have active orders in DB. If so, enable hot_boot to Resume instead of Wipe.
-        if self.order_manager.has_active_orders():
-            self.logger.info("🔥 Found active orders in Database. Enabling Smart Resume (Hot Boot).")
-            self.use_hot_boot = True
-        else:
-            self.logger.info("✨ No active orders found. Proceeding with Clean Start.")
-            self.use_hot_boot = False
-        # -------------------------------
 
         last_price: float | None = None
         grid_orders_initialized = False

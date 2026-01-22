@@ -400,7 +400,9 @@ class OrderManager:
         paired_sell_level = self._get_or_create_paired_sell_level(grid_level)
 
         if paired_sell_level and self.grid_manager.can_place_order(paired_sell_level, OrderSide.SELL):
-            await self._place_sell_order(grid_level, paired_sell_level, order.filled)
+            # FIX: Pass 0.0 quantity to force recalculation based on config (Fixed USDT vs Fixed Coin)
+            # This prevents "locking" the quantity to the buy amount.
+            await self._place_sell_order(grid_level, paired_sell_level, 0.0)
         else:
             self.logger.warning(f"No valid sell grid level found for buy grid level {grid_level}.")
 
@@ -489,7 +491,8 @@ class OrderManager:
 
         # --- REPLENISHMENT ---
         if paired_buy_level:
-            await self._place_buy_order(grid_level, paired_buy_level, order.filled)
+            # FIX: Pass 0.0 quantity to force recalculation based on config (Fixed USDT vs Fixed Coin)
+            await self._place_buy_order(grid_level, paired_buy_level, 0.0)
         else:
             self.logger.error(f"Failed to find or create a paired buy grid level for grid level {grid_level}.")
 
@@ -886,8 +889,9 @@ class OrderManager:
                 # Usually execute_market_order takes 'amount' as crypto quantity for BUY/SELL if side is base.
                 # Let's assume quantity is "Amount of Base Currency".
                 # Adjust quantity for precision
+                # FIX: Add small buffer (0.5%) to cover rounding/dust issues which cause "Insufficient Funds" for the last order
                 adjusted_qty = self.order_validator.adjust_and_validate_buy_quantity(
-                    self.balance_tracker.balance, required_amount, current_price
+                    self.balance_tracker.balance, required_amount * 1.005, current_price
                 )
 
                 order = await self.order_execution_strategy.execute_market_order(
@@ -940,21 +944,15 @@ class OrderManager:
         return False
 
     async def perform_initial_purchase(self, current_price: float) -> None:
-        grid_prices = self.grid_manager.grid_levels.keys()
-        total_grid_count = len(grid_prices)
-        if total_grid_count == 0:
-            return
+        # DELEGATE TO GRID MANAGER
+        # This ensures we use the correct logic for "Fixed USDT" vs "Fixed Coin"
+        # and respect the "Projected Holdings" allocation from the frontend.
+        target_quantity = self.grid_manager.get_initial_order_quantity(
+            current_price, self.balance_tracker.crypto_balance, self.balance_tracker.balance
+        )
 
-        sell_grids = [p for p in grid_prices if p > current_price]
-        sell_grid_count = len(sell_grids)
-        total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
-        value_per_grid = total_balance_value / total_grid_count
-        target_crypto_value = value_per_grid * sell_grid_count
-        current_crypto_value = self.balance_tracker.crypto_balance * current_price
-        shortfall_value = target_crypto_value - current_crypto_value
-
-        if shortfall_value > 10.0:
-            amount_to_buy = (shortfall_value / current_price) * 1.01
+        if target_quantity > 0:
+            amount_to_buy = target_quantity
 
             # --- ISOLATION FIX: Generate Client Order ID for Initial Buy ---
             client_order_id = None

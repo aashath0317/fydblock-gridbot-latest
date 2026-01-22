@@ -29,7 +29,8 @@ class GridManager:
         self.sorted_buy_grids: list[float]
         self.sorted_sell_grids: list[float]
         self.grid_levels: dict[float, GridLevel] = {}
-        self.uniform_order_quantity: float | None = None  # Store the fixed quantity
+        self.uniform_order_quantity: float | None = None  # Store the fixed quantity (Base)
+        self.auto_usdt_per_grid: float | None = None  # Store auto-calculated USDT per grid (Quote)
 
     @property
     def num_grids(self) -> int:
@@ -46,24 +47,46 @@ class GridManager:
         # Formula: (Investment * 0.99) / (Total Grids) / Central Price
         # This ensures every buy order is identical and we have a reserve for fees.
         investment = self.config_manager.get_investment_amount()
-        reserve_factor = 0.99  # 1% Fee Reserve
-        usable_investment = investment * reserve_factor
-        total_lines = len(self.price_grids)
+        amount_per_grid = self.config_manager.get_amount_per_grid()
+        order_size_type = self.config_manager.get_order_size_type()
 
-        if total_lines > 0 and self.central_price > 0:
-            raw_quantity = usable_investment / total_lines / self.central_price
-            # TODO: Apply exchange step size floor precision if available.
-            # For now, we assume standard precision or rely on OrderValidator to floor it safely.
-            # We want to be slightly conservative, so 4-6 decimal places is usually safe for most coins except very low value ones.
-            # Let's trust proper rounding in OrderValidator, but here we store the raw target.
-            self.uniform_order_quantity = raw_quantity
-            self.logger.info(
-                f"?? Uniform Order Quantity Calculated: {self.uniform_order_quantity:.6f} "
-                f"(Inv: {investment}, Usable: {usable_investment:.2f}, Lines: {total_lines}, Entry: {self.central_price})"
-            )
+        # If explicit amount is set, we prioritize that logic in get_order_size_for_grid_level
+        # But for 'base' mode, we can pre-set uniform_order_quantity here.
+        if amount_per_grid > 0 and order_size_type == "base":
+            self.uniform_order_quantity = amount_per_grid
+            self.logger.info(f"?? Using Configured Fixed Coin Quantity: {self.uniform_order_quantity}")
+        elif amount_per_grid > 0 and order_size_type == "quote":
+            self.uniform_order_quantity = None  # Dynamic calculation needed
+            self.logger.info(f"?? Using Configured Fixed USDT Amount: {amount_per_grid}")
         else:
-            self.uniform_order_quantity = 0.0
-            self.logger.warning("?? Could not calculate Uniform Quantity (Lines=0 or Price=0)")
+            # Legacy / Auto-Calculate Mode (Standard Grid)
+            # Legacy / Auto-Calculate Mode (Standard Grid)
+            usable_investment = investment * 0.99
+            total_lines = len(self.price_grids)
+
+            if total_lines > 0:
+                if order_size_type == "quote":
+                    # Fixed USDT (Quote) Auto-Calculation
+                    self.auto_usdt_per_grid = usable_investment / total_lines
+                    self.uniform_order_quantity = None
+                    self.logger.info(
+                        f"?? Auto-Calculated Fixed USDT: {self.auto_usdt_per_grid:.2f} "
+                        f"(Inv: {investment}, Usable: {usable_investment:.2f}, Lines: {total_lines})"
+                    )
+                else:
+                    # Fixed Coin (Base) Auto-Calculation - Legacy Behavior
+                    if self.central_price > 0:
+                        raw_quantity = usable_investment / total_lines / self.central_price
+                        self.uniform_order_quantity = raw_quantity
+                        self.logger.info(
+                            f"?? Uniform Order Quantity Calculated: {self.uniform_order_quantity:.6f} "
+                            f"(Inv: {investment}, Usable: {usable_investment:.2f}, Lines: {total_lines}, Entry: {self.central_price})"
+                        )
+                    else:
+                        self.uniform_order_quantity = 0.0
+            else:
+                self.uniform_order_quantity = 0.0
+                self.logger.warning("?? Could not calculate Uniform Quantity (Lines=0)")
         # ------------------------------------
 
         if self.strategy_type == StrategyType.SIMPLE_GRID:
@@ -233,11 +256,28 @@ class GridManager:
         total_balance: float,
         current_price: float,
     ) -> float:
-        # STRICT: Return the pre-calculated Uniform Quantity if available
+        # 1. Infinity Grid / Explicit Config Support
+        amount_per_grid = self.config_manager.get_amount_per_grid()
+        order_size_type = self.config_manager.get_order_size_type()
+
+        if amount_per_grid > 0:
+            if order_size_type == "quote":
+                # Fixed USDT -> Calculate Base Quantity dynamically
+                # amount / price
+                return amount_per_grid / current_price
+            elif order_size_type == "base":
+                # Fixed Coin -> Constant
+                return amount_per_grid
+
+        # 2. STRICT: Return the pre-calculated Uniform Quantity if available (Legacy/Standard)
         if self.uniform_order_quantity and self.uniform_order_quantity > 0:
             return self.uniform_order_quantity
 
-        # Fallback (Should not be reached if init works)
+        # 3. Auto Quote (Fixed USDT)
+        if self.auto_usdt_per_grid and self.auto_usdt_per_grid > 0:
+            return self.auto_usdt_per_grid / current_price
+
+        # 3. Fallback (Should not be reached if init works)
         total_grids = len(self.grid_levels)
         if total_grids == 0:
             return 0.0
@@ -259,17 +299,60 @@ class GridManager:
         current_crypto_value_in_fiat = current_crypto_balance * current_price
         total_portfolio_value = current_fiat_balance + current_crypto_value_in_fiat
 
-        sell_grid_count = len([p for p in self.price_grids if p > current_price])
-        total_grid_count = len(self.price_grids)
+        # FIX: Check for explicit "Frontend Projected" allocation first
+        # hierarchy:
+        # 1. explicit 'initial_base_balance_allocation' (The USDT value we WANT in Base)
+        # 2. calculated requirement based on grid summation
 
-        if total_grid_count == 0:
-            return 0.0
+        grid_strategy_config = self.config_manager.config.get("grid_strategy", {})
+        initial_base_budget = grid_strategy_config.get("initial_base_balance_allocation", 0.0)
 
-        target_crypto_ratio = sell_grid_count / total_grid_count
-        target_crypto_value = total_portfolio_value * target_crypto_ratio
+        if initial_base_budget > 0:
+            # The frontend explicitly told us: "We want $X worth of Base coin"
+            # We just need to buy enough to reach that target, accounting for what we already have.
+
+            # If we already have crypto, subtract its value
+            needed_fiat_value = initial_base_budget - current_crypto_value_in_fiat
+
+            # Cap at available balance
+            # Also cap at investment amount if set? The 'initial_base_budget' is usually part of the investment.
+            # But let's respect available fiat.
+            # FIX: Add 0.5% buffer for rounding/dust to ensure we have enough for all grids
+            fiat_to_allocate = max(0, min(needed_fiat_value * 1.005, current_fiat_balance))
+
+            self.logger.info(
+                f"🎯 Using Explicit Base Allocation: Target=${initial_base_budget:.2f}, Need=${needed_fiat_value:.2f}"
+            )
+            return fiat_to_allocate / current_price
+
+        # Fallback to calculated logic
+        # FIX: Use configured investment if available, else total balance
+        investment = self.config_manager.get_investment_amount()
+        if investment <= 0:
+            investment = total_portfolio_value
+
+        # Calculate TOTAL required crypto value for all SELL grids
+        # (This is more accurate than simple ratio if we have varying grid sizes/prices)
+        required_crypto_value = 0.0
+
+        # We need to cover all grids ABOVE current price
+        sell_grids = [p for p in self.price_grids if p > current_price]
+
+        # If we can calculate exact requirements per grid:
+        total_balance_for_calc = investment  # Use investment as the 'total' context
+
+        for p in sell_grids:
+            # How much crypto is needed for this grid?
+            # Fixed USDT: size = USDT / p. Value = (USDT/p) * p = USDT.
+            # Fixed Coin: size = Coin. Value = Coin * p.
+            qty = self.get_order_size_for_grid_level(total_balance_for_calc, p)
+            required_crypto_value += qty * current_price  # Current value of that future sell obligation
+
+        # Add 1% buffer for fee safety
+        target_crypto_value = required_crypto_value * 1.01
 
         fiat_to_allocate = target_crypto_value - current_crypto_value_in_fiat
-        fiat_to_allocate = max(0, min(fiat_to_allocate, current_fiat_balance))
+        fiat_to_allocate = max(0, min(fiat_to_allocate, current_fiat_balance, investment))
 
         return fiat_to_allocate / current_price
 
@@ -490,6 +573,10 @@ class GridManager:
         while current_price >= highest_grid + gap:
             self.logger.info(f"🚀 TRAILING UP: Price {current_price} reached next level. Shifting Grid...")
 
+            # --- SIMPLIFIED LOGIC (User Request) ---
+            # We assume the config validation has blocked unsafe combinations (Arithmetic + Fixed Coin).
+            # So we proceed without complex balance checks.
+
             # 1. Identify and Remove Lowest Grid
             # In Trail UP, the lowest grid (Buy) is dropped to make room for new Top (Sell).
             lowest_grid_price = sorted(self.price_grids)[0]
@@ -529,9 +616,10 @@ class GridManager:
             new_bottom = sorted(self.price_grids)[0]
             self._update_and_persist_config(new_bottom, new_top_price)
 
-    async def trail_grid_down(self, current_price: float, cancel_order_callback=None):
+    async def trail_grid_down(self, current_price: float, available_balance: float = 0.0, cancel_order_callback=None):
         """
         Infinite Grid Logic: Shift the grid interval DOWN one by one.
+        Includes Reserve Check and Virtual Order Logic.
         """
         sorted_grids = sorted(self.price_grids)
         if len(sorted_grids) < 2:
@@ -544,43 +632,67 @@ class GridManager:
         while current_price <= lowest_grid - gap:
             self.logger.info(f"📉 TRAILING DOWN: Price {current_price} reached next level. Shifting Grid...")
 
-            # 1. Identify and Remove Highest Grid
-            # In Trail DOWN, the highest grid (Sell) is dropped to make room for new Bottom (Buy).
+            # 1. Reserve Check
+            # We need enough USDT to place the new BUY order at the bottom.
+            new_bottom_price = self.calculate_next_price_down(lowest_grid)
+            needed_amount = self.get_order_size_for_grid_level(0, new_bottom_price)  # total_balance 0 to force calc
+
+            # Note: available_balance must be passed in by the caller (OrderManager/Bot)
+            if available_balance < needed_amount:
+                self.logger.warning(
+                    f"⚠️ Trailing Down PAUSED: Insufficient Reserve (Have: {available_balance:.2f}, Need: {needed_amount:.2f})"
+                )
+                return
+
+            # 2. Virtual Order Logic
+            # Cancel Highest Sell -> Mark as VIRTUAL_HOLD -> Place New Buy
             highest_grid_price = sorted(self.price_grids)[-1]
             highest_grid_level = self.grid_levels.get(highest_grid_price)
 
             if highest_grid_level:
-                # A) Cancel Order on Exchange (Release Coin)
+                # A) Cancel Order on Exchange
                 if cancel_order_callback:
-                    self.logger.info(f"   Cancelling highest grid order at {highest_grid_price}...")
+                    self.logger.info(
+                        f"   Cancelling highest grid order at {highest_grid_price} (Converting to Virtual)..."
+                    )
                     await cancel_order_callback(highest_grid_level)
 
-                # B) Remove from DB
+                # B) Mark as VIRTUAL_HOLD (Do NOT delete from DB, just update status)
+                highest_grid_level.state = GridCycleState.VIRTUAL_HOLD
                 if self.db and self.bot_id:
-                    self.db.delete_grid_level(self.bot_id, highest_grid_price)
+                    self.db.update_grid_level_status(self.bot_id, highest_grid_price, GridCycleState.VIRTUAL_HOLD.value)
+                    self.logger.info(f"   MARKED {highest_grid_price} AS VIRTUAL_HOLD")
 
-            # C) Shift Grid Structure (Remove High, Add Low)
-            removed_price, new_bottom_price = self.extend_grid_down()
+            # 3. Shift Grid Structure (Active Window)
+            # We remove the Highest Grid from 'price_grids' (Active Trading Window)
+            # but keep it in 'grid_levels' (Virtual Memory).
+            if highest_grid_price in self.price_grids:
+                self.price_grids.remove(highest_grid_price)
 
-            # 2. Update Previous Lowest Grid -> READY_TO_SELL
-            # The *old* lowest grid was a Buy/Support. Now it's above us, so it becomes a Sell code.
-            prev_lowest_grid = sorted(self.price_grids)[1]  # New 2nd lowest
-            if prev_lowest_grid in self.grid_levels:
-                self.grid_levels[prev_lowest_grid].state = GridCycleState.READY_TO_SELL
-                if self.db and self.bot_id:
-                    self.db.update_grid_level_status(self.bot_id, prev_lowest_grid, GridCycleState.READY_TO_SELL.value)
+            # Add New Bottom
+            self.price_grids.append(new_bottom_price)
+            self.grid_levels[new_bottom_price] = GridLevel(new_bottom_price, GridCycleState.READY_TO_BUY)
 
-            # 3. New Bottom Grid is READY_TO_BUY (Default from extend_grid_down)
-            # Add to DB
+            # DB Add New Bottom
             if self.db and self.bot_id:
                 self.db.add_grid_level(self.bot_id, new_bottom_price, GridCycleState.READY_TO_BUY.value)
 
-            # Update loop var
-            lowest_grid = new_bottom_price
+            # 4. Check if we are re-entering a previously Virtual Level?
+            # (User Logic: "If Price rises back... Re-activate")
+            # This logic typically runs in 'update_zones' or 'trail_grid_up', not trail_grid_down.
+            # Here we are just creating the new bottom.
+
+            # Update loop vars
+            sorted_grids = sorted(self.price_grids)  # Re-sort after mutation
+            lowest_grid = sorted_grids[0]
+            # Verify gap consistency if needed, but we rely on loop condition
 
             # Persist Config Range
-            new_top = sorted(self.price_grids)[-1]
-            self._update_and_persist_config(new_bottom_price, new_top)
+            new_top_active = sorted_grids[-1]
+            self._update_and_persist_config(lowest_grid, new_top_active)
+
+            # Decrement available balance simulation for the loop (approximate)
+            available_balance -= needed_amount
 
     def _update_and_persist_config(self, new_bottom: float, new_top: float):
         """
@@ -612,11 +724,17 @@ class GridManager:
     def calculate_next_price_up(self, current_highest: float) -> float:
         """Calculates the next grid price ABOVE the current highest."""
         _, _, num_grids, spacing_type = self._extract_grid_config()
-        # Note: num_grids in config is technically intervals or levels?
-        # In _calculate... we generate num_grids + 1 points.
-        # Spacing is derived from current range.
+        grid_gap = self.config_manager.get_grid_gap()
 
-        # We need the current Grid Gap or Ratio
+        # Infinity Grid: Use explicit Gap if available
+        if grid_gap > 0:
+            if spacing_type == SpacingType.ARITHMETIC:
+                return current_highest + grid_gap
+            else:  # GEOMETRIC
+                # Gap is percentage (e.g., 2.0 = 2%)
+                return current_highest * (1 + grid_gap / 100.0)
+
+        # Legacy / Auto-derived logic
         sorted_grids = sorted(self.price_grids)
         if len(sorted_grids) < 2:
             return current_highest * 1.01  # Fallback
@@ -625,7 +743,6 @@ class GridManager:
             gap = sorted_grids[-1] - sorted_grids[-2]
             return current_highest + gap
         else:  # GEOMETRIC
-            # Be careful with floating point math.
             if sorted_grids[-2] == 0:
                 ratio = 1.01
             else:
@@ -635,7 +752,18 @@ class GridManager:
     def calculate_next_price_down(self, current_lowest: float) -> float:
         """Calculates the next grid price BELOW the current lowest."""
         _, _, num_grids, spacing_type = self._extract_grid_config()
+        grid_gap = self.config_manager.get_grid_gap()
 
+        # Infinity Grid: Use explicit Gap if available
+        if grid_gap > 0:
+            if spacing_type == SpacingType.ARITHMETIC:
+                return current_lowest - grid_gap
+            else:  # GEOMETRIC
+                # Gap is percentage (e.g., 2.0 = 2%)
+                # Using the user's explicit formula logic: (1 - Percentage)
+                return current_lowest * (1 - grid_gap / 100.0)
+
+        # Legacy / Auto-derived logic
         sorted_grids = sorted(self.price_grids)
         if len(sorted_grids) < 2:
             return current_lowest * 0.99
