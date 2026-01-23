@@ -226,22 +226,23 @@ class BalanceTracker:
                 # Log only if there's a significant drift
                 if abs(new_fiat - self.balance) > 1.0 or abs(new_crypto - self.crypto_balance) > 0.01:
                     current_time = time.time()
-                    if current_time - self._last_drift_warning_time > 60:
-                        self.logger.warning(
-                            f"⚠️ Wallet Balance Drift Detected (Multi-Bot Shared Wallet?): "
+                    if current_time - self._last_drift_warning_time > 300:
+                        self.logger.info(
+                            f"ℹ️ Wallet Balance Drift Detected (Multi-Bot Shared Wallet?): "
                             f"Internal Fiat: {self.balance:.2f} vs Wallet Free: {new_fiat:.2f} | "
                             f"Internal Crypto: {self.crypto_balance:.4f} vs Wallet Free: {new_crypto:.4f}. "
                             f"Keeping Internal Ledger as Truth to prevent cross-bot contamination."
                         )
                         self._last_drift_warning_time = current_time
 
-                # FIX: Disable Hard Sync. Do NOT overwrite internal ledger with shared wallet balance.
-                # This ensures each bot tracks its own "allocated" funds independently.
                 # self.balance = new_fiat
                 # self.crypto_balance = new_crypto
                 # self._persist_balances()
+                return new_fiat, new_crypto
         except Exception as e:
             self.logger.error(f"Failed to sync balances: {e}")
+
+        return None, None
 
     # CHANGED: Renamed from _update_balance_on_order_completion to public method
     async def update_balance_on_order_completion(self, order: Order) -> None:

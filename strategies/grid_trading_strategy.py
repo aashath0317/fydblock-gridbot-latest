@@ -191,36 +191,46 @@ class GridTradingStrategy(TradingStrategyInterface):
             # 5. Initialize Tracker with FREE/AVAILABLE values
             # FIX: Removed incorrect initialization with global wallet balance.
             # self.balance_tracker.initialize_balances(free_fiat_balance, free_crypto_balance)
-            effective_fiat_balance = investment_amount
 
             # --- FIX: ISOLATE BOT ASSETS ---
             # If Clean Start (New Bot), we ignore existing crypto in the wallet.
-            # If Hot Boot (Resume), we assume existing crypto is ours to manage.
+            # If Hot Boot (Resume), we RESTORE balances from DB (not reset to investment).
             if self.use_hot_boot:
-                # FIX: Try to load from DB first (Isolated Ledger) to avoid picking up other bots' funds from Wallet.
+                # FIX: Load persisted balances from DB - this includes the correct FREE balance
                 if self.balance_tracker.load_persisted_balances():
-                    effective_crypto_balance = self.balance_tracker.crypto_balance
+                    # Balances are now restored from DB - use them as-is
+                    # The FREE balance is correct (what's left after orders were placed)
+                    # The LOCKED balance is calculated from grid_orders in server.py
                     self.logger.info(
-                        f"   🔥 Hot Boot: Restored Isolated Crypto from DB: {effective_crypto_balance:.4f} {base_currency}"
+                        f"   🔥 Hot Boot: Restored from DB: "
+                        f"{self.balance_tracker.balance:.2f} {quote_currency} (Free), "
+                        f"{self.balance_tracker.crypto_balance:.4f} {base_currency}"
                     )
+                    # Just set investment_cap for profit calculations (don't reset balances!)
+                    self.balance_tracker.investment_cap = investment_amount
+                    # DO NOT call setup_balances - it would overwrite the restored FREE balance!
                 else:
-                    effective_crypto_balance = free_crypto_balance
-                    self.logger.info(
-                        f"   🔥 Hot Boot: DB Load Failed. Fallback to Wallet Crypto: {effective_crypto_balance:.4f} {base_currency}"
+                    # DB load failed, fall back to fresh start with investment amount
+                    effective_fiat_balance = investment_amount
+                    effective_crypto_balance = 0.0
+                    self.logger.warning(
+                        f"   🔥 Hot Boot: DB Load Failed. Starting fresh with {effective_fiat_balance} {quote_currency}"
                     )
+                    res = self.balance_tracker.setup_balances(
+                        effective_fiat_balance, effective_crypto_balance, self.exchange_service
+                    )
+                    if res is not None and hasattr(res, "__await__"):
+                        await res
             else:
+                # Clean Start - initialize with investment amount
                 effective_crypto_balance = 0.0
-                self.logger.info(f"   ✨ Clean Start: Ignoring existing Wallet Crypto (Set to 0.0). Buying fresh.")
-
-            self.logger.info(
-                f"   ? Bot Initialized with: {effective_fiat_balance} {quote_currency} (Capped at investment)"
-            )
-
-            res = self.balance_tracker.setup_balances(
-                effective_fiat_balance, effective_crypto_balance, self.exchange_service
-            )
-            if res is not None and hasattr(res, "__await__"):
-                await res
+                effective_fiat_balance = investment_amount
+                self.logger.info(f"   ✨ Clean Start: Initializing with {effective_fiat_balance} {quote_currency}")
+                res = self.balance_tracker.setup_balances(
+                    effective_fiat_balance, effective_crypto_balance, self.exchange_service
+                )
+                if res is not None and hasattr(res, "__await__"):
+                    await res
 
         except Exception as e:
             self.logger.error(f"Failed to refresh balances: {e}", exc_info=True)

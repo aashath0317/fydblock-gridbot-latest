@@ -150,11 +150,15 @@ class GridTradingBot:
             self.is_running = True
             investment_amount = self.config_manager.get_initial_balance()
 
-            await self.balance_tracker.setup_balances(
-                initial_balance=investment_amount,
-                initial_crypto_balance=0.0,
-                exchange_service=self.exchange_service,
-            )
+            # FIX: Only setup balances for BACKTEST mode here.
+            # For LIVE/PAPER_TRADING, the Strategy handles balance initialization
+            # to properly support Hot Boot recovery with persisted balances from DB.
+            if self.trading_mode == TradingMode.BACKTEST:
+                await self.balance_tracker.setup_balances(
+                    initial_balance=investment_amount,
+                    initial_crypto_balance=0.0,
+                    exchange_service=self.exchange_service,
+                )
 
             await self.order_status_tracker.start_streaming()
             self.strategy.initialize_strategy()

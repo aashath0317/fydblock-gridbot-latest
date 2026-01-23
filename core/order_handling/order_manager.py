@@ -406,17 +406,7 @@ class OrderManager:
         self.logger.info(f"Buy order completed at grid level {grid_level}.")
         self.grid_manager.complete_order(grid_level, OrderSide.BUY)
 
-        # --- FIX: Determine Sell Level FIRST (with fallback) ---
-        paired_sell_level = self._get_or_create_paired_sell_level(grid_level)
-
-        if paired_sell_level and self.grid_manager.can_place_order(paired_sell_level, OrderSide.SELL):
-            # FIX: Pass 0.0 quantity to force recalculation based on config (Fixed USDT vs Fixed Coin)
-            # This prevents "locking" the quantity to the buy amount.
-            await self._place_sell_order(grid_level, paired_sell_level, 0.0)
-        else:
-            self.logger.warning(f"No valid sell grid level found for buy grid level {grid_level}.")
-
-        # --- PRECISE COIN TRACKING (Phase 2) ---
+        # --- PRECISE COIN TRACKING: Calculate Net Coin FIRST ---
         # 1. Get the exact fill data
         executed_qty = order.filled
         fee_paid_in_coin = 0.0
@@ -425,19 +415,12 @@ class OrderManager:
             # Fee was paid in Base Currency (e.g. SOL)
             fee_paid_in_coin = float(order.fee.get("cost", 0.0))
         elif not order.fee:
-            # Fallback estimation if no fee object (Assumes fee in base currency if buying)
-            # Typically exchanges charge fee in 'receiving' currency
-            # But we check config/trading logic.
-            # For safety, if we don't know, we assume 0.1% base deduction if not using BNb/etc.
-            # However, balance_tracker might know.
-            # Let's use a safe fallback: if no fee info, assume 0 for now or minimal?
-            # Better to use execution report.
-            pass
+            pass  # Fallback handled elsewhere or assumed 0
 
         # 2. Calculate Net Coin Received
         net_coin_received = executed_qty - fee_paid_in_coin
 
-        # 3. Save to DB Ledger & Memory
+        # 3. Save to Buy Level Initially (Safety)
         grid_level.stock_on_hand = net_coin_received
         if self.bot_id:
             self.db.update_grid_stock(self.bot_id, grid_level.price, net_coin_received)
@@ -445,7 +428,34 @@ class OrderManager:
         self.logger.info(
             f"🧬 Precise Tracking: Bought {executed_qty} - Fee {fee_paid_in_coin} = Stock {net_coin_received:.6f}"
         )
-        # ---------------------------------------
+        # -------------------------------------------------------
+
+        # --- Determine Sell Level & Transfer Stock ---
+        paired_sell_level = self._get_or_create_paired_sell_level(grid_level)
+
+        if paired_sell_level:
+            # TRANSFER STOCK: Buy Level -> Sell Level
+            # This ensures the Sell Order sees the stock and uses it.
+            paired_sell_level.stock_on_hand = net_coin_received
+            if self.bot_id:
+                self.db.update_grid_stock(self.bot_id, paired_sell_level.price, net_coin_received)
+
+            # Clear Buy Level
+            grid_level.stock_on_hand = 0.0
+            if self.bot_id:
+                self.db.update_grid_stock(self.bot_id, grid_level.price, 0.0)
+
+            self.logger.info(
+                f"🚚 Stock Transferred: {net_coin_received:.6f} moved from {grid_level.price} to {paired_sell_level.price}"
+            )
+
+            if self.grid_manager.can_place_order(paired_sell_level, OrderSide.SELL):
+                # FIX: Pass the EXACT net coin quantity
+                await self._place_sell_order(grid_level, paired_sell_level, net_coin_received)
+        else:
+            self.logger.warning(
+                f"No valid sell grid level found for buy grid level {grid_level}. Stock remains on Buy Level."
+            )
 
         # --- SAVE TRADE HISTORY (BUY) ---
         if self.bot_id:
@@ -456,7 +466,7 @@ class OrderManager:
                 "side": "buy",
                 "price": order.average or order.price,
                 "quantity": order.filled,
-                "fee_amount": 0.0,  # TODO: Parse fee from order if available
+                "fee_amount": 0.0,
                 "fee_currency": self.trading_pair.split("/")[0],
                 "realized_pnl": 0.0,
             }
@@ -467,7 +477,6 @@ class OrderManager:
                     trade_record["fee_currency"] = currency
             else:
                 # Fallback: Estimate Fee in Base Currency
-                # Fee = Quantity * Rate
                 rate = self.balance_tracker.fee_calculator.trading_fee
                 trade_record["fee_amount"] = order.filled * rate
 
@@ -520,6 +529,7 @@ class OrderManager:
 
             self.logger.info(
                 f"💰 PROFIT SECURED: +{net_profit:.4f} {self.trading_pair.split('/')[1]} "
+                f"[Sold {order.filled:.6f} {self.trading_pair.split('/')[0]}] "
                 f"(Gross: {gross_profit:.4f}, Fees: {total_estimated_fees:.4f}, Reserve: {reserve_amount:.4f})"
             )
 
@@ -669,25 +679,26 @@ class OrderManager:
                     self.logger.warning("🔄 Syncing wallet to resolve insufficient funds...")
 
                     # 1. Force Sync Wallet
-                    await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange_service, price)
-                    actual_balance = self.balance_tracker.crypto_balance
+                    # sync_balances returns the ACTUAL free funds in the shared wallet
+                    _, actual_crypto = await self.balance_tracker.sync_balances(
+                        self.order_execution_strategy.exchange_service, price
+                    )
 
                     # 2. Check Discrepancy
-                    if actual_balance < grid_level.stock_on_hand:
-                        diff = grid_level.stock_on_hand - actual_balance
+                    if actual_crypto is not None and actual_crypto < grid_level.stock_on_hand:
                         self.logger.warning(
-                            f"📉 Stock Mismatch: Wanted {grid_level.stock_on_hand}, Found {actual_balance}. "
-                            f"Adjusting stock down by {diff:.6f}."
+                            f"📉 Stock Mismatch (Manual Sell?): Wanted {grid_level.stock_on_hand:.6f}, "
+                            f"Found {actual_crypto:.6f}. Adjusting stock down."
                         )
 
                         # 3. Adjust Stock
-                        grid_level.stock_on_hand = actual_balance
+                        grid_level.stock_on_hand = actual_crypto
                         if self.bot_id:
-                            self.db.update_grid_stock(self.bot_id, price, actual_balance)
+                            self.db.update_grid_stock(self.bot_id, price, actual_crypto)
 
                         # 4. Retry Order (Recursive One-Shot)
                         # We only retry if we have meaningful balance left (e.g. > dust)
-                        if actual_balance > 0.0001:
+                        if actual_crypto > 0.0001:
                             self.logger.info("🔁 Retrying Sell Order with synced balance...")
                             return await self._place_limit_order_safe(price, side)
                         else:

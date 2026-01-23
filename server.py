@@ -663,18 +663,66 @@ async def get_bot_stats(bot_id: int):
         conn = sqlite3.connect(db.db_path)
         cursor = conn.cursor()
 
-        # 2. Get Free Balances (bot_balances)
+        # 2. Get Investment amount from bot config
+        cursor.execute("SELECT config_json FROM bots WHERE bot_id = ?", (bot_id,))
+        config_row = cursor.fetchone()
+        investment = 0.0
+        if config_row and config_row[0]:
+            try:
+                config = json.loads(config_row[0])
+                investment = float(config.get("investment", 0))
+            except:
+                pass
+
+        # 2b. Get Reserve from bot_balances
         cursor.execute(
             "SELECT fiat_balance, crypto_balance, reserve_amount FROM bot_balances WHERE bot_id = ?", (bot_id,)
         )
         bal_row = cursor.fetchone()
+        reserve = 0.0
         if bal_row:
-            logger.debug(f"DEBUG: Found balance row for {bot_id}: {bal_row}")
-            stats["holdings"]["free_quote"] = float(bal_row[0] or 0)
             stats["holdings"]["free_base"] = float(bal_row[1] or 0)
-            stats["holdings"]["reserve"] = float(bal_row[2] or 0)  # Added Reserve
+            reserve = float(bal_row[2] or 0)
+            stats["holdings"]["reserve"] = reserve
 
-        # 3. Get Locked Funds (grid_orders) & Order Counts
+        # 3. Get Order Stats (FILLED and OPEN) for calculating correct FREE balance
+        # Formula: FREE = Investment - Reserve - BuyFilled + SellFilled - BuyOpen
+        cursor.execute(
+            """
+            SELECT side, status, SUM(quantity * price) as total
+            FROM grid_orders 
+            WHERE bot_id = ?
+            GROUP BY side, status
+        """,
+            (bot_id,),
+        )
+        order_stats = cursor.fetchall()
+
+        buy_filled = 0.0
+        sell_filled = 0.0
+        buy_open_total = 0.0
+
+        for side, status, total in order_stats:
+            total = float(total) if total else 0.0
+            if side.lower() == "buy" and status.upper() == "FILLED":
+                buy_filled = total
+            elif side.lower() == "sell" and status.upper() == "FILLED":
+                sell_filled = total
+            elif side.lower() == "buy" and status.upper() == "OPEN":
+                buy_open_total = total
+
+        # Calculate correct FREE balance from order history
+        if investment > 0:
+            correct_free = investment - reserve - buy_filled + sell_filled - buy_open_total
+            stats["holdings"]["free_quote"] = max(0.0, correct_free)
+            logger.debug(
+                f"Bot {bot_id} FREE calc: {investment} - {reserve} - {buy_filled} + {sell_filled} - {buy_open_total} = {correct_free}"
+            )
+        elif bal_row:
+            # Fallback to DB value if no investment config
+            stats["holdings"]["free_quote"] = float(bal_row[0] or 0)
+
+        # 3b. Get Locked Funds (grid_orders) & Order Counts
         cursor.execute("SELECT side, quantity, price FROM grid_orders WHERE bot_id = ? AND status = 'OPEN'", (bot_id,))
         orders = cursor.fetchall()
 

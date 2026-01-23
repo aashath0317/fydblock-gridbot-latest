@@ -37,6 +37,7 @@ class OrderStatusTracker:
         self.event_bus = event_bus
         self.polling_interval = polling_interval
         self.trading_pair = trading_pair
+        self.bot_id = bot_id  # Store for ownership validation
         self._monitoring_task = None
         self._active_tasks = set()
         self.logger = logging.getLogger(self.__class__.__name__)
