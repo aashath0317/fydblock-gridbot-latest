@@ -123,6 +123,12 @@ class GridTradingStrategy(TradingStrategyInterface):
         else:
             await self._run_live_or_paper_trading(trigger_price)
 
+        if not self.order_manager:
+            return
+        has_active_orders = await self.order_manager.has_active_orders()
+        if has_active_orders:
+            self.logger.info("🔥 Found active orders in Database. Enabling Smart Resume (Hot Boot).")
+
     async def _run_live_or_paper_trading(self, trigger_price: float):
         self.logger.info(f"Starting {'live' if self.trading_mode == TradingMode.LIVE else 'paper'} trading")
 

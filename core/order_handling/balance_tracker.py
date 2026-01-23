@@ -194,47 +194,79 @@ class BalanceTracker:
     async def sync_balances(self, exchange_service: ExchangeInterface, current_price: float):
         """
         Forces an update of the available (free) balance from the exchange.
-        This ensures the bot doesn't try to spend funds it doesn't actually have.
+        CLAMPS funds to the 'User Allocated' Investment Cap to ensure strict isolation.
+        This prevents the bot from seeing or spending the User's personal HODL stack.
         """
         if self.trading_mode not in [TradingMode.LIVE, TradingMode.PAPER_TRADING]:
-            return
+            return None, None
 
         try:
             balances = await exchange_service.get_balance()
             if balances and "free" in balances and "total" in balances:
-                # Update Available Fiat
-                free_fiat = float(balances["free"].get(self.quote_currency, 0.0))
-                free_crypto = float(balances["free"].get(self.base_currency, 0.0))
+                # 1. Get Live Wallet State
+                wallet_free_fiat = float(balances["free"].get(self.quote_currency, 0.0))
+                wallet_free_crypto = float(balances["free"].get(self.base_currency, 0.0))
 
-                total_fiat = float(balances["total"].get(self.quote_currency, 0.0))
-                total_crypto = float(balances["total"].get(self.base_currency, 0.0))
+                wallet_total_fiat = float(balances["total"].get(self.quote_currency, 0.0))
+                wallet_total_crypto = float(balances["total"].get(self.base_currency, 0.0))
 
-                crypto_equity_value = total_crypto * current_price
+                # 2. Determine Bot's "Locked" State (What we KNOW we own in orders)
+                # These are funds we MUST account for.
+                my_locked_fiat = self.reserved_fiat
+                my_locked_crypto = self.reserved_crypto
 
-                locked_fiat = total_fiat - free_fiat
-                target_total_fiat = max(0.0, self.investment_cap - crypto_equity_value)
+                # 3. Calculate "Effective Cap" (Investment - Fee Reserves)
+                # This is the max net value the bot is allowed to manage.
+                effective_cap = self.investment_cap - self.operational_reserve
 
-                max_allowed_free_fiat = max(0.0, target_total_fiat - locked_fiat)
+                # ---------------------------------------------------------
+                # ISOLATION LOGIC: FIAT
+                # ---------------------------------------------------------
+                # Max Fiat we can possibly have = Cap - (My Locked Crypto Value) - (My Free Crypto Value)
+                # But My Free Crypto is unknown yet.
+                # Alternative: Clamp Fiat based on simple "Cap - Current Crypto Value"?
+                # No, because Current Crypto Value might include User's 5 SOL.
 
-                new_fiat = min(free_fiat, max_allowed_free_fiat)
-                new_crypto = free_crypto
+                # We need to trust our Internal Ledger but "reconcile" downwards if Wallet is empty.
+                # If Wallet has LESS than we think, we must shrink.
+                # If Wallet has MORE than we think, we must IGNORE the excess.
 
-                # Log only if there's a significant drift
-                if abs(new_fiat - self.balance) > 1.0 or abs(new_crypto - self.crypto_balance) > 0.01:
-                    current_time = time.time()
-                    if current_time - self._last_drift_warning_time > 300:
-                        self.logger.info(
-                            f"ℹ️ Wallet Balance Drift Detected (Multi-Bot Shared Wallet?): "
-                            f"Internal Fiat: {self.balance:.2f} vs Wallet Free: {new_fiat:.2f} | "
-                            f"Internal Crypto: {self.crypto_balance:.4f} vs Wallet Free: {new_crypto:.4f}. "
-                            f"Keeping Internal Ledger as Truth to prevent cross-bot contamination."
-                        )
-                        self._last_drift_warning_time = current_time
+                # Sanity Check 1: We cannot have more free fiat than the wallet has.
+                checked_free_fiat = min(self.balance, wallet_free_fiat)
 
-                # self.balance = new_fiat
-                # self.crypto_balance = new_crypto
-                # self._persist_balances()
-                return new_fiat, new_crypto
+                # Sanity Check 2: We cannot have more free crypto than the wallet has.
+                checked_free_crypto = min(self.crypto_balance, wallet_free_crypto)
+
+                # 4. Check for External Deposit "Drift" (User added funds?)
+                # If we suddenly see MORE funds, we do NOT auto-claim them unless explicitly resized.
+                # So the `min` check above implicitly handles "User added 5 SOL".
+                # self.crypto_balance (0.4) vs Wallet (5.4) -> min serves up 0.4. Correct.
+
+                # 5. Check for External Withdrawal "Drift" (User took funds?)
+                # self.crypto_balance (0.4) vs Wallet (0.2) -> min serves up 0.2.
+                # We must accept this loss to avoid order errors.
+
+                if checked_free_fiat != self.balance:
+                    self.logger.warning(
+                        f"📉 Fiat Sync: Internal {self.balance:.2f} -> Wallet Limit {checked_free_fiat:.2f} "
+                        f"(User withdrew funds?)"
+                    )
+                    self.balance = checked_free_fiat
+
+                if checked_free_crypto != self.crypto_balance:
+                    self.logger.warning(
+                        f"📉 Crypto Sync: Internal {self.crypto_balance:.6f} -> Wallet Limit {checked_free_crypto:.6f} "
+                        f"(User withdrew funds?)"
+                    )
+                    self.crypto_balance = checked_free_crypto
+
+                # Re-Persist (only if changed, but safe to call)
+                # await self._persist_balances()
+                # (Caller typically handles logic, but let's persist here to be safe)
+                await self._persist_balances()
+
+                return self.balance, self.crypto_balance
+
         except Exception as e:
             self.logger.error(f"Failed to sync balances: {e}")
 
@@ -567,13 +599,15 @@ class BalanceTracker:
         }
         """
         # 1. Check Crypto Deficit (for Sell Orders)
-        # We need `required_crypto` available.
-        if self.crypto_balance < required_crypto:
-            shortfall = required_crypto - self.crypto_balance
+        # FIX: Check TOTAL owned crypto (Free + Reserved), not just free.
+        # If funds are reserved, they are already supporting the grid orders, so we are good.
+        total_crypto = self.get_adjusted_crypto_balance()
+        if total_crypto < required_crypto:
+            shortfall = required_crypto - total_crypto
             # Ensure shortfall is significant (> 1% of required or some min value)
             if shortfall > (required_crypto * 0.01):
                 self.logger.warning(
-                    f"⚠️ Rebalance Needed: Crypto Shortfall. Have {self.crypto_balance}, Need {required_crypto}."
+                    f"⚠️ Rebalance Needed: Crypto Shortfall. Have {total_crypto} (Free+Reserved), Need {required_crypto}."
                 )
                 return {
                     "type": "BUY_CRYPTO",
@@ -582,16 +616,17 @@ class BalanceTracker:
                 }
 
         # 2. Check Fiat Deficit (for Buy Orders)
-        # We need `required_fiat` available.
-        if self.balance < required_fiat:
-            shortfall = required_fiat - self.balance
+        # FIX: Check TOTAL owned fiat (Free + Reserved).
+        total_fiat = self.get_adjusted_fiat_balance()
+        if total_fiat < required_fiat:
+            shortfall = required_fiat - total_fiat
             if shortfall > (required_fiat * 0.01):
                 # We need to raise 'shortfall' USDT.
                 # Amount of crypto to SELL = shortfall / current_price
                 crypto_to_sell = shortfall / current_price if current_price > 0 else 0
                 if crypto_to_sell > 0:
                     self.logger.warning(
-                        f"⚠️ Rebalance Needed: Fiat Shortfall. Have {self.balance}, Need {required_fiat}."
+                        f"⚠️ Rebalance Needed: Fiat Shortfall. Have {total_fiat} (Free+Reserved), Need {required_fiat}."
                     )
                     return {
                         "type": "SELL_CRYPTO",

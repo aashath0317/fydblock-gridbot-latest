@@ -1,8 +1,7 @@
-import asyncio
+from datetime import datetime
 import logging
 import os
-import json
-from datetime import datetime
+
 import asyncpg
 
 
@@ -13,17 +12,24 @@ class BotDatabase:
         self.db_url = os.getenv("DB_CONNECTION_STRING")
         if not self.db_url:
             # Fallback to constructing from parts if full string not provided
-            user = os.getenv("POSTGRES_USER", "postgres")
-            password = os.getenv("POSTGRES_PASSWORD", "password")
-            host = os.getenv("POSTGRES_HOST", "localhost")
-            port = os.getenv("POSTGRES_PORT", "5432")
-            dbname = os.getenv("POSTGRES_DB", "gridbot_db")
-            self.db_url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+            # Support both DB_* (from .env) and POSTGRES_* (standard) naming conventions
+            self.user = (os.getenv("DB_USER") or os.getenv("POSTGRES_USER", "postgres")).strip()
+            self.password = (os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "password")).strip()
+            self.host = (os.getenv("DB_HOST") or os.getenv("POSTGRES_HOST", "localhost")).strip()
+            self.port = (os.getenv("DB_PORT") or os.getenv("POSTGRES_PORT", "5432")).strip()
+            self.dbname = (os.getenv("DB_NAME") or os.getenv("POSTGRES_DB", "gridbot_db")).strip()
+
+            self.db_url = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
 
     async def connect(self):
         """Initializes the connection pool and creates tables."""
         try:
-            self.pool = await asyncpg.create_pool(dsn=self.db_url)
+            # DEBUG: Log the host and partial URL to debug connection issues
+            self.logger.info(f"🔌 Attempting to connect to DB Host: {self.host}, Port: {self.port}, DB: {self.dbname}")
+
+            self.pool = await asyncpg.create_pool(
+                user=self.user, password=self.password, host=self.host, port=self.port, database=self.dbname
+            )
             self.logger.info("✅ Connected to PostgreSQL Database")
             await self._init_db()
         except Exception as e:
@@ -49,6 +55,21 @@ class BotDatabase:
                         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                     )
                 """)
+
+                # 1b. Auto-Migration: Add missing columns if they don't exist (Backend compatibility)
+                # Check for config_json
+                try:
+                    await conn.execute("ALTER TABLE bots ADD COLUMN IF NOT EXISTS config_json TEXT")
+                except Exception as e:
+                    self.logger.warning(f"Migration: optional config_json check: {e}")
+
+                # Check for updated_at
+                try:
+                    await conn.execute(
+                        "ALTER TABLE bots ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Migration: optional updated_at check: {e}")
 
                 # 2. System Logs Table
                 await conn.execute("""
@@ -217,33 +238,35 @@ class BotDatabase:
         """Updates the persistent status of a bot."""
         try:
             if config_json:
-                await self.pool.execute(
+                result = await self.pool.execute(
                     """
-                    INSERT INTO bots (bot_id, status, config_json, updated_at) 
-                    VALUES ($1, $2, $3, NOW())
-                    ON CONFLICT(bot_id) DO UPDATE SET 
-                        status=EXCLUDED.status, 
-                        config_json=EXCLUDED.config_json,
-                        updated_at=NOW()
+                    UPDATE bots 
+                    SET status = $1, config_json = $2, updated_at = NOW()
+                    WHERE bot_id = $3
                 """,
-                    bot_id,
                     status,
                     config_json,
+                    bot_id,
                 )
             else:
-                await self.pool.execute(
+                result = await self.pool.execute(
                     """
-                    INSERT INTO bots (bot_id, status, updated_at) 
-                    VALUES ($1, $2, NOW())
-                    ON CONFLICT(bot_id) DO UPDATE SET 
-                        status=EXCLUDED.status, 
-                        updated_at=NOW()
+                    UPDATE bots 
+                    SET status = $1, updated_at = NOW()
+                    WHERE bot_id = $2
                 """,
-                    bot_id,
                     status,
+                    bot_id,
                 )
 
-            self.logger.info(f"🔄 DB: Bot {bot_id} status updated to {status}")
+            # Check if any row was actually updated
+            # "UPDATE 1" means 1 row updated.
+            if result == "UPDATE 0":
+                self.logger.warning(
+                    f"⚠️ DB: Could not update status for Bot {bot_id} (Not found in DB). Backend might have deleted it."
+                )
+            else:
+                self.logger.info(f"🔄 DB: Bot {bot_id} status updated to {status}")
         except Exception as e:
             self.logger.error(f"Failed to update bot status: {e}")
 
@@ -382,8 +405,16 @@ class BotDatabase:
             results = []
             for row in rows:
                 d = dict(row)
+                # Map executed_at to timestamp for frontend compatibility
+                # and ensure it is ISO formatted
                 if isinstance(d.get("executed_at"), datetime):
-                    d["executed_at"] = d["executed_at"].isoformat()
+                    iso_ts = d["executed_at"].isoformat()
+                    d["executed_at"] = iso_ts
+                    d["timestamp"] = iso_ts
+                elif d.get("executed_at"):
+                    # If already string (unlikely with asyncpg default but possible)
+                    d["timestamp"] = str(d["executed_at"])
+
                 results.append(d)
             return results
         except Exception as e:

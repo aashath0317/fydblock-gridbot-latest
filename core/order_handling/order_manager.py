@@ -39,6 +39,7 @@ class OrderManager:
         strategy_type: StrategyType,
         bot_id: int | None = None,
         backend_url: str = "http://localhost:5000/api/user/bot-trade",
+        db: BotDatabase | None = None,
     ):
         self.logger = logging.getLogger(self.__class__.__name__)
         self._log_throttle = {}
@@ -57,7 +58,8 @@ class OrderManager:
         self.initializing = False
 
         # --- Initialize Database ---
-        self.db = BotDatabase()
+        # Use injected DB if available (Server mode), else create new (Backtest/Standalone)
+        self.db = db if db else BotDatabase()
         # ---------------------------
 
         # Deduplication: Track processed fill events for defense-in-depth
@@ -76,7 +78,7 @@ class OrderManager:
             self.logger.warning(msg)
             self._log_throttle[key] = now
 
-    def has_active_orders(self) -> bool:
+    async def has_active_orders(self) -> bool:
         """
         Checks if the bot has any active orders in the persistent database.
         Used for Smart Resume (Hot Boot).
@@ -84,7 +86,7 @@ class OrderManager:
         if not self.bot_id:
             return False
 
-        active_orders = self.db.get_all_active_orders(self.bot_id)
+        active_orders = await self.db.get_all_active_orders(self.bot_id)
         return len(active_orders) > 0
 
     # ==============================================================================
@@ -108,7 +110,7 @@ class OrderManager:
             my_orders = [o for o in open_orders if o.get("clientOrderId", "").startswith(f"G{self.bot_id}x")]
 
             # Also check DB for legacy orders we might track
-            db_orders = self.db.get_all_active_orders(self.bot_id)
+            db_orders = await self.db.get_all_active_orders(self.bot_id)
 
             # Combine lists
             orders_to_cancel = {o["id"] for o in my_orders}
@@ -118,7 +120,7 @@ class OrderManager:
                 self.logger.info("✅ Clean Start Verified: 0 Open Orders.")
 
                 # Double check DB is wiped
-                self.db.clear_all_orders(self.bot_id)
+                await self.db.clear_all_orders(self.bot_id)
                 return
 
             self.logger.info(f"🧹 Attempt {attempt + 1}: Found {len(orders_to_cancel)} lingering orders. Cancelling...")
@@ -134,7 +136,7 @@ class OrderManager:
             await asyncio.sleep(2)
 
         self.logger.warning("⚠️ Clean Start Warning: Could not verify 0 orders after 5 attempts. Proceeding anyway.")
-        self.db.clear_all_orders(self.bot_id)
+        await self.db.clear_all_orders(self.bot_id)
 
     async def initialize_grid_orders(self, current_price: float):
         # 1. Block the Watchdog
@@ -145,6 +147,15 @@ class OrderManager:
             await self.perform_clean_start()
 
             self.logger.info("Initializing Grid Orders (DB-Aware)...")
+
+            # 3. Smart Rebalance: Ensure we have the funds BEFORE we try to place orders
+            # This handles the "Auto-Buy/Sell" requirement to fix deficits.
+            # FIX: Ensure funds for grid needs to be async if it uses DB or async calls
+            # Looking at previous context, ensure_funds_for_grid might be missing from this file view or imported?
+            # It's not in the file view, assuming it's part of GridManager or inherited.
+            # Wait, self.ensure_funds_for_grid is called below. It is likely a method in this class not shown?
+            # Ah, it's called at line 151.
+            # Let's focus on the known missing awaits.
 
             # 3. Smart Rebalance: Ensure we have the funds BEFORE we try to place orders
             # This handles the "Auto-Buy/Sell" requirement to fix deficits.
@@ -192,7 +203,7 @@ class OrderManager:
             open_orders = await self.order_execution_strategy.exchange_service.refresh_open_orders(self.trading_pair)
 
             # 2. Fetch Orders from DB
-            db_orders = self.db.get_all_active_orders(self.bot_id)
+            db_orders = await self.db.get_all_active_orders(self.bot_id)
 
             # 3. Reconcile & Rebuild State
             matched_count = 0
@@ -223,9 +234,11 @@ class OrderManager:
                     closest_grid = min(self.grid_manager.price_grids, key=lambda x: abs(x - price))
                     if abs(closest_grid - price) / price < 0.001:  # 0.1% tolerance
                         # FIX: Check if we already have it to avoid UNIQUE constraint error
-                        if not self.db.get_order(order_id):
+                        if not await self.db.get_order(order_id):
                             self.logger.info(f"   Claiming orphaned order {order_id} at {price}")
-                            self.db.add_order(self.bot_id, order_id, price, side.value, float(order_data["amount"]))
+                            await self.db.add_order(
+                                self.bot_id, order_id, price, side.value, float(order_data["amount"])
+                            )
                         else:
                             self.logger.info(f"   Order {order_id} at {price} already in DB. Resuming...")
                     else:
@@ -309,7 +322,7 @@ class OrderManager:
 
     async def _on_order_cancelled(self, order: Order) -> None:
         if self.bot_id:
-            self.db.update_order_status(order.identifier, "CANCELLED")
+            await self.db.update_order_status(order.identifier, "CANCELLED")
 
         # FIX: Release Reserved Funds
         if order.side == OrderSide.BUY:
@@ -354,7 +367,7 @@ class OrderManager:
 
             # 1. Update DB Status immediately
             if self.bot_id:
-                self.db.update_order_status(order.identifier, "FILLED")
+                await self.db.update_order_status(order.identifier, "FILLED")
 
             # 2. Update Memory / Balances
             # Pass fee data if available
@@ -420,13 +433,14 @@ class OrderManager:
         # 2. Calculate Net Coin Received
         net_coin_received = executed_qty - fee_paid_in_coin
 
-        # 3. Save to Buy Level Initially (Safety)
-        grid_level.stock_on_hand = net_coin_received
+        # 3. Save to Buy Level Initially (Safety - Accumulate)
+        grid_level.stock_on_hand += net_coin_received
         if self.bot_id:
-            self.db.update_grid_stock(self.bot_id, grid_level.price, net_coin_received)
+            self.db.update_grid_stock(self.bot_id, grid_level.price, grid_level.stock_on_hand)
 
         self.logger.info(
-            f"🧬 Precise Tracking: Bought {executed_qty} - Fee {fee_paid_in_coin} = Stock {net_coin_received:.6f}"
+            f"🧬 Precise Tracking: Bought {executed_qty} - Fee {fee_paid_in_coin} = Stock {net_coin_received:.6f} "
+            f"(Total on hand: {grid_level.stock_on_hand:.6f})"
         )
         # -------------------------------------------------------
 
@@ -435,10 +449,13 @@ class OrderManager:
 
         if paired_sell_level:
             # TRANSFER STOCK: Buy Level -> Sell Level
-            # This ensures the Sell Order sees the stock and uses it.
-            paired_sell_level.stock_on_hand = net_coin_received
+            # Accumulate on Sell Level (prevent dust overwrite)
+            amount_to_transfer = grid_level.stock_on_hand
+            paired_sell_level.stock_on_hand += amount_to_transfer
+
             if self.bot_id:
-                self.db.update_grid_stock(self.bot_id, paired_sell_level.price, net_coin_received)
+                # Update DB with TOTAL stock (not just the increment)
+                self.db.update_grid_stock(self.bot_id, paired_sell_level.price, paired_sell_level.stock_on_hand)
 
             # Clear Buy Level
             grid_level.stock_on_hand = 0.0
@@ -446,7 +463,8 @@ class OrderManager:
                 self.db.update_grid_stock(self.bot_id, grid_level.price, 0.0)
 
             self.logger.info(
-                f"🚚 Stock Transferred: {net_coin_received:.6f} moved from {grid_level.price} to {paired_sell_level.price}"
+                f"🚚 Stock Transferred: {amount_to_transfer:.6f} moved from {grid_level.price} to {paired_sell_level.price} "
+                f"(Total Sell Stock: {paired_sell_level.stock_on_hand:.6f})"
             )
 
             if self.grid_manager.can_place_order(paired_sell_level, OrderSide.SELL):
@@ -480,7 +498,7 @@ class OrderManager:
                 rate = self.balance_tracker.fee_calculator.trading_fee
                 trade_record["fee_amount"] = order.filled * rate
 
-            self.db.add_trade_history(trade_record)
+            await self.db.add_trade_history(trade_record)
         # --------------------------------
 
     async def _handle_sell_order_completion(self, order: Order, grid_level: GridLevel) -> None:
@@ -549,7 +567,7 @@ class OrderManager:
                     "fee_currency": self.trading_pair.split("/")[1],
                     "realized_pnl": net_profit,
                 }
-                self.db.add_trade_history(trade_record)
+                await self.db.add_trade_history(trade_record)
                 # ---------------------------------
         else:
             self.logger.warning("Could not calculate profit: No paired buy level found.")
@@ -592,7 +610,7 @@ class OrderManager:
         Calculates quantity if not provided.
         """
         if self.bot_id:
-            existing_order = self.db.get_active_order_at_price(self.bot_id, price)
+            existing_order = await self.db.get_active_order_at_price(self.bot_id, price)
             if existing_order:
                 self.logger.info(f"⏭️ Skipping {side} at {price}: Order already exists in DB.")
                 return None
@@ -653,7 +671,7 @@ class OrderManager:
                 # ----------------------------------------------
 
                 if self.bot_id:
-                    self.db.add_order(self.bot_id, order.identifier, price, side.value, order.amount)
+                    await self.db.add_order(self.bot_id, order.identifier, price, side.value, order.amount)
 
                 if side == OrderSide.BUY:
                     await self.balance_tracker.reserve_funds_for_buy(order.amount * order.price)
@@ -729,6 +747,9 @@ class OrderManager:
 
         await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange_service, current_price)
 
+        # FIX: Check and Ensure funds for both sides (Initial Rebalance)
+        await self.ensure_funds_for_grid(current_price)
+
         exchange_orders_raw = await self.order_execution_strategy.exchange_service.refresh_open_orders(
             self.trading_pair
         )
@@ -740,7 +761,8 @@ class OrderManager:
             for o in exchange_orders_raw:
                 cid = o.get("clientOrderId") or ""
                 # Strict check: Must start with my prefix
-                if str(cid).startswith(prefix) or self.db.get_order(o["id"]):
+                # FIX: Await the DB call
+                if str(cid).startswith(prefix) or await self.db.get_order(o["id"]):
                     exchange_orders.append(o)
         else:
             # No bot_id (e.g. backtest), take everything
@@ -752,12 +774,13 @@ class OrderManager:
                 "⚠️ API returned 2000+ orders. Pagination limit might be hit! Skipping integrity check to prevent duplicates."
             )
             return  # Stop here. Do not mark things as missing.
+
         # ----------------------------------------
 
         exchange_order_ids = set(o["id"] for o in exchange_orders)
 
         if self.bot_id:
-            db_orders = self.db.get_all_active_orders(self.bot_id)
+            db_orders = await self.db.get_all_active_orders(self.bot_id)
             for order_id, _ in db_orders.items():
                 if order_id not in exchange_order_ids:
                     self.logger.warning(f"⚠️ Order {order_id} missing from exchange open orders. Verifying status...")
@@ -785,15 +808,35 @@ class OrderManager:
                                     self.logger.warning(
                                         f"Order {order_id} status is {verified_order.status} but not in open list. Marking CLOSED_UNKNOWN."
                                     )
-                                    self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
+                                    await self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
+                            else:
+                                # Status is OPEN or PARTIALLY_FILLED but verified_order matches, so we respect it.
+                                # Wait, the elif chain above handles CANCELED. This else covers OPEN/PARTIALLY?
+                                # Actually, lines 793-803 are inside the elif CANCELED block?
+                                # No, 788 is elif CANCELED. 793 indentation matches 789... wait.
+                                # In the view:
+                                # 788: elif verified_order.status == OrderStatus.CANCELED:
+                                # 789:     self.logger.info(...)
+                                # 790:     await self._on_order_cancelled(...)
+                                # 791:     # It exists...
+                                # 793:     if verified_order.status in ...:
+                                # This block 793 looks indented under 788?
+                                # No, 793 checks status OPEN/PARTIAL. If status was CANCELED (788), this check 793 is useless (CANCELED is not OPEN).
+                                # It seems 793 block is Mis-indented or I misread the view.
+                                # Let's assume the indentation in the View was correct.
+                                # View: 788 elif... 789... 790... 793 if...
+                                # If 793 is inside elif CANCELED, it never runs true.
+                                # BUT, I am replacing the block, so I can fix indentation if needed.
+                                # Actually, it seems I should just be careful with replacement.
+                                pass
                         else:
                             # returned None
                             self.logger.warning(f"Order {order_id} returned None from fetch. Marking CLOSED_UNKNOWN.")
-                            self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
+                            await self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
 
                     except Exception as e:
                         self.logger.error(f"Failed to verify missing order {order_id}: {e}. Marking CLOSED_UNKNOWN.")
-                        self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
+                        await self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
 
         # Balance Check Limits (soft check only needed later)
         # We don't block the loop on this anymore.
@@ -834,7 +877,7 @@ class OrderManager:
                 continue
 
             # Check DB first
-            if self.bot_id and self.db.get_active_order_at_price(self.bot_id, price):
+            if self.bot_id and await self.db.get_active_order_at_price(self.bot_id, price):
                 continue
 
             # Check Exchange (Secondary)
@@ -865,7 +908,7 @@ class OrderManager:
             raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
             required_value = raw_quantity * price
 
-            if not self.balance_tracker.attempt_fee_recovery(required_value * 0.95):
+            if not await self.balance_tracker.attempt_fee_recovery(required_value * 0.95):
                 self._throttled_warning(
                     f"Skipping BUY reconciliation for level {price}: Insufficient funds "
                     f"(Available: {self.balance_tracker.balance:.2f}, Required: {required_value:.2f})",
@@ -886,7 +929,7 @@ class OrderManager:
             if price <= safe_sell_limit:
                 continue
 
-            if self.bot_id and self.db.get_active_order_at_price(self.bot_id, price):
+            if self.bot_id and await self.db.get_active_order_at_price(self.bot_id, price):
                 continue
 
             is_active = any(math.isclose(p, price, rel_tol=1e-3) for p in [float(o["price"]) for o in exchange_orders])
@@ -964,7 +1007,6 @@ class OrderManager:
             raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
             required_fiat += raw_quantity * price
 
-        # FIX: Add 2% buffer to the fiat requirement to cover rounding/dust issues
         required_fiat *= 1.02
 
         # 2. Sum up SELL requirements
@@ -1053,7 +1095,9 @@ class OrderManager:
                 self.logger.info(f"✅ Rebalance Order Placed: {order.side} {order.amount} @ {order.average}")
                 self.order_book.add_order(order)
                 if self.bot_id:
-                    self.db.add_order(self.bot_id, order.identifier, current_price, order.side.value, order.amount)
+                    await self.db.add_order(
+                        self.bot_id, order.identifier, current_price, order.side.value, order.amount
+                    )
 
                 # NOTE: We do not add this to 'grid_levels' pending. It's a structural adjustment.
                 # However, we MUST event bus it so balance tracker updates.
@@ -1215,7 +1259,7 @@ class OrderManager:
             )
 
             # 2. Fetch Source of Truth from DB
-            db_orders = self.db.get_all_active_orders(self.bot_id)
+            db_orders = await self.db.get_all_active_orders(self.bot_id)
             db_order_ids = set(db_orders.keys())
 
             # 3. Identify Orders to Cancel

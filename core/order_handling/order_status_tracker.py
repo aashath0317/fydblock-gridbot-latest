@@ -144,16 +144,16 @@ class OrderStatusTracker:
                 return  # Can't raise here as it might break the loop, just return
 
             # Normalize status to enum if possible or string check
+            # Normalize ID for deduplication
+            order_id_str = str(order_id)
+
             if status == OrderStatus.CLOSED or status == "closed":
-                # DEDUPLICATION: Skip if already processed
-                # FIX: Enforce string type for consistent deduplication
-                order_id_str = str(order_id)
+                # CRITICAL DEDUPLICATION: Check BEFORE any logic
                 if order_id_str in self._processed_fills:
                     self.logger.debug(f"Order {order_id} already processed. Skipping duplicate fill event.")
                     return
 
-                # CRITICAL: Mark as processed IMMEDIATELY to prevent race conditions
-                # This must happen BEFORE any async operations (like get_order)
+                # Mark as processed IMMEDIATELY
                 self._processed_fills.add(order_id_str)
 
                 self.order_book.update_order_status(order_id, OrderStatus.CLOSED)

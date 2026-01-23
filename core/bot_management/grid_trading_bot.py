@@ -119,6 +119,7 @@ class GridTradingBot:
                 self.trading_pair,
                 strategy_type,
                 self.bot_id,
+                db=self.db,
             )
 
             trading_performance_analyzer = TradingPerformanceAnalyzer(self.config_manager, order_book)
@@ -204,7 +205,7 @@ class GridTradingBot:
         """
         if self.db:
             self.logger.info("✅ Initialization Complete Event Received. Marking Bot as RUNNING.")
-            self.db.update_bot_status(self.bot_id, "RUNNING")
+            await self.db.update_bot_status(self.bot_id, "RUNNING")
 
             # --- SYNC with Node.js Backend ---
             try:

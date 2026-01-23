@@ -247,6 +247,10 @@ class GridManager:
             else:
                 self.logger.info(f"   Skipping state update for busy grid {price} (State: {grid_level.state})")
 
+        # Explicitly sort to ensure optimal order placement priority (Closest to price first)
+        self.sorted_buy_grids.sort(reverse=True)  # High to Low (Closest to Price -> Down)
+        self.sorted_sell_grids.sort()  # Low to High (Closest to Price -> Up)
+
         self.logger.info(f"   📊 Active Buy Grids: {len(self.sorted_buy_grids)}")
         self.logger.info(f"   📊 Active Sell Grids: {len(self.sorted_sell_grids)}")
 

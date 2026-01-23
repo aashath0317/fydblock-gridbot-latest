@@ -1,8 +1,13 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime  # Added import
 import json
 import logging
 from typing import Any
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from adapter.config_adapter import DictConfigManager
 import ccxt.async_support as ccxt  # Use Async CCXT for public data
@@ -523,7 +528,7 @@ async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotReques
 
         # Cleanup Grid Orders
         try:
-            db.clear_all_orders(bot_id)
+            await db.clear_all_orders(bot_id)
             logger.info(f"✅ Cleaned up grid_orders for deleted Bot {bot_id}")
         except Exception as e:
             logger.error(f"Failed to cleanup orders for bot {bot_id}: {e}")
@@ -751,13 +756,19 @@ async def get_bot_stats(bot_id: int):
             t_side = t["side"]
             t_qty = t["quantity"]
             t_price = t["price"]
-            t_ts = t["executed_at"]  # Already ISO formatted by new BotDatabase
-            t_fee = t["fee_amount"]
-            t_fee_curr = t["fee_currency"]
-            t_pnl = t["realized_pnl"]
-            t_pair = t["pair"]
+            t_ts = t.get("timestamp") or t.get("executed_at")
+            if isinstance(t_ts, datetime):
+                t_ts = t_ts.isoformat()
+            elif not t_ts:
+                # Fallback to avoid Invalid Date
+                t_ts = datetime.utcnow().isoformat() + "Z"
 
-            # Fix UNKNOWN currency
+            t_fee = t.get("fee_amount")
+            t_fee_curr = t.get("fee_currency")
+            t_pnl = t.get("realized_pnl")
+            t_pair = t.get("pair")
+
+            # Fix UNKNOWN currency (Restored Logic)
             final_fee_curr = t_fee_curr
             if not final_fee_curr or final_fee_curr == "UNKNOWN":
                 if t_pair and "/" in t_pair:
@@ -970,3 +981,16 @@ async def get_market_candles(
     except Exception as e:
         logger.error(f"Candle fetch failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import os
+
+    import uvicorn
+
+    # Get port from env or default to 8000
+    # Note: Backend might expect a specific port.
+    # checking Fydblock usage suggests 8000 is common.
+    port = int(os.getenv("PORT", 8000))
+
+    uvicorn.run(app, host="0.0.0.0", port=port, loop="asyncio")
