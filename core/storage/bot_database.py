@@ -10,7 +10,10 @@ class BotDatabase:
 
     def _init_db(self):
         """Initialize the database tables if they don't exist."""
-        conn = sqlite3.connect(self.db_path)
+        # FIX: Increase timeout and enable WAL mode for multi-bot concurrency (30+ bots)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         cursor = conn.cursor()
 
         # 1. Bots Table (Persistence)
