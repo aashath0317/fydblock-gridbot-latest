@@ -35,7 +35,7 @@ class GridTradingStrategy(TradingStrategyInterface):
         plotter: Plotter | None = None,
     ):
         super().__init__(config_manager, balance_tracker)
-    self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.event_bus = event_bus
         self.exchange_service = exchange_service
         self.grid_manager = grid_manager
@@ -47,6 +47,7 @@ class GridTradingStrategy(TradingStrategyInterface):
         self.data = self._initialize_historical_data()
         # FIX: Use deque with maxlen to cap memory usage (prevents unbounded growth)
         from collections import deque
+
         self.live_trading_metrics = deque(maxlen=1000)  # Keep last ~17 mins of 1-sec data
         self._running = True
 
@@ -682,4 +683,7 @@ class GridTradingStrategy(TradingStrategyInterface):
 
         # 5. Place New Buy Order at Bottom
         self.logger.info(f"   Placing New Bottom Buy Order at {new_bottom_price}...")
-        await self.order_man
+        await self.order_manager._place_limit_order_safe(new_bottom_price, OrderSide.BUY)
+
+    def get_formatted_orders(self):
+        return self.trading_performance_analyzer.get_formatted_orders()
