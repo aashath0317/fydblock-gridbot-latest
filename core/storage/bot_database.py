@@ -1,595 +1,482 @@
+import asyncio
 import logging
-import sqlite3
+import os
+import json
+from datetime import datetime
+import asyncpg
 
 
 class BotDatabase:
-    def __init__(self, db_path="bot_data.db"):
-        self.db_path = db_path
+    def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
-        self._init_db()
+        self.pool = None
+        self.db_url = os.getenv("DB_CONNECTION_STRING")
+        if not self.db_url:
+            # Fallback to constructing from parts if full string not provided
+            user = os.getenv("POSTGRES_USER", "postgres")
+            password = os.getenv("POSTGRES_PASSWORD", "password")
+            host = os.getenv("POSTGRES_HOST", "localhost")
+            port = os.getenv("POSTGRES_PORT", "5432")
+            dbname = os.getenv("POSTGRES_DB", "gridbot_db")
+            self.db_url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
 
-    def _init_db(self):
-        """Initialize the database tables if they don't exist."""
-        # FIX: Increase timeout and enable WAL mode for multi-bot concurrency (30+ bots)
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        cursor = conn.cursor()
-
-        # 1. Bots Table (Persistence)
-        # Added config_json column for restart recovery
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS bots (
-                bot_id INTEGER PRIMARY KEY,
-                status TEXT DEFAULT 'STOPPED',
-                config_json TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 2. System Logs Table (Logging)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS system_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bot_id INTEGER,
-                severity TEXT,
-                message TEXT,
-                fix_action TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Schema Migration: Add config_json to existing table if missing
-        cursor.execute("PRAGMA table_info(bots)")
-        bot_columns = [info[1] for info in cursor.fetchall()]
-        if "config_json" not in bot_columns:
-            try:
-                cursor.execute("ALTER TABLE bots ADD COLUMN config_json TEXT")
-                self.logger.info("🔄 DB: Migrated bots table - Added 'config_json'")
-            except Exception as e:
-                self.logger.error(f"Failed to add config_json to bots: {e}")
-                self.logger.error(f"Failed to add config_json to bots: {e}")
-
-        # 3. Grid Orders Table (Active Orders)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS grid_orders (
-                bot_id INTEGER,
-                order_id TEXT PRIMARY KEY,
-                price REAL,
-                side TEXT,
-                quantity REAL,
-                status TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 3b. Grid Levels Table (Persistence for Infinite Grid)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS grid_levels (
-                bot_id INTEGER,
-                price REAL,
-                status TEXT, -- READY_TO_BUY, READY_TO_SELL, etc.
-                stock_on_hand REAL DEFAULT 0.0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (bot_id, price)
-            )
-        """)
-
-        # 5. Trade History Table (New)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS trade_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bot_id INTEGER,
-                order_id TEXT,
-                pair TEXT,
-                side TEXT,
-                price REAL,
-                quantity REAL,
-                fee_amount REAL,
-                fee_currency TEXT,
-                realized_pnl REAL,
-                executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 4. Bot Balances Table (New)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS bot_balances (
-                bot_id INTEGER PRIMARY KEY,
-                fiat_balance REAL,
-                crypto_balance REAL,
-                reserve_amount REAL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Robust Migration for bot_balances
-        cursor.execute("PRAGMA table_info(bot_balances)")
-        balance_columns = [info[1] for info in cursor.fetchall()]
-
-        if "reserve_amount" not in balance_columns:
-            try:
-                cursor.execute("ALTER TABLE bot_balances ADD COLUMN reserve_amount REAL DEFAULT 0.0")
-                self.logger.info("🔄 DB: Migrated bot_balances table - Added 'reserve_amount'")
-            except Exception as e:
-                self.logger.error(f"Failed to add reserve_amount column: {e}")
-
-        if "updated_at" not in balance_columns:
-            try:
-                # SQLite limitation: ALTER TABLE ADD COLUMN cannot have non-constant default like CURRENT_TIMESTAMP
-                # We add it as NULLable (default NULL) since we explicitly set it on INSERT/UPDATE anyway.
-                cursor.execute("ALTER TABLE bot_balances ADD COLUMN updated_at TIMESTAMP")
-                self.logger.info("🔄 DB: Migrated bot_balances table - Added 'updated_at'")
-            except Exception as e:
-                self.logger.error(f"Failed to add updated_at column: {e}")
-
-        # Schema Migration: Add stock_on_hand to grid_levels if missing
-        cursor.execute("PRAGMA table_info(grid_levels)")
-        grid_columns = [info[1] for info in cursor.fetchall()]
-        if "stock_on_hand" not in grid_columns:
-            try:
-                cursor.execute("ALTER TABLE grid_levels ADD COLUMN stock_on_hand REAL DEFAULT 0.0")
-                self.logger.info("🔄 DB: Migrated grid_levels table - Added 'stock_on_hand'")
-            except Exception as e:
-                self.logger.error(f"Failed to add stock_on_hand to grid_levels: {e}")
-
-        conn.commit()
-        conn.close()
-
-    def add_order(self, bot_id: int, order_id: str, price: float, side: str, quantity: float):
-        """Saves a new active order to the DB."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    async def connect(self):
+        """Initializes the connection pool and creates tables."""
         try:
-            cursor.execute(
+            self.pool = await asyncpg.create_pool(dsn=self.db_url)
+            self.logger.info("✅ Connected to PostgreSQL Database")
+            await self._init_db()
+        except Exception as e:
+            self.logger.critical(f"❌ Failed to connect to PostgreSQL: {e}")
+            raise
+
+    async def close(self):
+        """Closes the connection pool."""
+        if self.pool:
+            await self.pool.close()
+            self.logger.info("Database connection closed.")
+
+    async def _init_db(self):
+        """Initialize the database tables if they don't exist."""
+        try:
+            async with self.pool.acquire() as conn:
+                # 1. Bots Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS bots (
+                        bot_id BIGINT PRIMARY KEY,
+                        status TEXT DEFAULT 'STOPPED',
+                        config_json TEXT,
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                """)
+
+                # 2. System Logs Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS system_logs (
+                        id SERIAL PRIMARY KEY,
+                        bot_id BIGINT,
+                        severity TEXT,
+                        message TEXT,
+                        fix_action TEXT,
+                        timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                """)
+
+                # 3. Grid Orders Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS grid_orders (
+                        bot_id BIGINT,
+                        order_id TEXT PRIMARY KEY,
+                        price DOUBLE PRECISION,
+                        side TEXT,
+                        quantity DOUBLE PRECISION,
+                        status TEXT,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                """)
+
+                # 3b. Grid Levels Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS grid_levels (
+                        bot_id BIGINT,
+                        price DOUBLE PRECISION,
+                        status TEXT,
+                        stock_on_hand DOUBLE PRECISION DEFAULT 0.0,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        PRIMARY KEY (bot_id, price)
+                    )
+                """)
+
+                # 4. Trade History Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS trade_history (
+                        id SERIAL PRIMARY KEY,
+                        bot_id BIGINT,
+                        order_id TEXT,
+                        pair TEXT,
+                        side TEXT,
+                        price DOUBLE PRECISION,
+                        quantity DOUBLE PRECISION,
+                        fee_amount DOUBLE PRECISION,
+                        fee_currency TEXT,
+                        realized_pnl DOUBLE PRECISION,
+                        executed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                """)
+
+                # 5. Bot Balances Table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_balances (
+                        bot_id BIGINT PRIMARY KEY,
+                        fiat_balance DOUBLE PRECISION,
+                        crypto_balance DOUBLE PRECISION,
+                        reserve_amount DOUBLE PRECISION DEFAULT 0.0,
+                        updated_at TIMESTAMP WITH TIME ZONE
+                    )
+                """)
+
+                self.logger.info("✅ Database tables verified/initialized")
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize DB schema: {e}")
+            raise
+
+    async def add_order(self, bot_id: int, order_id: str, price: float, side: str, quantity: float):
+        """Saves a new active order to the DB."""
+        try:
+            await self.pool.execute(
                 """
                 INSERT INTO grid_orders (bot_id, order_id, price, side, quantity, status)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES ($1, $2, $3, $4, $5, 'OPEN')
             """,
-                (bot_id, order_id, price, side, quantity, "OPEN"),
+                bot_id,
+                order_id,
+                price,
+                side,
+                quantity,
             )
-            conn.commit()
             self.logger.info(f"💾 DB: Saved {side} order {order_id} at {price}")
         except Exception as e:
             self.logger.error(f"Failed to save order to DB: {e}")
-        finally:
-            conn.close()
 
-    def update_order_status(self, order_id: str, new_status: str):
+    async def update_order_status(self, order_id: str, new_status: str):
         """Updates an order status (e.g. OPEN -> CLOSED)."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE grid_orders 
-            SET status = ?, updated_at = CURRENT_TIMESTAMP 
-            WHERE order_id = ?
-        """,
-            (new_status, order_id),
-        )
-        conn.commit()
-        conn.close()
-
-    def get_active_order_at_price(self, bot_id: int, price: float, tolerance: float = 0.001):
-        """
-        Checks if we ALREADY have an open order at this price.
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # Get all open orders for this bot
-        cursor.execute('SELECT order_id, price, side FROM grid_orders WHERE bot_id = ? AND status = "OPEN"', (bot_id,))
-        rows = cursor.fetchall()
-        conn.close()
-
-        # Check with tolerance (handling floating point math)
-        for row in rows:
-            db_order_id, db_price, db_side = row
-            if abs(db_price - price) < tolerance:
-                return {"order_id": db_order_id, "price": db_price, "side": db_side}
-
-        return None
-
-    def get_order(self, order_id: str):
-        """
-        Retrieves a specific order by its ID.
-        """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM grid_orders WHERE order_id = ?", (order_id,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            return dict(row)
-        return None
-
-    def get_all_active_orders(self, bot_id: int):
-        """Returns map of active orders for initialization."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            'SELECT order_id, price, side, quantity FROM grid_orders WHERE bot_id = ? AND status = "OPEN"', (bot_id,)
-        )
-        rows = cursor.fetchall()
-        conn.close()
-
-        # Return dict keyed by Order ID
-        return {row[0]: {"price": row[1], "side": row[2], "amount": row[3]} for row in rows}
-
-    def clear_all_orders(self, bot_id: int):
-        """Deletes ALL open orders for a specific bot (Clean Start)."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
         try:
-            cursor.execute("DELETE FROM grid_orders WHERE bot_id = ?", (bot_id,))
-            conn.commit()
+            await self.pool.execute(
+                """
+                UPDATE grid_orders 
+                SET status = $1, updated_at = NOW() 
+                WHERE order_id = $2
+            """,
+                new_status,
+                order_id,
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to update order status: {e}")
+
+    async def get_active_order_at_price(self, bot_id: int, price: float, tolerance: float = 0.001):
+        """Checks if we ALREADY have an open order at this price."""
+        try:
+            rows = await self.pool.fetch(
+                """
+                SELECT order_id, price, side FROM grid_orders 
+                WHERE bot_id = $1 AND status = 'OPEN'
+            """,
+                bot_id,
+            )
+
+            for row in rows:
+                db_price = row["price"]
+                if abs(db_price - price) < tolerance:
+                    return {"order_id": row["order_id"], "price": row["price"], "side": row["side"]}
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to check active order: {e}")
+            return None
+
+    async def get_order(self, order_id: str):
+        """Retrieves a specific order by its ID."""
+        try:
+            row = await self.pool.fetchrow("SELECT * FROM grid_orders WHERE order_id = $1", order_id)
+            return dict(row) if row else None
+        except Exception as e:
+            self.logger.error(f"Failed to get order: {e}")
+            return None
+
+    async def get_all_active_orders(self, bot_id: int):
+        """Returns map of active orders for initialization."""
+        try:
+            rows = await self.pool.fetch(
+                """
+                SELECT order_id, price, side, quantity FROM grid_orders 
+                WHERE bot_id = $1 AND status = 'OPEN'
+            """,
+                bot_id,
+            )
+
+            # Return dict keyed by Order ID
+            return {
+                row["order_id"]: {"price": row["price"], "side": row["side"], "amount": row["quantity"]} for row in rows
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to get all active orders: {e}")
+            return {}
+
+    async def clear_all_orders(self, bot_id: int):
+        """Deletes ALL open orders for a specific bot (Clean Start)."""
+        try:
+            await self.pool.execute("DELETE FROM grid_orders WHERE bot_id = $1", bot_id)
             self.logger.info(f"🧹 DB: Cleared all orders for Bot {bot_id}")
         except Exception as e:
             self.logger.error(f"Failed to clear DB orders: {e}")
-        finally:
-            conn.close()
 
     # --- Bot Status Persistence ---
-    def update_bot_status(self, bot_id: int, status: str, config_json: str | None = None):
-        """
-        Updates the persistent status of a bot.
-        Optionally updates config_json (used on Start).
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    async def update_bot_status(self, bot_id: int, status: str, config_json: str | None = None):
+        """Updates the persistent status of a bot."""
         try:
             if config_json:
-                cursor.execute(
+                await self.pool.execute(
                     """
                     INSERT INTO bots (bot_id, status, config_json, updated_at) 
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES ($1, $2, $3, NOW())
                     ON CONFLICT(bot_id) DO UPDATE SET 
-                        status=excluded.status, 
-                        config_json=excluded.config_json,
-                        updated_at=CURRENT_TIMESTAMP
+                        status=EXCLUDED.status, 
+                        config_json=EXCLUDED.config_json,
+                        updated_at=NOW()
                 """,
-                    (bot_id, status, config_json),
+                    bot_id,
+                    status,
+                    config_json,
                 )
             else:
-                cursor.execute(
+                await self.pool.execute(
                     """
                     INSERT INTO bots (bot_id, status, updated_at) 
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    VALUES ($1, $2, NOW())
                     ON CONFLICT(bot_id) DO UPDATE SET 
-                        status=excluded.status, 
-                        updated_at=CURRENT_TIMESTAMP
+                        status=EXCLUDED.status, 
+                        updated_at=NOW()
                 """,
-                    (bot_id, status),
+                    bot_id,
+                    status,
                 )
 
-            conn.commit()
             self.logger.info(f"🔄 DB: Bot {bot_id} status updated to {status}")
         except Exception as e:
             self.logger.error(f"Failed to update bot status: {e}")
-        finally:
-            conn.close()
 
-    def get_bot_status(self, bot_id: int) -> str:
+    async def get_bot_status(self, bot_id: int) -> str:
         """Returns the persistent status of a bot (e.g. RUNNING, STOPPED)."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT status FROM bots WHERE bot_id = ?", (bot_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else "STOPPED"
-
-    def get_bot_config(self, bot_id: int) -> str | None:
-        """Returns the persistent config JSON of a bot."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT config_json FROM bots WHERE bot_id = ?", (bot_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else None
-
-    # --- Bot Balances Persistence (New) ---
-    def _repair_schema(self, missing_column: str = None):
-        """Attempts to repair schema if columns are missing or PK is invalid."""
-        self.logger.warning(f"🔧 DB: Attempting schema repair. Detected issue: {missing_column}")
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
         try:
-            # 1. Check if bot_id is Primary Key
-            cursor.execute("PRAGMA table_info(bot_balances)")
-            columns = cursor.fetchall()
-            # col format: (cid, name, type, notnull, dflt_value, pk)
-            bot_id_pk = False
-            for col in columns:
-                if col[1] == "bot_id" and col[5] >= 1:  # pk > 0 means it is a PK
-                    bot_id_pk = True
-                    break
-
-            if not bot_id_pk:
-                self.logger.warning("️⚠️ DB: 'bot_balances' table missing Primary Key on bot_id. Recreating table...")
-                cursor.execute("DROP TABLE IF EXISTS bot_balances")
-                cursor.execute("""
-                    CREATE TABLE bot_balances (
-                        bot_id INTEGER PRIMARY KEY,
-                        fiat_balance REAL,
-                        crypto_balance REAL,
-                        reserve_amount REAL DEFAULT 0.0,
-                        updated_at TIMESTAMP
-                    )
-                """)
-                self.logger.info("✅ DB: Recreated 'bot_balances' with correct schema.")
-                conn.commit()
-                return  # Table recreated, no need to add columns
-
-            # 2. Check for missing columns (if table wasn't dropped)
-            existing_col_names = [col[1] for col in columns]
-
-            # Force add columns if they are suspected missing
-            columns_to_check = [("reserve_amount", "REAL DEFAULT 0.0"), ("updated_at", "TIMESTAMP")]
-
-            for col, type_def in columns_to_check:
-                if col not in existing_col_names:
-                    try:
-                        cursor.execute(f"ALTER TABLE bot_balances ADD COLUMN {col} {type_def}")
-                        self.logger.info(f"🔧 DB: Repaired schema - Added '{col}'")
-                    except sqlite3.OperationalError:
-                        pass
-            conn.commit()
+            val = await self.pool.fetchval("SELECT status FROM bots WHERE bot_id = $1", bot_id)
+            return val if val else "STOPPED"
         except Exception as e:
-            self.logger.error(f"Failed to repair schema: {e}")
-        finally:
-            conn.close()
+            self.logger.error(f"Failed to get bot status: {e}")
+            return "STOPPED"
 
-    def update_balances(self, bot_id: int, fiat: float, crypto: float, reserve: float):
-        """Upserts the bot's known balances."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    async def get_bot_config(self, bot_id: int) -> str | None:
+        """Returns the persistent config JSON of a bot."""
         try:
-            cursor.execute(
+            val = await self.pool.fetchval("SELECT config_json FROM bots WHERE bot_id = $1", bot_id)
+            return val
+        except Exception as e:
+            self.logger.error(f"Failed to get bot config: {e}")
+            return None
+
+    # --- Bot Balances Persistence ---
+    async def update_balances(self, bot_id: int, fiat: float, crypto: float, reserve: float):
+        """Upserts the bot's known balances."""
+        try:
+            await self.pool.execute(
                 """
                 INSERT INTO bot_balances (bot_id, fiat_balance, crypto_balance, reserve_amount, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES ($1, $2, $3, $4, NOW())
                 ON CONFLICT(bot_id) DO UPDATE SET
-                    fiat_balance=excluded.fiat_balance,
-                    crypto_balance=excluded.crypto_balance,
-                    reserve_amount=excluded.reserve_amount,
-                    updated_at=CURRENT_TIMESTAMP
+                    fiat_balance=EXCLUDED.fiat_balance,
+                    crypto_balance=EXCLUDED.crypto_balance,
+                    reserve_amount=EXCLUDED.reserve_amount,
+                    updated_at=NOW()
             """,
-                (bot_id, fiat, crypto, reserve),
+                bot_id,
+                fiat,
+                crypto,
+                reserve,
             )
-            conn.commit()
-        except sqlite3.OperationalError as e:
-            err_msg = str(e).lower()
-            if "no column" in err_msg or "on conflict" in err_msg or "constraint" in err_msg:
-                self.logger.warning(f"⚠️ DB Schema Mismatch/Corruption detected: {e}. Triggering repair/recreation...")
-                conn.close()  # Close current connection before repair
-                self._repair_schema()
-                # Use recursive call to retry once.
-                return self.update_balances(bot_id, fiat, crypto, reserve)
-            else:
-                self.logger.error(f"Failed to update balances (OperationalError): {e}")
         except Exception as e:
             self.logger.error(f"Failed to update balances: {e}")
-        finally:
-            # Only close if not already closed/retried
-            try:
-                conn.close()
-            except:
-                pass
 
-    def get_balances(self, bot_id: int):
+    async def get_balances(self, bot_id: int):
         """Returns the last saved balances: (fiat, crypto, reserve) or None."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM bot_balances WHERE bot_id = ?", (bot_id,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            return dict(row)
-        return None
+        try:
+            row = await self.pool.fetchrow("SELECT * FROM bot_balances WHERE bot_id = $1", bot_id)
+            return dict(row) if row else None
+        except Exception as e:
+            self.logger.error(f"Failed to get balances: {e}")
+            return None
 
     # --- System Logs Methods ---
-    def log_event(self, bot_id: int, severity: str, message: str, fix_action: str = None):
+    async def log_event(self, bot_id: int, severity: str, message: str, fix_action: str = None):
         """Inserts a structured log event."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
         try:
-            cursor.execute(
+            await self.pool.execute(
                 """
                 INSERT INTO system_logs (bot_id, severity, message, fix_action)
-                VALUES (?, ?, ?, ?)
+                VALUES ($1, $2, $3, $4)
             """,
-                (bot_id, severity, message, fix_action),
+                bot_id,
+                severity,
+                message,
+                fix_action,
             )
-            conn.commit()
         except Exception as e:
-            # Fallback to standard logging if DB fails
-            # Avoid using self.logger.error here as it might trigger recursion if this IS the db logger
             print(f"CRITICAL: Failed to write to DB Log: {e}")
-        finally:
-            conn.close()
 
-    def get_logs(self, bot_id: int, limit: int = 50):
+    async def get_logs(self, bot_id: int, limit: int = 50):
         """Retrieves recent logs for a bot."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT * FROM system_logs 
-            WHERE bot_id = ? 
-            ORDER BY timestamp DESC 
-            LIMIT ?
-        """,
-            (bot_id, limit),
-        )
-        rows = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        return rows
+        try:
+            rows = await self.pool.fetch(
+                """
+                SELECT * FROM system_logs 
+                WHERE bot_id = $1 
+                ORDER BY timestamp DESC 
+                LIMIT $2
+            """,
+                bot_id,
+                limit,
+            )
+
+            # Convert timestamp to ISO format string for JSON serialization
+            results = []
+            for row in rows:
+                d = dict(row)
+                if isinstance(d.get("timestamp"), datetime):
+                    d["timestamp"] = d["timestamp"].isoformat()
+                results.append(d)
+            return results
+        except Exception as e:
+            self.logger.error(f"Failed to get logs: {e}")
+            return []
 
     # --- Trade History Methods ---
-    def add_trade_history(self, trade_data: dict):
-        """
-        Saves a finalized trade to history.
-        Expected keys: bot_id, order_id, pair, side, price, quantity, fee_amount, fee_currency, realized_pnl
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    async def add_trade_history(self, trade_data: dict):
+        """Saves a finalized trade to history."""
         try:
-            cursor.execute(
+            await self.pool.execute(
                 """
                 INSERT INTO trade_history (
                     bot_id, order_id, pair, side, price, quantity, 
                     fee_amount, fee_currency, realized_pnl
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             """,
-                (
-                    trade_data["bot_id"],
-                    trade_data["order_id"],
-                    trade_data["pair"],
-                    trade_data["side"],
-                    trade_data["price"],
-                    trade_data["quantity"],
-                    trade_data.get("fee_amount", 0.0),
-                    trade_data.get("fee_currency", "USDT"),
-                    trade_data.get("realized_pnl", 0.0),
-                ),
+                trade_data["bot_id"],
+                trade_data["order_id"],
+                trade_data["pair"],
+                trade_data["side"],
+                trade_data["price"],
+                trade_data["quantity"],
+                trade_data.get("fee_amount", 0.0),
+                trade_data.get("fee_currency", "USDT"),
+                trade_data.get("realized_pnl", 0.0),
             )
-            conn.commit()
             self.logger.info(f"📜 DB: Recorded trade {trade_data['order_id']}")
         except Exception as e:
             self.logger.error(f"Failed to save trade history: {e}")
-        finally:
-            conn.close()
 
-    def get_trade_history(self, bot_id: int, limit: int = 50):
+    async def get_trade_history(self, bot_id: int, limit: int = 50):
         """Retrieves verified trade history."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT * FROM trade_history 
-            WHERE bot_id = ? 
-            ORDER BY executed_at DESC 
-            LIMIT ?
-        """,
-            (bot_id, limit),
-        )
-        rows = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        return rows
+        try:
+            rows = await self.pool.fetch(
+                """
+                SELECT * FROM trade_history 
+                WHERE bot_id = $1 
+                ORDER BY executed_at DESC 
+                LIMIT $2
+            """,
+                bot_id,
+                limit,
+            )
 
-    def get_active_bots(self):
+            results = []
+            for row in rows:
+                d = dict(row)
+                if isinstance(d.get("executed_at"), datetime):
+                    d["executed_at"] = d["executed_at"].isoformat()
+                results.append(d)
+            return results
+        except Exception as e:
+            self.logger.error(f"Failed to get trade history: {e}")
+            return []
+
+    async def get_active_bots(self):
         """Retrieve all bots with status 'RUNNING'."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT bot_id, status, config_json, updated_at FROM bots WHERE status = 'RUNNING'")
-        rows = cursor.fetchall()
-        conn.close()
-        return rows
+        try:
+            rows = await self.pool.fetch("""
+                SELECT bot_id, status, config_json, updated_at 
+                FROM bots WHERE status = 'RUNNING'
+            """)
+            return [dict(row) for row in rows]
+        except Exception as e:
+            self.logger.error(f"Failed to get active bots: {e}")
+            return []
 
     # --- Grid Level Persistence (Infinite Grid) ---
-    def add_grid_level(self, bot_id: int, price: float, status: str, stock_on_hand: float = 0.0):
-        """
-        Inserts a new grid level into the database.
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    async def add_grid_level(self, bot_id: int, price: float, status: str, stock_on_hand: float = 0.0):
+        """Inserts a new grid level into the database."""
         try:
-            cursor.execute(
+            await self.pool.execute(
                 """
                 INSERT INTO grid_levels (bot_id, price, status, stock_on_hand, created_at, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES ($1, $2, $3, $4, NOW(), NOW())
                 ON CONFLICT(bot_id, price) DO UPDATE SET
-                    status=excluded.status,
-                    stock_on_hand=excluded.stock_on_hand,
-                    updated_at=CURRENT_TIMESTAMP
+                    status=EXCLUDED.status,
+                    stock_on_hand=EXCLUDED.stock_on_hand,
+                    updated_at=NOW()
             """,
-                (bot_id, price, status, stock_on_hand),
+                bot_id,
+                price,
+                status,
+                stock_on_hand,
             )
-            conn.commit()
-            # self.logger.debug(f"💾 DB: Added grid level {price} as {status}")
         except Exception as e:
             self.logger.error(f"Failed to add grid level {price}: {e}")
-        finally:
-            conn.close()
 
-    def update_grid_level_status(self, bot_id: int, price: float, new_status: str):
-        """
-        Updates the status of an existing grid level.
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    async def update_grid_level_status(self, bot_id: int, price: float, new_status: str):
+        """Updates the status of an existing grid level."""
         try:
-            cursor.execute(
+            await self.pool.execute(
                 """
                 UPDATE grid_levels
-                SET status = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE bot_id = ? AND price = ?
+                SET status = $1, updated_at = NOW()
+                WHERE bot_id = $2 AND price = $3
             """,
-                (new_status, bot_id, price),
+                new_status,
+                bot_id,
+                price,
             )
-            conn.commit()
-            # self.logger.debug(f"💾 DB: Updated grid level {price} to {new_status}")
         except Exception as e:
             self.logger.error(f"Failed to update grid level {price}: {e}")
-        finally:
-            conn.close()
 
-    def update_grid_stock(self, bot_id: int, price: float, stock_on_hand: float):
-        """
-        Updates the stock_on_hand for a grid level.
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    async def update_grid_stock(self, bot_id: int, price: float, stock_on_hand: float):
+        """Updates the stock_on_hand for a grid level."""
         try:
-            cursor.execute(
+            await self.pool.execute(
                 """
                 UPDATE grid_levels
-                SET stock_on_hand = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE bot_id = ? AND price = ?
+                SET stock_on_hand = $1, updated_at = NOW()
+                WHERE bot_id = $2 AND price = $3
             """,
-                (stock_on_hand, bot_id, price),
+                stock_on_hand,
+                bot_id,
+                price,
             )
-            conn.commit()
             self.logger.info(f"💾 DB: Updated stock for {price} to {stock_on_hand:.6f}")
         except Exception as e:
             self.logger.error(f"Failed to update stock for {price}: {e}")
-        finally:
-            conn.close()
 
-    def delete_grid_level(self, bot_id: int, price: float):
-        """
-        Removes a grid level from the database (Infinite Grid trailing).
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    async def delete_grid_level(self, bot_id: int, price: float):
+        """Removes a grid level from the database."""
         try:
-            cursor.execute(
-                "DELETE FROM grid_levels WHERE bot_id = ? AND price = ?",
-                (bot_id, price),
-            )
-            conn.commit()
+            await self.pool.execute("DELETE FROM grid_levels WHERE bot_id = $1 AND price = $2", bot_id, price)
             self.logger.info(f"💾 DB: Removed grid level {price}")
         except Exception as e:
             self.logger.error(f"Failed to delete grid level {price}: {e}")
-        finally:
-            conn.close()
 
-    def get_grid_levels(self, bot_id: int):
-        """
-        Retrieves all grid levels for this bot.
-        Returns a dict: {price: {"status": status, "stock": stock_on_hand}}
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT price, status, stock_on_hand FROM grid_levels WHERE bot_id = ?", (bot_id,))
-        rows = cursor.fetchall()
-        conn.close()
-        # Return enriched dict
-        return {row[0]: {"status": row[1], "stock": row[2] if row[2] is not None else 0.0} for row in rows}
+    async def get_grid_levels(self, bot_id: int):
+        """Retrieves all grid levels for this bot."""
+        try:
+            rows = await self.pool.fetch(
+                "SELECT price, status, stock_on_hand FROM grid_levels WHERE bot_id = $1", bot_id
+            )
+            return {
+                row["price"]: {
+                    "status": row["status"],
+                    "stock": row["stock_on_hand"] if row["stock_on_hand"] is not None else 0.0,
+                }
+                for row in rows
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to get grid levels: {e}")
+            return {}

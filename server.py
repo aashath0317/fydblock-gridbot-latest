@@ -238,16 +238,13 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Server starting up...")
 
+    # Connect to DB
+    await db.connect()
+
     # Start Solvency Monitor
     asyncio.create_task(solvency_check_loop())
 
-    # Global db is already initialized
-
     # Resume active bots
-
-    # Resume active bots
-    # Resume active bots
-    # We call the specialized recovery function that handles Hot Boot recreation from config_json
     await recover_active_bots()
 
     yield
@@ -263,6 +260,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Error stopping bot {bot_id}: {e}")
 
+    await db.close()
     logger.info("All bots paused.")
 
 
@@ -272,18 +270,13 @@ async def recover_active_bots():
     Restarts them in Hot Boot mode (reconcile orders, don't cancel).
     """
     try:
-        import sqlite3
-
-        conn = sqlite3.connect(db.db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT bot_id, config_json FROM bots WHERE status = 'RUNNING'")
-        rows = cursor.fetchall()
+        rows = await db.get_active_bots()
 
         if rows:
             logger.info(f"🔥 Found {len(rows)} bots to recover.")
             for row in rows:
-                bot_id = row[0]
-                config_json = row[1]
+                bot_id = row["bot_id"]
+                config_json = row["config_json"]
 
                 if not config_json:
                     logger.warning(
@@ -320,11 +313,10 @@ async def recover_active_bots():
 
                 except Exception as e:
                     logger.error(f"Failed to recover Bot {bot_id}: {e}")
-                    db.update_bot_status(bot_id, "CRASHED")
+                    await db.update_bot_status(bot_id, "CRASHED")
 
         else:
             logger.info("✅ No active bots found.")
-        conn.close()
     except Exception as e:
         logger.error(f"Failed to recover bots: {e}")
 
@@ -392,7 +384,7 @@ async def start_bot(req: BotRequest):
     try:
         # Check if this is a Hot Boot (was previously RUNNING)
         # We also recover interrupted STARTING attempts
-        prev_status = db.get_bot_status(req.bot_id)
+        prev_status = await db.get_bot_status(req.bot_id)
         is_hot_boot = prev_status in ["RUNNING", "STARTING"]
 
         if is_hot_boot:
@@ -418,7 +410,7 @@ async def start_bot(req: BotRequest):
         # Update DB Status to STARTING (Loading State)
         # We start as STARTING. The Bot itself will flip to RUNNING once orders are placed.
         # However, we preserve the config locking.
-        db.update_bot_status(req.bot_id, "STARTING", config_json=json.dumps(config_dict))
+        await db.update_bot_status(req.bot_id, "STARTING", config_json=json.dumps(config_dict))
 
         # Hack/Fix: Set a temporary attribute on the strategy instance.
         bot.strategy.use_hot_boot = is_hot_boot
@@ -431,7 +423,7 @@ async def start_bot(req: BotRequest):
 
     except Exception as e:
         logger.error(f"Failed to start bot {req.bot_id}: {e}", exc_info=True)
-        db.update_bot_status(req.bot_id, "CRASHED")
+        await db.update_bot_status(req.bot_id, "CRASHED")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -439,20 +431,20 @@ async def start_bot(req: BotRequest):
 async def stop_bot(bot_id: int):
     # Idempotency Check: If bot is not active, check if it exists in DB
     if bot_id not in active_instances:
-        status = db.get_bot_status(bot_id)
+        status = await db.get_bot_status(bot_id)
         if status in ["STOPPED", "CRASHED", "DELETED"]:
             return {"status": "already_stopped", "message": f"Bot {bot_id} is already {status}"}
 
         # If DB says RUNNING/STARTING but not in memory -> Zombie state
         # We force update to STOPPED to match reality
-        db.update_bot_status(bot_id, "STOPPED")
+        await db.update_bot_status(bot_id, "STOPPED")
         return {"status": "stopped", "message": f"Bot was zombie (DB={status}, Memory=None). Forced STOPPED."}
 
     instance = active_instances[bot_id]
     bot = instance["bot"]
 
     # 1. Update Status to STOPPING (Lock)
-    db.update_bot_status(bot_id, "STOPPING")
+    await db.update_bot_status(bot_id, "STOPPING")
 
     # 2. Trigger Strict Stop (No Liquidation by default on Stop)
     await bot._stop(sell_assets=False)
@@ -465,7 +457,7 @@ async def stop_bot(bot_id: int):
         logger.error(f"Error stopping bot {bot_id}: {e}")
 
     # 3. Finalize Status
-    db.update_bot_status(bot_id, "STOPPED")
+    await db.update_bot_status(bot_id, "STOPPED")
 
     del active_instances[bot_id]
     return {"status": "stopped"}
@@ -502,7 +494,7 @@ async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotReques
         instance = active_instances[bot_id]
         bot = instance["bot"]
 
-        db.update_bot_status(bot_id, "STOPPING")
+        await db.update_bot_status(bot_id, "STOPPING")
 
         logger.info(f"🗑️ Deleting Bot {bot_id} (Active, Liquidate/Nuclear={liquidate})...")
 
@@ -527,7 +519,7 @@ async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotReques
             logger.error(f"Error stopping/liquidating bot {bot_id}: {e}")
 
         del active_instances[bot_id]
-        db.update_bot_status(bot_id, "DELETED")
+        await db.update_bot_status(bot_id, "DELETED")
 
         # Cleanup Grid Orders
         try:
@@ -540,11 +532,11 @@ async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotReques
 
     else:
         # Inactive Bot
-        status = db.get_bot_status(bot_id)
+        status = await db.get_bot_status(bot_id)
         if status == "DELETED":
             return {"status": "already_deleted"}
 
-        db.update_bot_status(bot_id, "DELETED")
+        await db.update_bot_status(bot_id, "DELETED")
 
         liq_msg = "Skipped (No Creds)"
 
@@ -631,7 +623,7 @@ async def health_system():
 
 @app.get("/logs/{bot_id}")
 async def get_bot_logs(bot_id: int, limit: int = 50):
-    logs = db.get_logs(bot_id, limit)
+    logs = await db.get_logs(bot_id, limit)
     return {"logs": logs}
 
 
@@ -644,8 +636,6 @@ async def get_bot_stats(bot_id: int):
     Used by the Node.js backend to display dashboards.
     """
     try:
-        import sqlite3
-
         # 1. Initialize Response Structure
         stats = {
             "holdings": {
@@ -660,79 +650,79 @@ async def get_bot_stats(bot_id: int):
             "sparkline": [],
         }
 
-        conn = sqlite3.connect(db.db_path)
-        cursor = conn.cursor()
-
         # 2. Get Investment amount from bot config
-        cursor.execute("SELECT config_json FROM bots WHERE bot_id = ?", (bot_id,))
-        config_row = cursor.fetchone()
+        config_json = await db.get_bot_config(bot_id)
         investment = 0.0
-        if config_row and config_row[0]:
+        if config_json:
             try:
-                config = json.loads(config_row[0])
+                config = json.loads(config_json)
                 investment = float(config.get("investment", 0))
             except:
                 pass
 
         # 2b. Get Reserve from bot_balances
-        cursor.execute(
-            "SELECT fiat_balance, crypto_balance, reserve_amount FROM bot_balances WHERE bot_id = ?", (bot_id,)
-        )
-        bal_row = cursor.fetchone()
+        bal_row = await db.get_balances(bot_id)
         reserve = 0.0
         if bal_row:
-            stats["holdings"]["free_base"] = float(bal_row[1] or 0)
-            reserve = float(bal_row[2] or 0)
+            stats["holdings"]["free_base"] = float(bal_row.get("crypto_balance") or 0)
+            reserve = float(bal_row.get("reserve_amount") or 0)
             stats["holdings"]["reserve"] = reserve
+            # Also set free_quote from DB as fallback/base
+            stats["holdings"]["free_quote"] = float(bal_row.get("fiat_balance") or 0)
 
         # 3. Get Order Stats (FILLED and OPEN) for calculating correct FREE balance
-        # Formula: FREE = Investment - Reserve - BuyFilled + SellFilled - BuyOpen
-        cursor.execute(
-            """
-            SELECT side, status, SUM(quantity * price) as total
-            FROM grid_orders 
-            WHERE bot_id = ?
-            GROUP BY side, status
-        """,
-            (bot_id,),
-        )
-        order_stats = cursor.fetchall()
-
-        buy_filled = 0.0
-        sell_filled = 0.0
-        buy_open_total = 0.0
-
-        for side, status, total in order_stats:
-            total = float(total) if total else 0.0
-            if side.lower() == "buy" and status.upper() == "FILLED":
-                buy_filled = total
-            elif side.lower() == "sell" and status.upper() == "FILLED":
-                sell_filled = total
-            elif side.lower() == "buy" and status.upper() == "OPEN":
-                buy_open_total = total
-
-        # Calculate correct FREE balance from order history
-        if investment > 0:
-            correct_free = investment - reserve - buy_filled + sell_filled - buy_open_total
-            stats["holdings"]["free_quote"] = max(0.0, correct_free)
-            logger.debug(
-                f"Bot {bot_id} FREE calc: {investment} - {reserve} - {buy_filled} + {sell_filled} - {buy_open_total} = {correct_free}"
+        # Using direct pool query for aggregation
+        try:
+            # Formula: FREE = Investment - Reserve - BuyFilled + SellFilled - BuyOpen
+            rows = await db.pool.fetch(
+                """
+                SELECT side, status, SUM(quantity * price) as total
+                FROM grid_orders 
+                WHERE bot_id = $1
+                GROUP BY side, status
+            """,
+                bot_id,
             )
-        elif bal_row:
-            # Fallback to DB value if no investment config
-            stats["holdings"]["free_quote"] = float(bal_row[0] or 0)
+
+            buy_filled = 0.0
+            sell_filled = 0.0
+            buy_open_total = 0.0
+
+            for row in rows:
+                side = row["side"]
+                status = row["status"]
+                total = float(row["total"]) if row["total"] else 0.0
+
+                if side.lower() == "buy" and status.upper() == "FILLED":
+                    buy_filled = total
+                elif side.lower() == "sell" and status.upper() == "FILLED":
+                    sell_filled = total
+                elif side.lower() == "buy" and status.upper() == "OPEN":
+                    buy_open_total = total
+
+            # Calculate correct FREE balance from order history
+            # Note: This logic assumes 'investment' is the total started with.
+            if investment > 0:
+                correct_free = investment - reserve - buy_filled + sell_filled - buy_open_total
+                stats["holdings"]["free_quote"] = max(0.0, correct_free)
+        except Exception as e:
+            logger.error(f"Stats Aggregation Failed: {e}")
 
         # 3b. Get Locked Funds (grid_orders) & Order Counts
-        cursor.execute("SELECT side, quantity, price FROM grid_orders WHERE bot_id = ? AND status = 'OPEN'", (bot_id,))
-        orders = cursor.fetchall()
+        orders = await db.get_all_active_orders(bot_id)  # Returns dict: order_id -> {price, side, amount}
 
         buy_orders = 0
         sell_orders = 0
         grid_lines = []
 
-        for side, quantity, price in orders:
-            amt = float(quantity or 0)
-            prc = float(price or 0)
+        # We need raw list for stats, get_all_active_orders returns dict.
+        # Let's use get_all_active_orders or just query again. Querying again matches original logic better for lists.
+        # Actually, get_all_active_orders returns what we need.
+
+        for order_id, info in orders.items():
+            amt = float(info["amount"] or 0)
+            prc = float(info["price"] or 0)
+            side = info["side"]
 
             # Add to lines for chart
             grid_lines.append({"side": side, "price": prc, "qty": amt})
@@ -755,47 +745,43 @@ async def get_bot_stats(bot_id: int):
         }
 
         # 3.5 Get Execution History (Trades)
-        try:
-            cursor.execute(
-                "SELECT side, quantity, price, executed_at, fee_amount, fee_currency, realized_pnl, pair FROM trade_history WHERE bot_id = ? ORDER BY executed_at DESC LIMIT 50",
-                (bot_id,),
-            )
-            trades = cursor.fetchall()
-            stats["recent_trades"] = []
-            for t_side, t_qty, t_price, t_ts, t_fee, t_fee_curr, t_pnl, t_pair in trades:
-                # Fix UNKNOWN currency
-                final_fee_curr = t_fee_curr
-                if not final_fee_curr or final_fee_curr == "UNKNOWN":
-                    # Fallback to pair deduction
-                    if t_pair and "/" in t_pair:
-                        base, quote = t_pair.split("/")
-                        final_fee_curr = base if t_side == "buy" else quote
-                    else:
-                        final_fee_curr = "USDT"  # Ultimate fallback
+        trades = await db.get_trade_history(bot_id, limit=50)
+        stats["recent_trades"] = []
+        for t in trades:
+            t_side = t["side"]
+            t_qty = t["quantity"]
+            t_price = t["price"]
+            t_ts = t["executed_at"]  # Already ISO formatted by new BotDatabase
+            t_fee = t["fee_amount"]
+            t_fee_curr = t["fee_currency"]
+            t_pnl = t["realized_pnl"]
+            t_pair = t["pair"]
 
-                stats["recent_trades"].append(
-                    {
-                        "side": t_side,
-                        "qty": float(t_qty or 0),
-                        "price": float(t_price or 0),
-                        "timestamp": t_ts,
-                        "fee": float(t_fee or 0),
-                        "fee_currency": final_fee_curr,
-                        "profit": float(t_pnl or 0),
-                    }
-                )
-        except Exception as e:
-            logger.warning(f"Failed to fetch trades for bot {bot_id}: {e}")
-            stats["recent_trades"] = []
+            # Fix UNKNOWN currency
+            final_fee_curr = t_fee_curr
+            if not final_fee_curr or final_fee_curr == "UNKNOWN":
+                if t_pair and "/" in t_pair:
+                    base, quote = t_pair.split("/")
+                    final_fee_curr = base if t_side == "buy" else quote
+                else:
+                    final_fee_curr = "USDT"
+
+            stats["recent_trades"].append(
+                {
+                    "side": t_side,
+                    "qty": float(t_qty or 0),
+                    "price": float(t_price or 0),
+                    "timestamp": t_ts,
+                    "fee": float(t_fee or 0),
+                    "fee_currency": final_fee_curr,
+                    "profit": float(t_pnl or 0),
+                }
+            )
 
         # 4. Calculate Totals
         stats["holdings"]["base"] = stats["holdings"]["free_base"] + stats["holdings"]["locked_base"]
         stats["holdings"]["quote"] = stats["holdings"]["free_quote"] + stats["holdings"]["locked_quote"]
 
-        # 5. Sparkline is now handled by Backend (Postgres), so we return empty here
-        stats["sparkline"] = []
-
-        conn.close()
         return stats
 
     except Exception as e:

@@ -83,7 +83,7 @@ class GridTradingBot:
                 self.trading_mode,
             )
             order_execution_strategy = OrderExecutionStrategyFactory.create(self.config_manager, self.exchange_service)
-            grid_manager = GridManager(self.config_manager, strategy_type)
+            grid_manager = GridManager(self.config_manager, strategy_type, db=self.db)
             order_validator = OrderValidator()
             fee_calculator = FeeCalculator(self.config_manager)
 

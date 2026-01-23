@@ -6,6 +6,7 @@ from config.config_manager import ConfigManager
 from core.storage.bot_database import BotDatabase
 from strategies.spacing_type import SpacingType
 from strategies.strategy_type import StrategyType
+from typing import Any
 
 from ..order_handling.order import Order, OrderSide
 from .grid_level import GridCycleState, GridLevel
@@ -16,6 +17,7 @@ class GridManager:
         self,
         config_manager: ConfigManager,
         strategy_type: StrategyType,
+        db: Any = None,
     ):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.config_manager: ConfigManager = config_manager
@@ -23,7 +25,7 @@ class GridManager:
 
         # Inject bot_id if available in config, needed for DB persistence
         self.bot_id = self.config_manager.config.get("bot_id")
-        self.db = BotDatabase() if self.bot_id else None
+        self.db = db
         self.price_grids: list[float]
         self.central_price: float
         self.sorted_buy_grids: list[float]
@@ -588,9 +590,8 @@ class GridManager:
                     self.logger.info(f"   Cancelling lowest grid order at {lowest_grid_price}...")
                     await cancel_order_callback(lowest_grid_level)
 
-                # B) Remove from DB
                 if self.db and self.bot_id:
-                    self.db.delete_grid_level(self.bot_id, lowest_grid_price)
+                    await self.db.delete_grid_level(self.bot_id, lowest_grid_price)
 
             # C) Shift Grid Structure (Remove Low, Add High)
             removed_price, new_top_price = self.extend_grid_up()
@@ -602,19 +603,21 @@ class GridManager:
             if prev_highest_grid in self.grid_levels:
                 self.grid_levels[prev_highest_grid].state = GridCycleState.READY_TO_BUY
                 if self.db and self.bot_id:
-                    self.db.update_grid_level_status(self.bot_id, prev_highest_grid, GridCycleState.READY_TO_BUY.value)
+                    await self.db.update_grid_level_status(
+                        self.bot_id, prev_highest_grid, GridCycleState.READY_TO_BUY.value
+                    )
 
             # 3. New Top Grid is READY_TO_SELL (Default from extend_grid_up)
             # Add to DB
             if self.db and self.bot_id:
-                self.db.add_grid_level(self.bot_id, new_top_price, GridCycleState.READY_TO_SELL.value)
+                await self.db.add_grid_level(self.bot_id, new_top_price, GridCycleState.READY_TO_SELL.value)
 
             # Update loop var
             highest_grid = new_top_price
 
             # Persist Config Range
             new_bottom = sorted(self.price_grids)[0]
-            self._update_and_persist_config(new_bottom, new_top_price)
+            await self._update_and_persist_config(new_bottom, new_top_price)
 
     async def trail_grid_down(self, current_price: float, available_balance: float = 0.0, cancel_order_callback=None):
         """
@@ -659,8 +662,11 @@ class GridManager:
 
                 # B) Mark as VIRTUAL_HOLD (Do NOT delete from DB, just update status)
                 highest_grid_level.state = GridCycleState.VIRTUAL_HOLD
+                highest_grid_level.state = GridCycleState.VIRTUAL_HOLD
                 if self.db and self.bot_id:
-                    self.db.update_grid_level_status(self.bot_id, highest_grid_price, GridCycleState.VIRTUAL_HOLD.value)
+                    await self.db.update_grid_level_status(
+                        self.bot_id, highest_grid_price, GridCycleState.VIRTUAL_HOLD.value
+                    )
                     self.logger.info(f"   MARKED {highest_grid_price} AS VIRTUAL_HOLD")
 
             # 3. Shift Grid Structure (Active Window)
@@ -674,8 +680,9 @@ class GridManager:
             self.grid_levels[new_bottom_price] = GridLevel(new_bottom_price, GridCycleState.READY_TO_BUY)
 
             # DB Add New Bottom
+            # DB Add New Bottom
             if self.db and self.bot_id:
-                self.db.add_grid_level(self.bot_id, new_bottom_price, GridCycleState.READY_TO_BUY.value)
+                await self.db.add_grid_level(self.bot_id, new_bottom_price, GridCycleState.READY_TO_BUY.value)
 
             # 4. Check if we are re-entering a previously Virtual Level?
             # (User Logic: "If Price rises back... Re-activate")
@@ -689,12 +696,12 @@ class GridManager:
 
             # Persist Config Range
             new_top_active = sorted_grids[-1]
-            self._update_and_persist_config(lowest_grid, new_top_active)
+            await self._update_and_persist_config(lowest_grid, new_top_active)
 
             # Decrement available balance simulation for the loop (approximate)
             available_balance -= needed_amount
 
-    def _update_and_persist_config(self, new_bottom: float, new_top: float):
+    async def _update_and_persist_config(self, new_bottom: float, new_top: float):
         """
         Updates the in-memory config and persists it to the DB.
         """
@@ -703,23 +710,16 @@ class GridManager:
         self.config_manager.config["grid_strategy"]["range"]["bottom"] = new_bottom
 
         # 2. Persist to DB
-        if hasattr(self, "bot_id") and self.bot_id:
-            # Need to access BotDatabase.
-            # GridManager doesn't natively have BotDatabase access in __init__,
-            # but OrderManager does. Or we can instantiate it purely for storage.
-            # Better: GridManager should perhaps rely on OrderManager?
-            # Or just allow GridManager to initiate a DB connection for this persistence event.
-            import json
+        if self.db and self.bot_id:
+            try:
+                import json
 
-            from core.storage.bot_database import BotDatabase
-
-            db = BotDatabase()
-
-            # serializing the FULL config might be heavy, but necessary.
-            # We assume self.config_manager.config is the dict structure we want to save.
-            config_json = json.dumps(self.config_manager.config)
-            db.update_bot_status(self.bot_id, "RUNNING", config_json)
-            self.logger.info("💾 Grid Configuration Persisted to DB.")
+                # serializing the FULL config might be heavy, but necessary.
+                config_json = json.dumps(self.config_manager.config)
+                await self.db.update_bot_status(self.bot_id, "RUNNING", config_json)
+                self.logger.info("💾 Grid Configuration Persisted to DB.")
+            except Exception as e:
+                self.logger.error(f"Failed to persist config: {e}")
 
     def calculate_next_price_up(self, current_highest: float) -> float:
         """Calculates the next grid price ABOVE the current highest."""

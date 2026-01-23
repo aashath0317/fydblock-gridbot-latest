@@ -54,15 +54,11 @@ class BalanceTracker:
         self.operational_reserve: float = 0.0  # Dynamic Fee Stabilization Reserve
         self._last_drift_warning_time = 0
 
-    def _persist_balances(self):
+    async def _persist_balances(self):
         """Saves current balance state to DB."""
         if self.db and self.bot_id:
             # We persist what we OWN (Total Fiat, Total Crypto, Reserve)
-            # Reserve usually refers to the 'Operational Reserve' (Fee Reserve), not locked order funds.
-            self.db.update_balances(self.bot_id, self.balance, self.crypto_balance, self.operational_reserve)
-
-        # REMOVED: Automatic subscription. OrderManager will call update manually to ensure sequence.
-        # self.event_bus.subscribe(Events.ORDER_FILLED, self._update_balance_on_order_completion)
+            await self.db.update_balances(self.bot_id, self.balance, self.crypto_balance, self.operational_reserve)
 
     async def setup_balances(
         self,
@@ -86,9 +82,9 @@ class BalanceTracker:
             f"{self.operational_reserve:.2f} {self.quote_currency} (Fee Reserve) / "
             f"{self.crypto_balance} {self.base_currency}"
         )
-        self._persist_balances()
+        await self._persist_balances()
 
-    def initialize_balances(self, fiat_balance: float, crypto_balance: float):
+    async def initialize_balances(self, fiat_balance: float, crypto_balance: float):
         """
         Manually initializes the balance state.
         Called by the Strategy during startup after validating real-world funds.
@@ -99,9 +95,9 @@ class BalanceTracker:
             f"✅ Balances synced with Wallet: {self.balance:.2f} {self.quote_currency}, "
             f"{self.crypto_balance} {self.base_currency}"
         )
-        self._persist_balances()
+        await self._persist_balances()
 
-    def load_persisted_balances(self) -> bool:
+    async def load_persisted_balances(self) -> bool:
         """
         Loads the last known balance state from the database.
         Returns True if successful, False otherwise.
@@ -110,7 +106,7 @@ class BalanceTracker:
             return False
 
         try:
-            saved = self.db.get_balances(self.bot_id)
+            saved = await self.db.get_balances(self.bot_id)
             if saved:
                 # { "fiat_balance": X, "crypto_balance": Y, "reserve_amount": Z }
                 self.balance = float(saved.get("fiat_balance", 0.0))
@@ -127,7 +123,7 @@ class BalanceTracker:
 
         return False
 
-    def attempt_fee_recovery(self, required_amount: float) -> bool:
+    async def attempt_fee_recovery(self, required_amount: float) -> bool:
         """
         Checks if the main balance is sufficient. If not, attempts to auto-heal
         using the Operational Reserve ("Dust Shortfall" logic).
@@ -143,7 +139,7 @@ class BalanceTracker:
             self.operational_reserve -= deficit
             self.balance += deficit
             self.logger.info(f"?? RESCUE: Auto-injected {deficit:.6f} from Operational Reserve to cover shortfall.")
-            self._persist_balances()
+            await self._persist_balances()
             return True
 
         return False
@@ -165,7 +161,7 @@ class BalanceTracker:
         # FIX: For Paper Trading, we must NOT overwrite with Real Wallet Balance
         # We should load from DB if available, or default to Investment amount if fresh.
         if self.trading_mode == TradingMode.PAPER_TRADING:
-            saved = self.db.get_balances(self.bot_id) if self.db else None
+            saved = await self.db.get_balances(self.bot_id) if self.db else None
             if saved:
                 # { "fiat_balance": X, "crypto_balance": Y, "reserve_amount": Z }
                 fiat = float(saved.get("fiat_balance", 0.0))
@@ -258,11 +254,11 @@ class BalanceTracker:
             (BUY/SELL), filled quantity, and price.
         """
         if order.side == OrderSide.BUY:
-            self._update_after_buy_order_filled(order.filled, order.price, order.fee)
+            await self._update_after_buy_order_filled(order.filled, order.price, order.fee)
         elif order.side == OrderSide.SELL:
-            self._update_after_sell_order_filled(order.filled, order.price)
+            await self._update_after_sell_order_filled(order.filled, order.price)
 
-    def _update_after_buy_order_filled(self, quantity: float, price: float, fee_data: dict | None = None) -> None:
+    async def _update_after_buy_order_filled(self, quantity: float, price: float, fee_data: dict | None = None) -> None:
         """
         Updates the balances after a buy order is completed.
         Handles fee deduction from either Reserve (Fiat) or Base (Crypto).
@@ -332,9 +328,9 @@ class BalanceTracker:
 
         self.total_fees += fee_in_quote + (fee_in_base * price)
         self.logger.info(f"Buy filled: +{net_crypto:.6f} {self.base_currency} (Gross: {quantity}, Fee: {fee_in_base}).")
-        self._persist_balances()
+        await self._persist_balances()
 
-    def _update_after_sell_order_filled(
+    async def _update_after_sell_order_filled(
         self,
         quantity: float,
         price: float,
@@ -366,9 +362,9 @@ class BalanceTracker:
         self.total_fees += fee
 
         self.logger.info(f"Sell order completed. Proceeds: {sale_proceeds:.4f} {self.quote_currency} added to balance.")
-        self._persist_balances()
+        await self._persist_balances()
 
-    def allocate_profit_to_reserve(self, amount: float) -> None:
+    async def allocate_profit_to_reserve(self, amount: float) -> None:
         """
         Allocates a specific amount of fiat profit to the operational reserve.
         Subject to a Cap: Stop allocating if Reserve >= 1% of Investment.
@@ -397,9 +393,9 @@ class BalanceTracker:
             self.logger.info(
                 f"🏦 Banked Profit: Moved {to_allocate:.4f} {self.quote_currency} to Reserve (Cap: {target_cap:.2f})."
             )
-            self._persist_balances()
+            await self._persist_balances()
 
-    def update_after_initial_purchase(self, initial_order: Order):
+    async def update_after_initial_purchase(self, initial_order: Order):
         """
         Updates balances after an initial crypto purchase.
 
@@ -419,9 +415,9 @@ class BalanceTracker:
             f"Updated balances. Crypto balance: {self.crypto_balance}, "
             f"Fiat balance: {self.balance}, Total fees: {self.total_fees}",
         )
-        self._persist_balances()
+        await self._persist_balances()
 
-    def reserve_funds_for_buy(
+    async def reserve_funds_for_buy(
         self,
         amount: float,
     ) -> None:
@@ -437,9 +433,9 @@ class BalanceTracker:
         self.reserved_fiat += amount
         self.balance -= amount
         self.logger.info(f"Reserved {amount} fiat for a buy order. Remaining fiat balance: {self.balance}.")
-        self._persist_balances()
+        await self._persist_balances()
 
-    def reserve_funds_for_sell(
+    async def reserve_funds_for_sell(
         self,
         quantity: float,
     ) -> None:
@@ -459,9 +455,9 @@ class BalanceTracker:
         self.logger.info(
             f"Reserved {quantity} crypto for a sell order. Remaining crypto balance: {self.crypto_balance}.",
         )
-        self._persist_balances()
+        await self._persist_balances()
 
-    def release_reserve_for_buy(self, amount: float) -> None:
+    async def release_reserve_for_buy(self, amount: float) -> None:
         """
         Releases reserved fiat when a buy order is cancelled.
 
@@ -474,9 +470,9 @@ class BalanceTracker:
         self.reserved_fiat -= amount_to_release
         self.balance += amount_to_release
         self.logger.info(f"Released {amount_to_release} fiat from reserve (Cancelled Buy). Balance: {self.balance}.")
-        self._persist_balances()
+        await self._persist_balances()
 
-    def release_reserve_for_sell(self, quantity: float) -> None:
+    async def release_reserve_for_sell(self, quantity: float) -> None:
         """
         Releases reserved crypto when a sell order is cancelled.
 
@@ -491,9 +487,9 @@ class BalanceTracker:
         self.logger.info(
             f"Released {qty_to_release} crypto from reserve (Cancelled Sell). Crypto Balance: {self.crypto_balance}."
         )
-        self._persist_balances()
+        await self._persist_balances()
 
-    def register_open_order(self, order: Order, deduct_from_balance: bool = True) -> None:
+    async def register_open_order(self, order: Order, deduct_from_balance: bool = True) -> None:
         """
         Registers an existing open order (e.g. from Hot Boot) with the tracker,
         moving funds from 'balance' to 'reserved'.
@@ -515,7 +511,7 @@ class BalanceTracker:
             self.logger.info(
                 f"Registered Open BUY {order.identifier}: Reserved {cost:.2f} {self.quote_currency} (Deducted: {deduct_from_balance})"
             )
-            self._persist_balances()
+            await self._persist_balances()
 
         elif order.side == OrderSide.SELL:
             amount = order.remaining
@@ -526,7 +522,7 @@ class BalanceTracker:
             self.logger.info(
                 f"Registered Open SELL {order.identifier}: Reserved {amount:.6f} {self.base_currency} (Deducted: {deduct_from_balance})"
             )
-            self._persist_balances()
+            await self._persist_balances()
 
     def get_adjusted_fiat_balance(self) -> float:
         """

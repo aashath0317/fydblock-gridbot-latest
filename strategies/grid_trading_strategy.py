@@ -200,7 +200,7 @@ class GridTradingStrategy(TradingStrategyInterface):
             # If Hot Boot (Resume), we RESTORE balances from DB (not reset to investment).
             if self.use_hot_boot:
                 # FIX: Load persisted balances from DB - this includes the correct FREE balance
-                if self.balance_tracker.load_persisted_balances():
+                if await self.balance_tracker.load_persisted_balances():
                     # Balances are now restored from DB - use them as-is
                     # The FREE balance is correct (what's left after orders were placed)
                     # The LOCKED balance is calculated from grid_orders in server.py
@@ -219,21 +219,17 @@ class GridTradingStrategy(TradingStrategyInterface):
                     self.logger.warning(
                         f"   🔥 Hot Boot: DB Load Failed. Starting fresh with {effective_fiat_balance} {quote_currency}"
                     )
-                    res = self.balance_tracker.setup_balances(
+                    res = await self.balance_tracker.setup_balances(
                         effective_fiat_balance, effective_crypto_balance, self.exchange_service
                     )
-                    if res is not None and hasattr(res, "__await__"):
-                        await res
             else:
                 # Clean Start - initialize with investment amount
                 effective_crypto_balance = 0.0
                 effective_fiat_balance = investment_amount
                 self.logger.info(f"   ✨ Clean Start: Initializing with {effective_fiat_balance} {quote_currency}")
-                res = self.balance_tracker.setup_balances(
+                res = await self.balance_tracker.setup_balances(
                     effective_fiat_balance, effective_crypto_balance, self.exchange_service
                 )
-                if res is not None and hasattr(res, "__await__"):
-                    await res
 
         except Exception as e:
             self.logger.error(f"Failed to refresh balances: {e}", exc_info=True)
@@ -394,13 +390,9 @@ class GridTradingStrategy(TradingStrategyInterface):
                     # OrderCancelled event might be too slow if we depend on WebSocket
                     if target_order.side == OrderSide.BUY:
                         cost = target_order.remaining * target_order.price
-                        self.balance_tracker.reserved_fiat = max(0, self.balance_tracker.reserved_fiat - cost)
-                        self.balance_tracker.balance += cost  # Add back to Free Fiat
+                        await self.balance_tracker.release_reserve_for_buy(cost)
                     else:
-                        self.balance_tracker.reserved_crypto = max(
-                            0, self.balance_tracker.reserved_crypto - target_order.remaining
-                        )
-                        self.balance_tracker.crypto_balance += target_order.remaining  # Add back to Free Crypto
+                        await self.balance_tracker.release_reserve_for_sell(target_order.remaining)
 
                     # Mark locally as Cancelled so we don't try again
                     target_order.status = "CANCELLED"
@@ -611,8 +603,7 @@ class GridTradingStrategy(TradingStrategyInterface):
 
                 # Manually Release Reserved Funds (Since OrderManager event doesn't do it)
                 cost = target_order.remaining * target_order.price
-                self.balance_tracker.reserved_fiat -= cost
-                self.balance_tracker.balance += cost
+                await self.balance_tracker.release_reserve_for_buy(cost)
                 self.logger.info(f"   Released {cost:.2f} reserved fiat.")
 
                 # Force status update locally (OrderManager event will eventually confirm)
@@ -654,8 +645,7 @@ class GridTradingStrategy(TradingStrategyInterface):
 
                 # Manually Release Reserved Funds
                 quantity_released = target_order.remaining
-                self.balance_tracker.reserved_crypto -= quantity_released
-                self.balance_tracker.crypto_balance += quantity_released
+                await self.balance_tracker.release_reserve_for_sell(quantity_released)
                 self.logger.info(f"   Released {quantity_released:.6f} reserved crypto.")
 
                 target_order.status = "CANCELLED"

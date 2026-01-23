@@ -291,7 +291,7 @@ class OrderManager:
                     # FIX: Sync with BalanceTracker
                     # deduct_from_balance=False because these funds are ALREADY locked on exchange
                     # and therefore missing from the 'free balance' we initialized with.
-                    self.balance_tracker.register_open_order(order_obj, deduct_from_balance=False)
+                    await self.balance_tracker.register_open_order(order_obj, deduct_from_balance=False)
                     matched_count += 1
 
             self.logger.info(f"✅ Resumed {matched_count} orders from Hot Boot.")
@@ -316,10 +316,10 @@ class OrderManager:
             # For BUY, we reserved (Price * Amount)
             # Use remaining amount to calculate what to release
             release_amount = order.remaining * order.price
-            self.balance_tracker.release_reserve_for_buy(release_amount)
+            await self.balance_tracker.release_reserve_for_buy(release_amount)
         elif order.side == OrderSide.SELL:
             # For SELL, we reserved (Amount) of crypto
-            self.balance_tracker.release_reserve_for_sell(order.remaining)
+            await self.balance_tracker.release_reserve_for_sell(order.remaining)
 
         await self.notification_handler.async_send_notification(
             NotificationType.ORDER_CANCELLED,
@@ -525,7 +525,7 @@ class OrderManager:
             reserve_amount = 0.0
             if net_profit > 0:
                 reserve_amount = net_profit * 0.10
-                self.balance_tracker.allocate_profit_to_reserve(reserve_amount)
+                await self.balance_tracker.allocate_profit_to_reserve(reserve_amount)
 
             self.logger.info(
                 f"💰 PROFIT SECURED: +{net_profit:.4f} {self.trading_pair.split('/')[1]} "
@@ -656,9 +656,9 @@ class OrderManager:
                     self.db.add_order(self.bot_id, order.identifier, price, side.value, order.amount)
 
                 if side == OrderSide.BUY:
-                    self.balance_tracker.reserve_funds_for_buy(order.amount * order.price)
+                    await self.balance_tracker.reserve_funds_for_buy(order.amount * order.price)
                 else:
-                    self.balance_tracker.reserve_funds_for_sell(order.amount)
+                    await self.balance_tracker.reserve_funds_for_sell(order.amount)
 
                 self.grid_manager.mark_order_pending(grid_level, order)
                 self.order_book.add_order(order, grid_level)
