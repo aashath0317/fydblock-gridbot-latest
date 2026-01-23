@@ -964,6 +964,9 @@ class OrderManager:
             raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
             required_fiat += raw_quantity * price
 
+        # FIX: Add 2% buffer to the fiat requirement to cover rounding/dust issues
+        required_fiat *= 1.02
+
         # 2. Sum up SELL requirements
         for price in self.grid_manager.sorted_sell_grids:
             if price <= safe_sell_limit:
@@ -971,6 +974,10 @@ class OrderManager:
 
             raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
             required_crypto += raw_quantity
+
+        # FIX: Add 2% buffer to the crypto requirement to cover rounding/dust issues
+        # This prevents the last sell order placement from failing after rebalancing.
+        required_crypto *= 1.02
 
         return required_fiat, required_crypto
 

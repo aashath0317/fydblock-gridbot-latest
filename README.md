@@ -1,226 +1,133 @@
 # Fydblock Spot Grid Trading Bot 🚀
 
-A high-performance, asynchronous cryptocurrency trading bot specializing in **Spot Grid Trading**. Built with Python (FastAPI) and CCXT, it features enterprise-grade security, real-time observability (Grafana/Loki), and a robust simulation engine.
+A high-performance, asynchronous cryptocurrency trading bot specializing in **Spot Grid Trading**. Built with Python 3.12 (FastAPI) and CCXT, it features enterprise-grade security, real-time observability (Grafana/Loki), and a robust simulation engine designed for high-frequency order management and resilient bot operations.
 
-## 🌟 Key Features
+---
 
-* **⚡ Asynchronous Core**: Powered by `asyncio` and `FastAPI` for non-blocking I/O, handling real-time WebSocket feeds and order updates simultaneously.
-* **🛡️ Resilient Order Management**:
-* **State Reconciliation**: Automatically detects and handles "vanished" orders via `OrderManager`.
-* **Strict Isolation**: Prevents "phantom orders" by ensuring database state matches exchange state.
+## 🏗️ Enterprise Core Features
 
+The Fydblock engine is designed for mission-critical trading with a focus on state integrity and financial safety.
 
-* **🔒 Enterprise Security**:
-* **AES Encryption**: API keys/secrets are encrypted at rest using `Fernet` before storage.
-* **Environment Isolation**: Critical secrets managed via `.env`.
+### 🛡️ Smart Recovery (Hot Boot)
+- **Zero-Downtime Recovery**: Automatically detects and resumes active bots after a system restart or crash.
+- **State Reconstruction**: Rebuilds internal grid levels and order history directly from the SQLite database and exchange state without cancelling open orders.
+- **Zombie Prevention**: Automatically cleans up and reconciles "vanished" or orphaned orders via a heartbeat watchdog.
 
+### 💰 Financial Integrity & Solvency
+- **Solvency Monitor**: A background auditor that ensures global exchange balances always match the total capital allocated across all active bots.
+- **Haircut Mechanism**: Proactively adjusts bot allocations if a deficit is detected (e.g., due to external manual withdrawals) to prevent execution failures.
+- **Operational Fee Reserve**: Automatically reserves **1% of initial capital** to stabilize fee execution and prevent "Dust Shortfall" errors.
+- **Profit Banking**: Dynamically allocates **10% of realized profits** to the fee reserve (capped at 1% of investment) to ensure sustainability during long-running sessions.
 
-* **🤖 Smart Auto-Tuner**:
-* **Reset Up**: Automatically resets the grid upwards if the price breaks the upper limit.
-* **Expand Down**: Intelligently lowers limits during market dips with configurable cooldowns.
+### 🔒 Enterprise Security
+- **At-Rest Encryption**: API keys and secrets are encrypted using `Fernet` (AES-128 in CBC mode) before persisting to the database.
+- **Strict Isolation**: Every order is tagged with a unique `clientOrderId` (CID) prefix, ensuring zero interference between multiple bots running on the same trading pair.
 
+---
 
-* **👁️ Observability & Monitoring**:
-* Full integration with **Grafana**, **Loki**, and **Promtail** for log aggregation and visualization.
-* Health stats endpoints.
+## 🤖 Advanced Trading Strategies
 
+Beyond simple grids, Fydblock implements sophisticated market-making logic.
 
-* **📊 Built-in Backtesting**: Simulation engine to verify strategies against historical data before going live.
+### ♾️ Infinity Grid (Dynamic Trailing)
+- **Trailing Up**: Automatically adjusts the grid range upwards during bullish breakouts, performing inventory re-buys to maintain market exposure.
+- **Trailing Down**: Lowers the grid during bearish trends, liquidating excess inventory to protect capital.
+- **Inventory Stabilization**: Implements precise coin tracking to handle exchange fees and "dust" accumulation during high-frequency flips.
+
+### ⚡ Smart Auto-Tuner
+- **Geometric vs. Arithmetic**: Supports both geometric (percentage-based) and arithmetic (fixed-step) spacing.
+- **Breakout Management**: Automatically resets or expands the grid if the price moves out of the predefined range.
+- **Dynamic Dead Zones**: Intelligently prevents order placement too close to the current market price to avoid "Instant Fill" slippage.
+
+---
+
+## 📊 Observability & Monitoring
+
+Enterprise-grade visibility into your bot's health and performance.
+
+- **Stack**: Fully Integrated **Grafana**, **Loki**, and **Promtail** (via Docker Compose).
+- **Log Aggregation**: Real-time log streaming with dedicated dashboards for bot events, order fills, and system errors.
+- **Performance Analytics**: 
+    - Real-time PnL tracking and equity curves.
+    - Historical trade history with precise fee and slippage breakdown.
+    - REST API endpoints for real-time holdings, stats, and "Sparkline" data.
 
 ---
 
 ## 🛠️ Technology Stack
 
-* **Core**: Python 3.12+
-* **Web Framework**: FastAPI, Uvicorn
-* **Database**: SQLite (Async/WAL mode) with SQLAlchemy
-* **Exchange**: CCXT (WebSockets + REST)
-* **Monitoring**: Grafana, Loki, Promtail (via Docker)
-* **Data Analysis**: Pandas, NumPy, Plotly
+* **Core**: Python 3.12+ (Asyncio)
+* **API Framework**: FastAPI & Uvicorn
+* **Database**: SQLite (WAL Mode) with SQLAlchemy Async
+* **Execution**: CCXT (Unified exchange interface with WebSocket support)
+* **Security**: Cryptography (Fernet)
+* **Data**: Pandas, NumPy (Performance analysis)
 
 ---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-
-* Python 3.12 or higher
-* Git
-* Docker & Docker Compose (optional, for monitoring)
+* Python 3.12+
+* Docker & Docker Compose (for monitoring)
 
 ### Installation
+1. **Clone & Setup**
+   ```bash
+   git clone https://github.com/yourusername/fydblock-grid-bot.git
+   cd fydblock-grid-bot
+   python -m venv venv
+   source venv/bin/activate  # Windows: venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
 
-1. **Clone the Repository**
-```bash
-git clone https://github.com/yourusername/fydblock-grid-bot.git
-cd fydblock-grid-bot
-
-```
-
-
-2. **Set up Virtual Environment**
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-```
-
-
-3. **Install Dependencies**
-```bash
-pip install -r requirements.txt
-
-```
-
-
-4. **Environment Configuration**
-Create a `.env` file in the root directory:
-```env
-# Database Configuration
-DB_URL=sqlite+aiosqlite:///grid_bot.db
-
-# Security (Generate a key using cryptography.fernet)
-ENCRYPTION_KEY=YOUR_GENERATED_FERNET_KEY
-
-# Monitoring (Optional)
-GRAFANA_ADMIN_USER=admin
-GRAFANA_ADMIN_PASSWORD=admin
-
-# Notifications (Optional - Apprise)
-APPRISE_NOTIFICATION_URLS=discord://webhook_id/webhook_token
-
-```
-
-
-*Tip: Generate a Fernet key with:*
-```python
-from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())
-
-```
-
-
+2. **Configuration**
+   Create a `.env` file:
+   ```env
+   DB_URL=sqlite+aiosqlite:///bot_data.db
+   ENCRYPTION_KEY=YOUR_FERNET_KEY # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+   GRAFANA_ADMIN_PASSWORD=admin
+   ```
 
 ---
 
-## 🏃 Running the Bot
+## 🏃 Operation
 
-### 1. Run the API Server (Live/Paper Trading)
-
-The server handles API requests to start/stop bots and manage state.
-
+### Run the Server
 ```bash
-uvicorn server:app --reload --host 0.0.0.0 --port 8000
-
+uvicorn server:app --host 0.0.0.0 --port 8000
 ```
+- **Interactive API**: [http://localhost:8000/docs](http://localhost:8000/docs)
 
-* **Swagger Docs**: `http://localhost:8000/docs`
-* **Health Check**: `http://localhost:8000/`
-
-### 2. Run with Monitoring Stack (Docker)
-
-To spin up Grafana, Loki, and Promtail for logs and dashboards:
-
+### Deployment with Monitoring
 ```bash
 docker-compose up -d
-
 ```
-
-* **Grafana Dashboard**: `http://localhost:3000` (Default login: defined in `.env`)
-
-### 3. Run Standalone (CLI)
-
-To run a specific configuration file directly without the API server:
-
-```bash
-python main.py --config config/config.json
-
-```
+- **Grafana**: `http://localhost:3000`
 
 ---
 
-## 🕹️ API Usage Guide
+## 🕹️ API Quick Start
 
-The bot is primarily controlled via REST API.
-
-### Start a Bot
-
-**POST** `/start`
-
+### Start Infinity Grid
 ```json
+// POST /start
 {
   "bot_id": 1,
-  "user_id": 101,
   "exchange": "binance",
-  "pair": "BTC/USDT",
-  "api_key": "YOUR_API_KEY",
-  "api_secret": "YOUR_SECRET",
-  "mode": "paper",
+  "pair": "SOL/USDT",
   "investment": 1000.0,
   "strategy": {
-    "upper_price": 60000,
-    "lower_price": 50000,
-    "grids": 10,
+    "upper_price": 120.0,
+    "lower_price": 80.0,
+    "grids": 20,
+    "trailing_up": true,
     "spacing": "geometric"
   }
 }
-
-```
-
-### Stop a Bot
-
-**POST** `/stop/{bot_id}`
-
-```bash
-curl -X POST "http://localhost:8000/stop/1"
-
-```
-
-### Delete a Bot (Liquidate Assets)
-
-**DELETE** `/bot/{bot_id}?liquidate=true`
-
-* If the bot is running, it stops and sells assets.
-* If the bot is offline, pass credentials in the body to perform "Offline Liquidation".
-
-### Run Backtest
-
-**POST** `/backtest`
-
-```json
-{
-  "exchange": "binance",
-  "pair": "SOL/USDT",
-  "startDate": "2024-01-01T00:00:00Z",
-  "endDate": "2024-02-01T00:00:00Z",
-  "capital": 1000,
-  "upperPrice": 150,
-  "lowerPrice": 80,
-  "gridSize": 20
-}
-
 ```
 
 ---
 
-## 📂 Project Structure
-
-```text
-├── backtest/            # Simulation engine & data loaders
-├── config/              # Config validators & schema definitions
-├── core/
-│   ├── bot_management/  # Bot Controller, Event Bus, Health Checks
-│   ├── grid_management/ # Logic for calculating grid levels
-│   ├── order_handling/  # Order execution, fee calc, & reconciliation
-│   ├── services/        # Exchange interfaces (CCXT wrapper)
-│   └── storage/         # Database persistence layers
-├── monitoring/          # Docker configs for Grafana/Loki/Promtail
-├── strategies/          # Trading logic (Grid Strategy, Auto-Tuner)
-├── server.py            # FastAPI Entry Point
-├── main.py              # CLI Entry Point
-└── docker-compose.yml   # Observability Stack
-
-```
-
 ## 📄 License
-
 Distributed under the MIT License. See `LICENSE` for more information.
