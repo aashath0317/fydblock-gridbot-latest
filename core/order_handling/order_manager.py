@@ -268,7 +268,7 @@ class OrderManager:
                 if order:
                     # Record Initial Stock
                     self.grid_manager.grid_levels[price].stock_on_hand = order.amount
-                    if self.bot_id:
+                    if self.bot_id is not None:
                         await self.db.update_grid_stock(self.bot_id, price, order.amount)
                     self.logger.info(f"🏁 Init: Recorded initial stock {order.amount} for grid {price}")
 
@@ -426,7 +426,7 @@ class OrderManager:
     # ==============================================================================
 
     async def _on_order_cancelled(self, order: Order) -> None:
-        if self.bot_id:
+        if self.bot_id is not None:
             await self.db.update_order_status(order.identifier, "CANCELLED")
 
         # FIX: Release Reserved Funds
@@ -457,7 +457,7 @@ class OrderManager:
             self._processed_order_fills.add(order_id_str)
 
             # OWNERSHIP VALIDATION: Defense-in-depth
-            if self.bot_id:
+            if self.bot_id is not None:
                 info = order.info or {}
                 # Check common fields for client ID
                 client_oid = info.get("clientOrderId") or info.get("clOrdId") or info.get("client_oid")
@@ -471,7 +471,7 @@ class OrderManager:
                     return
 
             # 1. Update DB Status immediately
-            if self.bot_id:
+            if self.bot_id is not None:
                 await self.db.update_order_status(order.identifier, "FILLED")
 
             # 2. Update Memory / Balances
@@ -540,7 +540,7 @@ class OrderManager:
 
         # 3. Save to Buy Level Initially (Safety - Accumulate)
         grid_level.stock_on_hand += net_coin_received
-        if self.bot_id:
+        if self.bot_id is not None:
             self.db.update_grid_stock(self.bot_id, grid_level.price, grid_level.stock_on_hand)
 
         self.logger.info(
@@ -558,13 +558,13 @@ class OrderManager:
             amount_to_transfer = grid_level.stock_on_hand
             paired_sell_level.stock_on_hand += amount_to_transfer
 
-            if self.bot_id:
+            if self.bot_id is not None:
                 # Update DB with TOTAL stock (not just the increment)
                 self.db.update_grid_stock(self.bot_id, paired_sell_level.price, paired_sell_level.stock_on_hand)
 
             # Clear Buy Level
             grid_level.stock_on_hand = 0.0
-            if self.bot_id:
+            if self.bot_id is not None:
                 self.db.update_grid_stock(self.bot_id, grid_level.price, 0.0)
 
             self.logger.info(
@@ -581,7 +581,7 @@ class OrderManager:
             )
 
         # --- SAVE TRADE HISTORY (BUY) ---
-        if self.bot_id:
+        if self.bot_id is not None:
             trade_record = {
                 "bot_id": self.bot_id,
                 "order_id": order.identifier,
@@ -656,7 +656,7 @@ class OrderManager:
                 f"(Gross: {gross_profit:.4f}, Fees: {total_estimated_fees:.4f}, Reserve: {reserve_amount:.4f})"
             )
 
-            if self.bot_id:
+            if self.bot_id is not None:
                 # Sync Net Profit to backend
                 await self._sync_profit_to_backend(order, net_profit)
 
@@ -714,7 +714,7 @@ class OrderManager:
         Places an order and immediately saves it to DB.
         Calculates quantity if not provided.
         """
-        if self.bot_id:
+        if self.bot_id is not None:
             existing_order = await self.db.get_active_order_at_price(self.bot_id, price)
             if existing_order:
                 self.logger.info(f"⏭️ Skipping {side} at {price}: Order already exists in DB.")
@@ -748,7 +748,7 @@ class OrderManager:
 
             # --- ISOLATION FIX: Generate Client Order ID ---
             client_order_id = None
-            if self.bot_id:
+            if self.bot_id is not None:
                 # Format: G<bot_id>x<short_uuid> (Alphanumeric only for OKX)
                 short_uuid = uuid.uuid4().hex[:8]
                 client_order_id = f"G{self.bot_id}x{short_uuid}"
@@ -766,16 +766,16 @@ class OrderManager:
                     if qty < quantity:
                         dust_remainder = quantity - qty
                         grid_level.stock_on_hand = dust_remainder
-                        if self.bot_id:
+                        if self.bot_id is not None:
                             self.db.update_grid_stock(self.bot_id, price, dust_remainder)
                         self.logger.info(f"🧹 Dust Management: Keeping {dust_remainder:.6f} as residue.")
                     else:
                         grid_level.stock_on_hand = 0.0
-                        if self.bot_id:
+                        if self.bot_id is not None:
                             self.db.update_grid_stock(self.bot_id, price, 0.0)
                 # ----------------------------------------------
 
-                if self.bot_id:
+                if self.bot_id is not None:
                     await self.db.add_order(self.bot_id, order.identifier, price, side.value, order.amount)
 
                 if side == OrderSide.BUY:
@@ -816,7 +816,7 @@ class OrderManager:
 
                         # 3. Adjust Stock
                         grid_level.stock_on_hand = actual_crypto
-                        if self.bot_id:
+                        if self.bot_id is not None:
                             self.db.update_grid_stock(self.bot_id, price, actual_crypto)
 
                         # 4. Retry Order (Recursive One-Shot)
@@ -861,7 +861,7 @@ class OrderManager:
 
         # --- ISOLATION FIX: Strict Filter by Client Order ID ---
         exchange_orders = []
-        if self.bot_id:
+        if self.bot_id is not None:
             prefix = f"G{self.bot_id}x"
             for o in exchange_orders_raw:
                 cid = o.get("clientOrderId") or ""
@@ -884,7 +884,7 @@ class OrderManager:
 
         exchange_order_ids = set(o["id"] for o in exchange_orders)
 
-        if self.bot_id:
+        if self.bot_id is not None:
             db_orders = await self.db.get_all_active_orders(self.bot_id)
             for order_id, _ in db_orders.items():
                 if order_id not in exchange_order_ids:
@@ -1199,7 +1199,7 @@ class OrderManager:
             if order:
                 self.logger.info(f"✅ Rebalance Order Placed: {order.side} {order.amount} @ {order.average}")
                 self.order_book.add_order(order)
-                if self.bot_id:
+                if self.bot_id is not None:
                     await self.db.add_order(
                         self.bot_id, order.identifier, current_price, order.side.value, order.amount
                     )
@@ -1233,7 +1233,7 @@ class OrderManager:
 
             # --- ISOLATION FIX: Generate Client Order ID for Initial Buy ---
             client_order_id = None
-            if self.bot_id:
+            if self.bot_id is not None:
                 short_uuid = uuid.uuid4().hex[:8]
                 client_order_id = f"G{self.bot_id}x{short_uuid}"
 
@@ -1259,7 +1259,7 @@ class OrderManager:
                 )
 
                 # --- SAVE TRADE HISTORY (INITIAL BUY) ---
-                if self.bot_id:
+                if self.bot_id is not None:
                     trade_record = {
                         "bot_id": self.bot_id,
                         "order_id": buy_order.identifier,
