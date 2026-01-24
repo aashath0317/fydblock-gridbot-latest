@@ -343,8 +343,13 @@ class GridManager:
         # (This is more accurate than simple ratio if we have varying grid sizes/prices)
         required_crypto_value = 0.0
 
-        # We need to cover all grids ABOVE current price
-        sell_grids = [p for p in self.price_grids if p > current_price]
+        # FIX: Use Active Sell Orders list to exclude the "Phantom" Position Order (Gap)
+        # We rely on the structural definition of Active Sell Grids which naturally excludes the gap.
+        if hasattr(self, "sorted_sell_grids") and self.sorted_sell_grids:
+            sell_grids = self.sorted_sell_grids
+        else:
+            # Fallback (Safety)
+            sell_grids = [p for p in self.price_grids if p > current_price]
 
         # If we can calculate exact requirements per grid:
         total_balance_for_calc = investment  # Use investment as the 'total' context
