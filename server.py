@@ -103,6 +103,7 @@ class BotRequest(BaseModel):
     strategy: StrategyConfig
     # Primary location for investment
     investment: float = 0.0
+    risk_management: dict | None = None
 
 
 class BacktestRequest(BaseModel):
@@ -118,8 +119,24 @@ class BacktestRequest(BaseModel):
 
 
 # --- Helper: Map Request to Bot Config ---
-def create_config(exchange, pair, api_key, api_secret, passphrase, mode, strategy_settings, trading_settings):
+def create_config(
+    exchange,
+    pair,
+    api_key,
+    api_secret,
+    passphrase,
+    mode,
+    strategy_settings,
+    trading_settings,
+    risk_management_settings=None,
+):
     base, quote = pair.split("/")
+    if risk_management_settings is None:
+        risk_management_settings = {
+            "take_profit": {"enabled": False, "threshold": 0.0},
+            "stop_loss": {"enabled": False, "threshold": 0.0},
+        }
+
     return {
         "exchange": {"name": exchange.lower(), "trading_fee": 0.001, "trading_mode": mode},
         "credentials": {"api_key": api_key, "api_secret": api_secret, "password": passphrase},
@@ -137,11 +154,9 @@ def create_config(exchange, pair, api_key, api_secret, passphrase, mode, strateg
             "amount_per_grid": strategy_settings.get("amount_per_grid", 0.0),
             "grid_gap": strategy_settings.get("grid_gap", 0.0),
             "trailing_up": strategy_settings.get("trailing_up", False),
+            "trailing_down": strategy_settings.get("trailing_down", False),
         },
-        "risk_management": {
-            "take_profit": {"enabled": False, "threshold": 0.0},
-            "stop_loss": {"enabled": False, "threshold": 0.0},
-        },
+        "risk_management": risk_management_settings,
         "logging": {"log_level": "INFO", "log_to_file": True},
     }
 
@@ -384,6 +399,7 @@ async def start_bot(req: BotRequest):
         mode_str,
         strategy_settings,
         trading_settings,
+        req.risk_management,
     )
 
     try:

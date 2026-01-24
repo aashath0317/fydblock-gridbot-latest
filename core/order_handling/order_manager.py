@@ -302,9 +302,9 @@ class OrderManager:
                     self.grid_manager.mark_order_pending(grid_level, order_obj)
 
                     # FIX: Sync with BalanceTracker
-                    # deduct_from_balance=False because these funds are ALREADY locked on exchange
-                    # and therefore missing from the 'free balance' we initialized with.
-                    await self.balance_tracker.register_open_order(order_obj, deduct_from_balance=False)
+                    # deduct_from_balance=True because we now rehydrate Total Equity (Free+Locked) from DB.
+                    # We must subtract the locked portion here to return to the correct "Free" state.
+                    await self.balance_tracker.register_open_order(order_obj, deduct_from_balance=True)
                     matched_count += 1
 
             self.logger.info(f"✅ Resumed {matched_count} orders from Hot Boot.")
@@ -1297,18 +1297,18 @@ class OrderManager:
                     self.logger.info(f"✅ Cancelled order {order_id}")
 
                     # Update DB to keep it consistent
-                    self.db.update_order_status(order_id, "CANCELLED")
+                    await self.db.update_order_status(order_id, "CANCELLED")
                 except Exception as e:
                     self.logger.warning(f"⚠️ Failed to cancel {order_id}: {e}")
 
             # 4. Final DB Cleanup (Force mark all 'OPEN' as 'CANCELLED' in DB to remove zombies)
             # Even if exchange didn't return them (maybe they closed 1ms ago), we shouldn't think they are open.
             # Rrefetch active orders to see what's left
-            remaining_db_orders = self.db.get_all_active_orders(self.bot_id)
+            remaining_db_orders = await self.db.get_all_active_orders(self.bot_id)
             if remaining_db_orders:
                 self.logger.info(f"🧹 Cleanup: Marking {len(remaining_db_orders)} local DB orders as CANCELLED.")
                 for oid in remaining_db_orders.keys():
-                    self.db.update_order_status(oid, "CANCELLED")
+                    await self.db.update_order_status(oid, "CANCELLED")
 
         except Exception as e:
             self.logger.error(f"❌ Critical Error during cancel_all_open_orders: {e}", exc_info=True)

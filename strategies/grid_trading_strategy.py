@@ -155,15 +155,48 @@ class GridTradingStrategy(TradingStrategyInterface):
             )
             self.logger.info(f"   ?? User Allocated: {investment_amount} {quote_currency}")
 
-            # 3. Check for Active Orders (Hot Boot detection)
-            # FIX: Moved Logic Up to determine Balance Initialization
-            has_active_orders = self.order_manager.has_active_orders()
+            # 3. Check for Active Orders OR Existing State (Hot Boot / Edit Resume)
+            has_active_orders = await self.order_manager.has_active_orders()
 
+            # ATTEMPT INITIAL LOAD FROM DB
+            # We try to load balances now. If they exist, we might be resuming an edit
+            # where orders were cancelled but funds are still held.
+            has_persisted_balance = await self.balance_tracker.load_persisted_balances()
+
+            # Determine Resume vs Clean Start
             if has_active_orders:
                 self.logger.info("🔥 Found active orders in Database. Enabling Smart Resume (Hot Boot).")
                 self.use_hot_boot = True
+            elif has_persisted_balance:
+                # Calculate Equity of the persisted state
+                current_price = await self.exchange_service.get_current_price(self.trading_pair)
+                persisted_crypto_val = self.balance_tracker.crypto_balance * current_price
+                persisted_total_equity = self.balance_tracker.balance + persisted_crypto_val
+
+                # HEURISTIC: Should we Resume or Reset?
+                # 1. If we are holding significant bags (> 5% of investment), we MUST Resume to manage them.
+                # 2. If we are "Poor" (Equity < 80% of investment) AND Bags are Dust (< 5%), we implies a User Reset/loss invalidation.
+                #    In this case, we prefer a Clean Start to pull fresh funds from Wallet (if available).
+
+                is_bag_holder = persisted_crypto_val > (investment_amount * 0.05)
+                is_poor = persisted_total_equity < (investment_amount * 0.80)
+
+                if is_bag_holder:
+                    self.logger.info(
+                        f"💾 Persisted Holdings Significant ({persisted_crypto_val:.2f}). Resuming to manage bags."
+                    )
+                    self.use_hot_boot = True
+                elif is_poor:
+                    self.logger.warning(
+                        f"📉 Persisted Equity Low ({persisted_total_equity:.2f} < 80% of {investment_amount}). "
+                        f"Holdings are dust. Forcing Clean Start to attempt Wallet Top-Up."
+                    )
+                    self.use_hot_boot = False
+                else:
+                    self.logger.info("💾 Found valid persisted balances. Resuming.")
+                    self.use_hot_boot = True
             else:
-                self.logger.info("✨ No active orders found. Proceeding with Clean Start.")
+                self.logger.info("✨ No active orders or significant history found. Proceeding with Clean Start.")
                 self.use_hot_boot = False
 
             # 4. Validate Funds (Equity Check uses NET WORTH)
@@ -187,8 +220,12 @@ class GridTradingStrategy(TradingStrategyInterface):
                     f"Wallet Total: {total_fiat_balance:.2f} {quote_currency} + "
                     f"{total_crypto_balance:.4f} {base_currency}."
                 )
-                self.logger.error(error_msg)
-                raise Exception(error_msg)
+
+                if self.use_hot_boot:
+                    self.logger.warning(f"{error_msg} Proceeding anyway because Smart Resume (Hot Boot) is active.")
+                else:
+                    self.logger.error(error_msg)
+                    raise Exception(error_msg)
 
             # If Equity is sufficient but Fiat is low, we warn but PROCEED.
             if total_fiat_balance < investment_amount * 0.1:  # warn if very low fiat
@@ -197,37 +234,20 @@ class GridTradingStrategy(TradingStrategyInterface):
                     f"Bot will rely heavily on existing Crypto ({total_crypto_balance:.4f}) for Sell orders."
                 )
 
-            # 5. Initialize Tracker with FREE/AVAILABLE values
-            # FIX: Removed incorrect initialization with global wallet balance.
-            # self.balance_tracker.initialize_balances(free_fiat_balance, free_crypto_balance)
-
+            # 5. Initialize Tracker
             # --- FIX: ISOLATE BOT ASSETS ---
             # If Clean Start (New Bot), we ignore existing crypto in the wallet.
             # If Hot Boot (Resume), we RESTORE balances from DB (not reset to investment).
             if self.use_hot_boot:
-                # FIX: Load persisted balances from DB - this includes the correct FREE balance
-                if await self.balance_tracker.load_persisted_balances():
-                    # Balances are now restored from DB - use them as-is
-                    # The FREE balance is correct (what's left after orders were placed)
-                    # The LOCKED balance is calculated from grid_orders in server.py
-                    self.logger.info(
-                        f"   🔥 Hot Boot: Restored from DB: "
-                        f"{self.balance_tracker.balance:.2f} {quote_currency} (Free), "
-                        f"{self.balance_tracker.crypto_balance:.4f} {base_currency}"
-                    )
-                    # Just set investment_cap for profit calculations (don't reset balances!)
-                    self.balance_tracker.investment_cap = investment_amount
-                    # DO NOT call setup_balances - it would overwrite the restored FREE balance!
-                else:
-                    # DB load failed, fall back to fresh start with investment amount
-                    effective_fiat_balance = investment_amount
-                    effective_crypto_balance = 0.0
-                    self.logger.warning(
-                        f"   🔥 Hot Boot: DB Load Failed. Starting fresh with {effective_fiat_balance} {quote_currency}"
-                    )
-                    res = await self.balance_tracker.setup_balances(
-                        effective_fiat_balance, effective_crypto_balance, self.exchange_service
-                    )
+                # We already loaded balances at step 3.
+                self.logger.info(
+                    f"   🔥 Hot Boot: Restored from DB: "
+                    f"{self.balance_tracker.balance:.2f} {quote_currency} (Free), "
+                    f"{self.balance_tracker.crypto_balance:.4f} {base_currency}"
+                )
+                # Just set investment_cap for profit calculations
+                self.balance_tracker.investment_cap = investment_amount
+                # NOTE: If we resumed due to persisted balance, we do NOT call setup_balances.
             else:
                 # Clean Start - initialize with investment amount
                 effective_crypto_balance = 0.0

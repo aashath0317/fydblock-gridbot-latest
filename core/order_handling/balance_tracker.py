@@ -108,14 +108,48 @@ class BalanceTracker:
         try:
             saved = await self.db.get_balances(self.bot_id)
             if saved:
-                # { "fiat_balance": X, "crypto_balance": Y, "reserve_amount": Z }
+                # 1. Load Free Balances (Available for new orders)
                 self.balance = float(saved.get("fiat_balance", 0.0))
                 self.crypto_balance = float(saved.get("crypto_balance", 0.0))
                 self.operational_reserve = float(saved.get("reserve_amount", 0.0))
 
+                # 2. Rehydrate "Total Equity" from Active Orders
+                # If we are restarting, the orders might be cancelled or resumed.
+                # Regardless, we need to know we OWN these funds.
+
+                # Fetch active orders directly from DB to verify what is locked
+                db_orders = await self.db.get_all_active_orders(self.bot_id)
+                locked_fiat = 0.0
+                locked_crypto = 0.0
+
+                # DB Orders format: {order_id: {price, side, quantity, ...}} OR just dict of orders?
+                # Based on get_all_active_orders implementation (usually returns dict {id: details})
+                if db_orders:
+                    for order_id, details in db_orders.items():
+                        side = str(details.get("side", "")).upper()
+                        # Handle varied side formats (buy vs OrderSide.BUY)
+                        if "BUY" in side:
+                            price = float(details.get("price", 0.0))
+                            qty = float(details.get("quantity", 0.0))
+                            locked_fiat += price * qty
+                        elif "SELL" in side:
+                            qty = float(details.get("quantity", 0.0))
+                            locked_crypto += qty
+
+                # 3. Add Locked Funds back to Ledger (Treat as "Owned")
+                # We do NOT set 'reserved' here because 'reserved' tracks *currently active* orders in memory.
+                # Only if we call 'resume_existing_orders' will 'reserved' be populated and deducted.
+                # If we call 'cancel_all', these funds become Free.
+                # So loading them into the main balance is the correct "Total Equity" starting point.
+
+                self.balance += locked_fiat
+                self.crypto_balance += locked_crypto
+
                 self.logger.info(
-                    f"💾 Restored Isolated Balances from DB: Fiat={self.balance:.2f}, "
-                    f"Crypto={self.crypto_balance:.4f}, Reserve={self.operational_reserve:.2f}"
+                    f"💾 Restored Total Equity from DB: "
+                    f"Fiat={self.balance:.2f} (Free {saved.get('fiat_balance', 0.0)} + Locked {locked_fiat:.2f}), "
+                    f"Crypto={self.crypto_balance:.6f} (Free {saved.get('crypto_balance', 0.0)} + Locked {locked_crypto:.6f}), "
+                    f"Reserve={self.operational_reserve:.2f}"
                 )
                 return True
         except Exception as e:
@@ -534,10 +568,10 @@ class BalanceTracker:
                     self.balance -= cost
                 else:
                     self.logger.warning(
-                        f"⚠️ Inconsistency during Hot Boot: registered buy order cost {cost} > available balance {self.balance}. "
-                        f"Forcing reserve (Balance may go negative)."
+                        f"⚠️ Implicit Rehydration: Order {order.identifier} cost {cost:.2f} > Balance {self.balance:.2f}. "
+                        f"Clamping Balance to 0.0 and assuming funds were locked outside of DB history."
                     )
-                    self.balance -= cost
+                    self.balance = 0.0
 
             self.reserved_fiat += cost
             self.logger.info(
@@ -548,7 +582,14 @@ class BalanceTracker:
         elif order.side == OrderSide.SELL:
             amount = order.remaining
             if deduct_from_balance:
-                self.crypto_balance -= amount
+                if self.crypto_balance >= amount:
+                    self.crypto_balance -= amount
+                else:
+                    self.logger.warning(
+                        f"⚠️ Implicit Rehydration: Order {order.identifier} amount {amount:.6f} > Crypto Balance {self.crypto_balance:.6f}. "
+                        f"Clamping Crypto Balance to 0.0 and assuming funds were locked outside of DB history."
+                    )
+                    self.crypto_balance = 0.0
 
             self.reserved_crypto += amount
             self.logger.info(
@@ -615,7 +656,23 @@ class BalanceTracker:
                     "reason": f"Insufficient {self.base_currency} for grid.",
                 }
 
-        # 2. Check Fiat Deficit (for Buy Orders)
+        # 2. Check Excess Crypto (Liquidation of Dust/Old Grid inventory)
+        # MOVED UP: Priority is to liquidate excess assets to fund the Buy side naturally.
+        # If we have significantly MORE crypto than needed, sell it to free up Fiat.
+        if total_crypto > (required_crypto * 1.02):  # 2% buffer
+            excess_crypto = total_crypto - required_crypto
+
+            self.logger.info(
+                f"♻️ Excess Crypto Detected: Have {total_crypto:.6f}, Need {required_crypto:.6f}. "
+                f"Liquidating {excess_crypto:.6f} to rebalance portfolio."
+            )
+            return {
+                "type": "SELL_CRYPTO",
+                "amount": excess_crypto,
+                "reason": "Liquidation of excess crypto for grid adjustment.",
+            }
+
+        # 3. Check Fiat Deficit (for Buy Orders)
         # FIX: Check TOTAL owned fiat (Free + Reserved).
         total_fiat = self.get_adjusted_fiat_balance()
         if total_fiat < required_fiat:
