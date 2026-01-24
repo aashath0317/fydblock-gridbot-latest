@@ -207,7 +207,12 @@ class OrderManager:
         # Case B: Coin Deficit (Buy using Surplus Cash)
         # Only buy if we really need it (Coin Deficit)
         elif coin_diff < 0 and abs(coin_diff * current_price) > min_trade_val:
-            needed_coin = abs(coin_diff)
+            # FIX: Add buffer for trading fees (e.g. 0.1% or 0.2%)
+            # If we need 4.8 BNB, and fee is 0.1%, we receive 4.8 * 0.999 = 4.7952 (Shortfall).
+            # We need to BUY enough so that (BuyQty * (1 - fee)) >= Needed.
+            # BuyQty >= Needed / (1 - fee). Approx Needed * 1.002
+            needed_coin = abs(coin_diff) * 1.002
+
             # Check if we can afford it.
             # We check if we have enough cash.
             # Note: We only buy if we have the cash.
@@ -220,9 +225,14 @@ class OrderManager:
                     adj_qty = self.order_validator.adjust_and_validate_buy_quantity(
                         self.balance_tracker.balance, needed_coin, current_price
                     )
-                    await self.order_execution_strategy.execute_market_order(
+                    order = await self.order_execution_strategy.execute_market_order(
                         OrderSide.BUY, self.trading_pair, amount=adj_qty, price=current_price
                     )
+
+                    if order and order.status == OrderStatus.CLOSED:
+                        self.logger.info(f"✅ Rebalance Buy Successful: {order.filled} @ {order.average}")
+                        await self.balance_tracker.update_balance_on_order_completion(order)
+
                     await asyncio.sleep(2)
                     await self.balance_tracker.sync_balances(
                         self.order_execution_strategy.exchange_service, current_price
