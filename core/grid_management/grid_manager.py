@@ -1,12 +1,11 @@
 import logging
+from typing import Any
 
 import numpy as np
 
 from config.config_manager import ConfigManager
-from core.storage.bot_database import BotDatabase
 from strategies.spacing_type import SpacingType
 from strategies.strategy_type import StrategyType
-from typing import Any
 
 from ..order_handling.order import Order, OrderSide
 from .grid_level import GridCycleState, GridLevel
@@ -38,17 +37,20 @@ class GridManager:
     def num_grids(self) -> int:
         return self.config_manager.get_num_grids()
 
-    def initialize_grids_and_levels(self) -> None:
+    def initialize_grids_and_levels(self, equity_override: float | None = None) -> None:
         """
         Initializes the grid levels and assigns their respective states.
-        Calculates the Uniform Order Quantity ensuring 1% reserve for fees.
+        Calculates the Uniform Order Quantity ensuring 0.1% reserve for fees.
         """
         self.price_grids, self.central_price = self._calculate_price_grids_and_central_price()
 
         # --- UNIFORM QUANTITY CALCULATION ---
-        # Formula: (Investment * 0.99) / (Total Grids) / Central Price
+        # Formula: (Investment * 0.999) / (Total Grids) / Central Price
         # This ensures every buy order is identical and we have a reserve for fees.
-        investment = self.config_manager.get_investment_amount()
+        investment = equity_override if equity_override else self.config_manager.get_investment_amount()
+        if equity_override:
+            self.logger.info(f"⚖️ Using Equity Override for Grid Sizing: {equity_override:.2f}")
+
         amount_per_grid = self.config_manager.get_amount_per_grid()
         order_size_type = self.config_manager.get_order_size_type()
 
@@ -63,7 +65,7 @@ class GridManager:
         else:
             # Legacy / Auto-Calculate Mode (Standard Grid)
             # Legacy / Auto-Calculate Mode (Standard Grid)
-            usable_investment = investment * 0.99
+            usable_investment = investment * 0.999
             total_lines = len(self.price_grids)
 
             if total_lines > 0:
@@ -291,8 +293,8 @@ class GridManager:
         if investment <= 0:
             investment = total_balance
 
-        # Apply 1% reserve even in fallback
-        usable = investment * 0.99
+        # Apply 0.1% reserve even in fallback
+        usable = investment * 0.999
         order_size = usable / total_grids / self.central_price
         return order_size
 
@@ -354,8 +356,8 @@ class GridManager:
             qty = self.get_order_size_for_grid_level(total_balance_for_calc, p)
             required_crypto_value += qty * current_price  # Current value of that future sell obligation
 
-        # Add 1% buffer for fee safety
-        target_crypto_value = required_crypto_value * 1.01
+        # Add 0.5% buffer for fee safety
+        target_crypto_value = required_crypto_value * 1.005
 
         fiat_to_allocate = target_crypto_value - current_crypto_value_in_fiat
         fiat_to_allocate = max(0, min(fiat_to_allocate, current_fiat_balance, investment))

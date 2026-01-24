@@ -167,7 +167,7 @@ class OrderManager:
             if price >= safe_buy:
                 continue
             qty = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
-            target_cash += (qty * price) * 1.01  # Add 1% buffer for fees
+            target_cash += (qty * price) * 1.002  # Add 0.2% buffer for fees
 
         # 3. Identify Imbalances
         coin_diff = current_coin - target_coin
@@ -456,6 +456,20 @@ class OrderManager:
             # Mark as processed immediately
             self._processed_order_fills.add(order_id_str)
 
+            # --- ISOLATION FIX: Ignore Market Orders (Rebalancing/Manual) ---
+            if order.order_type == OrderType.MARKET:
+                self.logger.info(f"⏭️ Skipping Grid Logic for MARKET order {order.identifier} (Rebalance/Manual).")
+                # Still update balance tracker, as it listens to event bus independently?
+                # Actually, BalanceTracker listens to event bus.
+                # But here we explicitly call: await self.balance_tracker.update_balance_on_order_completion(order)
+                # We SHOULD call it to ensure local state is fresh before next logic.
+                await self.balance_tracker.update_balance_on_order_completion(order)
+
+                if self.bot_id is not None:
+                    await self.db.update_order_status(order.identifier, "FILLED")
+                return
+            # ----------------------------------------------------------------
+
             # OWNERSHIP VALIDATION: Defense-in-depth
             if self.bot_id is not None:
                 info = order.info or {}
@@ -541,7 +555,7 @@ class OrderManager:
         # 3. Save to Buy Level Initially (Safety - Accumulate)
         grid_level.stock_on_hand += net_coin_received
         if self.bot_id is not None:
-            self.db.update_grid_stock(self.bot_id, grid_level.price, grid_level.stock_on_hand)
+            await self.db.update_grid_stock(self.bot_id, grid_level.price, grid_level.stock_on_hand)
 
         self.logger.info(
             f"🧬 Precise Tracking: Bought {executed_qty} - Fee {fee_paid_in_coin} = Stock {net_coin_received:.6f} "
@@ -557,15 +571,16 @@ class OrderManager:
             # Accumulate on Sell Level (prevent dust overwrite)
             amount_to_transfer = grid_level.stock_on_hand
             paired_sell_level.stock_on_hand += amount_to_transfer
+            paired_sell_level.stock_on_hand = round(paired_sell_level.stock_on_hand, 6)  # Rounding safety
 
             if self.bot_id is not None:
                 # Update DB with TOTAL stock (not just the increment)
-                self.db.update_grid_stock(self.bot_id, paired_sell_level.price, paired_sell_level.stock_on_hand)
+                await self.db.update_grid_stock(self.bot_id, paired_sell_level.price, paired_sell_level.stock_on_hand)
 
             # Clear Buy Level
             grid_level.stock_on_hand = 0.0
             if self.bot_id is not None:
-                self.db.update_grid_stock(self.bot_id, grid_level.price, 0.0)
+                await self.db.update_grid_stock(self.bot_id, grid_level.price, 0.0)
 
             self.logger.info(
                 f"🚚 Stock Transferred: {amount_to_transfer:.6f} moved from {grid_level.price} to {paired_sell_level.price} "
@@ -767,12 +782,12 @@ class OrderManager:
                         dust_remainder = quantity - qty
                         grid_level.stock_on_hand = dust_remainder
                         if self.bot_id is not None:
-                            self.db.update_grid_stock(self.bot_id, price, dust_remainder)
+                            await self.db.update_grid_stock(self.bot_id, price, dust_remainder)
                         self.logger.info(f"🧹 Dust Management: Keeping {dust_remainder:.6f} as residue.")
                     else:
                         grid_level.stock_on_hand = 0.0
                         if self.bot_id is not None:
-                            self.db.update_grid_stock(self.bot_id, price, 0.0)
+                            await self.db.update_grid_stock(self.bot_id, price, 0.0)
                 # ----------------------------------------------
 
                 if self.bot_id is not None:
@@ -817,7 +832,7 @@ class OrderManager:
                         # 3. Adjust Stock
                         grid_level.stock_on_hand = actual_crypto
                         if self.bot_id is not None:
-                            self.db.update_grid_stock(self.bot_id, price, actual_crypto)
+                            await self.db.update_grid_stock(self.bot_id, price, actual_crypto)
 
                         # 4. Retry Order (Recursive One-Shot)
                         # We only retry if we have meaningful balance left (e.g. > dust)
@@ -1015,11 +1030,11 @@ class OrderManager:
 
             if not await self.balance_tracker.attempt_fee_recovery(required_value * 0.95):
                 self._throttled_warning(
-                    f"Skipping BUY reconciliation for level {price}: Insufficient funds "
+                    f"🛑 Budget Exhausted. Trimming remaining BUY grids below {price}. "
                     f"(Available: {self.balance_tracker.balance:.2f}, Required: {required_value:.2f})",
-                    f"insufficient_funds_buy_{price}",
+                    f"budget_exhausted_buy_{price}",
                 )
-                continue
+                break  # Graceful Degradation: Stop placing orders for deeper levels.
             # -----------------------------
 
             success = await self._place_limit_order_safe(price, OrderSide.BUY)
@@ -1062,11 +1077,11 @@ class OrderManager:
 
             if self.balance_tracker.crypto_balance < (required_crypto * 0.95):
                 self._throttled_warning(
-                    f"Skipping SELL reconciliation for level {price}: Insufficient crypto "
+                    f"🛑 Crypto Exhausted. Trimming remaining SELL grids above {price}. "
                     f"(Available: {self.balance_tracker.crypto_balance:.4f}, Required: {required_crypto:.4f})",
                     f"insufficient_crypto_sell_{price}",
                 )
-                continue
+                break
             # ------------------------------
 
             success = await self._place_limit_order_safe(price, OrderSide.SELL)
@@ -1112,7 +1127,7 @@ class OrderManager:
             raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
             required_fiat += raw_quantity * price
 
-        required_fiat *= 1.02
+        required_fiat *= 1.005
 
         # 2. Sum up SELL requirements
         for price in self.grid_manager.sorted_sell_grids:
@@ -1124,7 +1139,7 @@ class OrderManager:
 
         # FIX: Add 2% buffer to the crypto requirement to cover rounding/dust issues
         # This prevents the last sell order placement from failing after rebalancing.
-        required_crypto *= 1.02
+        required_crypto *= 1.005
 
         return required_fiat, required_crypto
 
@@ -1169,11 +1184,21 @@ class OrderManager:
                     self.balance_tracker.balance, required_amount * 1.005, current_price
                 )
 
+                # --- ISOLATION FIX: Attach Client Order ID ---
+                client_order_id = None
+                if self.bot_id is not None:
+                    short_uuid = uuid.uuid4().hex[:8]
+                    client_order_id = f"G{self.bot_id}x{short_uuid}"
+
+                params = {"clientOrderId": client_order_id} if client_order_id else None
+                # ---------------------------------------------
+
                 order = await self.order_execution_strategy.execute_market_order(
                     OrderSide.BUY,
                     self.trading_pair,
                     amount=adjusted_qty,
                     price=current_price,
+                    params=params,
                 )
 
             elif action_type == "SELL_CRYPTO":
@@ -1189,11 +1214,17 @@ class OrderManager:
                     self.balance_tracker.crypto_balance, required_amount
                 )
 
+                # --- ISOLATION FIX: Attach Client Order ID ---
+                client_order_id = None
+                if self.bot_id is not None:
+                    short_uuid = uuid.uuid4().hex[:8]
+                    client_order_id = f"G{self.bot_id}x{short_uuid}"
+
+                params = {"clientOrderId": client_order_id} if client_order_id else None
+                # ---------------------------------------------
+
                 order = await self.order_execution_strategy.execute_market_order(
-                    OrderSide.SELL,
-                    self.trading_pair,
-                    amount=adjusted_qty,
-                    price=current_price,
+                    OrderSide.SELL, self.trading_pair, amount=adjusted_qty, price=current_price, params=params
                 )
 
             if order:

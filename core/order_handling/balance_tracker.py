@@ -1,5 +1,4 @@
 import logging
-import time
 
 from config.trading_mode import TradingMode
 from core.bot_management.event_bus import EventBus
@@ -70,7 +69,7 @@ class BalanceTracker:
         Sets up the balances using the investment cap passed from the Strategy.
         1% is moved to Operational Reserve for fees.
         """
-        reservation_amount = initial_balance * 0.01
+        reservation_amount = initial_balance * 0.001
         self.operational_reserve = reservation_amount
         self.balance = initial_balance - reservation_amount
 
@@ -659,7 +658,7 @@ class BalanceTracker:
         # 2. Check Excess Crypto (Liquidation of Dust/Old Grid inventory)
         # MOVED UP: Priority is to liquidate excess assets to fund the Buy side naturally.
         # If we have significantly MORE crypto than needed, sell it to free up Fiat.
-        if total_crypto > (required_crypto * 1.02):  # 2% buffer
+        if total_crypto > (required_crypto * 1.005):  # 0.5% buffer
             excess_crypto = total_crypto - required_crypto
 
             self.logger.info(
