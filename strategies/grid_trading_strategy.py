@@ -455,15 +455,18 @@ class GridTradingStrategy(TradingStrategyInterface):
         await self.grid_manager.update_zones_based_on_price(current_price, cancel_order_callback)
 
         try:
+            # OPTIMIZATION: Signal RUNNING state immediately so user sees "Running" while orders place.
+            await self.event_bus.publish(Events.INITIALIZATION_COMPLETE)
+
             if hot_boot:
                 self.logger.info("🔥 Hot Boot detected: Resuming existing orders...")
                 await self.order_manager.resume_existing_orders(current_price)
-                self.logger.info("✨ Clean Start: Initializing fresh grid...")
-                # Phase 1-4 State Diff Logic handled in initialize_grid_orders
-                self.logger.info("State Diff Handover: Placing grid orders...")
-                await self.order_manager.initialize_grid_orders(current_price)
 
-            await self.event_bus.publish(Events.INITIALIZATION_COMPLETE)
+            # ensure we initialize grid orders (State Diff / Clean Start)
+            self.logger.info("State Diff Handover: Placing/Reconciling grid orders...")
+            await self.order_manager.initialize_grid_orders(current_price)
+
+            return True
             return True
 
         except Exception as e:
