@@ -210,8 +210,8 @@ class OrderManager:
             # FIX: Add buffer for trading fees (e.g. 0.1% or 0.2%)
             # If we need 4.8 BNB, and fee is 0.1%, we receive 4.8 * 0.999 = 4.7952 (Shortfall).
             # We need to BUY enough so that (BuyQty * (1 - fee)) >= Needed.
-            # BuyQty >= Needed / (1 - fee). Approx Needed * 1.002
-            needed_coin = abs(coin_diff) * 1.002
+            # BuyQty >= Needed / (1 - fee). Approx Needed * 1.01 (1% buffer)
+            needed_coin = abs(coin_diff) * 1.01
 
             # Check if we can afford it.
             # We check if we have enough cash.

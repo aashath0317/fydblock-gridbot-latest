@@ -62,8 +62,9 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
                 parsed_timestamp = int(parsed_timestamp)
 
             parsed_fee = raw_order.get("fee")
-            if parsed_fee is None:
-                parsed_fee = {"cost": 0.0, "currency": pair.split("/")[1] if "/" in pair else "USDT"}
+            # FIX: Do not default to 0.0. Let BalanceTracker estimate if None.
+            # if parsed_fee is None:
+            #     parsed_fee = {"cost": 0.0, "currency": pair.split("/")[1] if "/" in pair else "USDT"}
             # --------------------------
 
             return Order(
