@@ -223,6 +223,14 @@ class OrderStatusTracker:
                                 self.logger.info(f"Recovered orphan order {order_id}. Publishing FILLED event.")
                                 self.event_bus.publish_sync(Events.ORDER_FILLED, remote_order)
                     except Exception as rec_error:
+                        error_msg = str(rec_error)
+                        # Check for "Ghost" order indicators
+                        if "Order does not exist" in error_msg or "not found" in error_msg or "51603" in error_msg:
+                            self.logger.warning(
+                                f"Market order {order_id} already closed or not found (Ghost Order), skipping recovery. Error: {error_msg}"
+                            )
+                            return
+
                         self.logger.error(f"Failed to recover orphan order {order_id}: {rec_error}")
 
             elif status == OrderStatus.CANCELED or status == "canceled":
