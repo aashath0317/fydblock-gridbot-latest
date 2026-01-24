@@ -435,10 +435,9 @@ class GridTradingStrategy(TradingStrategyInterface):
             if hot_boot:
                 self.logger.info("🔥 Hot Boot detected: Resuming existing orders...")
                 await self.order_manager.resume_existing_orders(current_price)
-            else:
                 self.logger.info("✨ Clean Start: Initializing fresh grid...")
-                await self.order_manager.perform_initial_purchase(current_price)
-                self.logger.info("Initial purchase complete. Placing grid orders...")
+                # Phase 1-4 State Diff Logic handled in initialize_grid_orders
+                self.logger.info("State Diff Handover: Placing grid orders...")
                 await self.order_manager.initialize_grid_orders(current_price)
 
             await self.event_bus.publish(Events.INITIALIZATION_COMPLETE)

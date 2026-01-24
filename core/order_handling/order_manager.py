@@ -138,52 +138,157 @@ class OrderManager:
         self.logger.warning("⚠️ Clean Start Warning: Could not verify 0 orders after 5 attempts. Proceeding anyway.")
         await self.db.clear_all_orders(self.bot_id)
 
+    async def _perform_state_diff_rebalance(self, current_price: float):
+        """
+        Phase 1 & 2: State Diff Calculation & Priority Rebalancing.
+        Detects Surplus Coin/Cash and liquidates/acquires to match Target Distribution.
+        """
+        self.logger.info("⚖️ Phase 1: Snapshotting State & Calculating Diff...")
+
+        # 1. Snapshot State (Net Worth)
+        await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange_service, current_price)
+
+        current_coin = self.balance_tracker.crypto_balance
+        current_cash = self.balance_tracker.balance
+
+        # 2. Compute Targets
+        total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
+        safe_buy, safe_sell = self.grid_manager.get_dead_zone_thresholds(current_price)
+
+        target_coin = 0.0
+        for price in self.grid_manager.sorted_sell_grids:
+            if price <= safe_sell:
+                continue
+            qty = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+            target_coin += qty
+
+        target_cash = 0.0
+        for price in self.grid_manager.sorted_buy_grids:
+            if price >= safe_buy:
+                continue
+            qty = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+            target_cash += (qty * price) * 1.01  # Add 1% buffer for fees
+
+        # 3. Identify Imbalances
+        coin_diff = current_coin - target_coin
+        cash_diff = current_cash - target_cash
+
+        self.logger.info(f"   Targets: Coin={target_coin:.6f}, Cash={target_cash:.2f}")
+        self.logger.info(f"   Current: Coin={current_coin:.6f}, Cash={current_cash:.2f}")
+        self.logger.info(
+            f"   Diff: Coin {'Surplus' if coin_diff > 0 else 'Deficit'}={abs(coin_diff):.6f}, "
+            f"Cash {'Surplus' if cash_diff > 0 else 'Deficit'}={abs(cash_diff):.2f}"
+        )
+
+        # 4. Phase 2: Priority Rebalancing
+        # Case A: Surplus Coin (Sell to fund Cash)
+        # Fix: Removed relative buffer (target_coin * 0.02). If we have a surplus and a deficit, we MUST sell.
+        is_surplus_coin = coin_diff > 0
+        value_of_surplus = coin_diff * current_price
+        min_trade_val = 2.0  # Safe minimum for most exchanges
+
+        if is_surplus_coin and value_of_surplus > min_trade_val:
+            # Check if we actually need cash (Deficit) OR if we just want to be neutral
+            # User goal: "fund the cash deficit".
+            # If cash_diff < 0 (Deficit), we definitely sell.
+            # If cash_diff >= 0 (Surplus Cash), strictly we could hold the coin, but for Grid Bot neutrality, we usually sell.
+            # Let's prioritize the Deficit case to avoid "forgetting to sell".
+
+            self.logger.info(f"🚨 Phase 2: Selling Surplus Coin ({coin_diff:.6f}) to release liquidity...")
+            try:
+                await self.order_execution_strategy.execute_market_order(
+                    OrderSide.SELL, self.trading_pair, coin_diff, current_price
+                )
+                await asyncio.sleep(2)  # Wait for settlement
+                await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange_service, current_price)
+            except Exception as e:
+                self.logger.error(f"Failed to sell surplus: {e}")
+
+        # Case B: Coin Deficit (Buy using Surplus Cash)
+        # Only buy if we really need it (Coin Deficit)
+        elif coin_diff < 0 and abs(coin_diff * current_price) > min_trade_val:
+            needed_coin = abs(coin_diff)
+            # Check if we can afford it.
+            # We check if we have enough cash.
+            # Note: We only buy if we have the cash.
+            cost = needed_coin * current_price
+
+            if self.balance_tracker.balance >= cost:
+                self.logger.info(f"🚨 Phase 2: Buying Deficit Coin ({needed_coin:.6f})...")
+                try:
+                    # Adjust qty for precision
+                    adj_qty = self.order_validator.adjust_and_validate_buy_quantity(
+                        self.balance_tracker.balance, needed_coin, current_price
+                    )
+                    await self.order_execution_strategy.execute_market_order(
+                        OrderSide.BUY, self.trading_pair, amount=adj_qty, price=current_price
+                    )
+                    await asyncio.sleep(2)
+                    await self.balance_tracker.sync_balances(
+                        self.order_execution_strategy.exchange_service, current_price
+                    )
+                except Exception as e:
+                    self.logger.error(f"Failed to buy deficit coin: {e}")
+            else:
+                self.logger.warning("Phase 2: Coin Deficit detected but Insufficient Cash to fully cover.")
+
     async def initialize_grid_orders(self, current_price: float):
         # 1. Block the Watchdog
         self.initializing = True
 
         try:
-            # 2. Enforce Clean Start (Wait until 0 orders)
+            # 2. Phase 0: Enforce Zero State
             await self.perform_clean_start()
 
-            self.logger.info("Initializing Grid Orders (DB-Aware)...")
+            self.logger.info("Initializing Grid Orders (State Diff Strategy)...")
 
-            # 3. Smart Rebalance: Ensure we have the funds BEFORE we try to place orders
-            # This handles the "Auto-Buy/Sell" requirement to fix deficits.
-            # FIX: Ensure funds for grid needs to be async if it uses DB or async calls
-            # Looking at previous context, ensure_funds_for_grid might be missing from this file view or imported?
-            # It's not in the file view, assuming it's part of GridManager or inherited.
-            # Wait, self.ensure_funds_for_grid is called below. It is likely a method in this class not shown?
-            # Ah, it's called at line 151.
-            # Let's focus on the known missing awaits.
+            # 3. Phase 1 & 2: State Diff Rebalance
+            await self._perform_state_diff_rebalance(current_price)
 
-            # 3. Smart Rebalance: Ensure we have the funds BEFORE we try to place orders
-            # This handles the "Auto-Buy/Sell" requirement to fix deficits.
-            await self.ensure_funds_for_grid(current_price)
+            # 4. Phase 3: Grid Distribution
+            self.logger.info("Phase 3: Distributing Orders...")
 
-            # 4. Place Orders (Now safely into an empty account)
-            # FIX: Use Dynamic Dead Zone from GridManager
             safe_buy_limit, safe_sell_limit = self.grid_manager.get_dead_zone_thresholds(current_price)
 
-            for price in self.grid_manager.sorted_buy_grids:
-                if price >= safe_buy_limit:
-                    continue
-                await self._place_limit_order_safe(price, OrderSide.BUY)
-
+            # --- SELL ORDERS ---
             for price in self.grid_manager.sorted_sell_grids:
                 if price <= safe_sell_limit:
                     continue
-                # Phase 4 Update: Capture order and record stock
-                order = await self._place_limit_order_safe(price, OrderSide.SELL)
+
+                # Check Inventory (Iterative Locking)
+                if self.balance_tracker.crypto_balance <= 0:
+                    self.logger.warning(f"⚠️ Phase 3: Out of Coin Inventory at {price}. Stopping Sell Loop.")
+                    break
+
+                # Get Target Qty (re-calc based on latest value)
+                total_val = self.balance_tracker.get_total_balance_value(current_price)
+                target_qty = self.grid_manager.get_order_size_for_grid_level(total_val, price)
+
+                order = await self._place_limit_order_safe(price, OrderSide.SELL, quantity_override=target_qty)
                 if order:
-                    # We successfully locked stock in a sell order.
-                    # According to the plan, we should record this as stock "allocated" to the key.
-                    # Even though it's locked, it is the Tracking Field for this grid.
-                    # If we cancel it later, we know how much we had.
+                    # Record Initial Stock
                     self.grid_manager.grid_levels[price].stock_on_hand = order.amount
                     if self.bot_id:
-                        self.db.update_grid_stock(self.bot_id, price, order.amount)
+                        await self.db.update_grid_stock(self.bot_id, price, order.amount)
                     self.logger.info(f"🏁 Init: Recorded initial stock {order.amount} for grid {price}")
+
+            # --- BUY ORDERS (Phase 4 Solvency) ---
+            for price in self.grid_manager.sorted_buy_grids:
+                if price >= safe_buy_limit:
+                    continue
+
+                # Solvency Guard check
+                total_val = self.balance_tracker.get_total_balance_value(current_price)
+                target_qty = self.grid_manager.get_order_size_for_grid_level(total_val, price)
+                cost = target_qty * price
+
+                if self.balance_tracker.balance < (cost * 0.98):
+                    self.logger.warning(
+                        f"🛡️ Phase 4 Solvency: Insufficient Cash for Buy at {price}. Auto-Scaling (Stopping)."
+                    )
+                    break
+
+                await self._place_limit_order_safe(price, OrderSide.BUY)
 
         finally:
             self.initializing = False
