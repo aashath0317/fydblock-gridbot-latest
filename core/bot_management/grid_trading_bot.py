@@ -43,9 +43,11 @@ class GridTradingBot:
         no_plot: bool = False,
         bot_id: int | None = None,
         db: Any = None,  # BotDatabase
+        clean_start: bool = False,
     ):
         try:
             self.bot_id = bot_id
+            self.clean_start = clean_start
             self.db = db
             self.logger = logging.getLogger(self.__class__.__name__)
             self.config_path = config_path
@@ -136,6 +138,8 @@ class GridTradingBot:
                 self.trading_pair,
                 plotter,
             )
+            # Pass Clean Start flag
+            self.strategy.clean_start = self.clean_start
 
         except (UnsupportedExchangeError, DataFetchError, UnsupportedTimeframeError) as e:
             self.logger.error(f"{type(e).__name__}: {e}")

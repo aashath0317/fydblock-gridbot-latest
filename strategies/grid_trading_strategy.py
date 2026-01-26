@@ -164,7 +164,10 @@ class GridTradingStrategy(TradingStrategyInterface):
             has_persisted_balance = await self.balance_tracker.load_persisted_balances()
 
             # Determine Resume vs Clean Start
-            if has_active_orders:
+            if getattr(self, "clean_start", False):
+                self.logger.info("🧹 Clean Start requested. Ignoring existing DB state and forcing fresh start.")
+                self.use_hot_boot = False
+            elif has_active_orders:
                 self.logger.info("🔥 Found active orders in Database. Enabling Smart Resume (Hot Boot).")
                 self.use_hot_boot = True
             elif has_persisted_balance:
@@ -464,9 +467,8 @@ class GridTradingStrategy(TradingStrategyInterface):
 
             # ensure we initialize grid orders (State Diff / Clean Start)
             self.logger.info("State Diff Handover: Placing/Reconciling grid orders...")
-            await self.order_manager.initialize_grid_orders(current_price)
+            await self.order_manager.initialize_grid_orders(current_price, can_clean_start=not hot_boot)
 
-            return True
             return True
 
         except Exception as e:

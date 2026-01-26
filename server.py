@@ -104,6 +104,7 @@ class BotRequest(BaseModel):
     # Primary location for investment
     investment: float = 0.0
     risk_management: dict | None = None
+    clean_start: bool = False  # New flag
 
 
 class BacktestRequest(BaseModel):
@@ -408,7 +409,11 @@ async def start_bot(req: BotRequest):
         prev_status = await db.get_bot_status(req.bot_id)
         is_hot_boot = prev_status in ["RUNNING", "STARTING"]
 
-        if is_hot_boot:
+        # Override Hot Boot if User requested Clean Start
+        if req.clean_start:
+            logger.info(f"🧹 Clean Start requested for Bot {req.bot_id}. Overriding Hot Boot.")
+            is_hot_boot = False
+        elif is_hot_boot:
             logger.info(f"🔥 Bot {req.bot_id} matched in DB as {prev_status}. Initiating Hot Boot.")
 
         # Initialize Components
@@ -426,6 +431,7 @@ async def start_bot(req: BotRequest):
             no_plot=True,
             bot_id=req.bot_id,
             db=db,
+            clean_start=req.clean_start,
         )
 
         # Update DB Status to STARTING (Loading State)

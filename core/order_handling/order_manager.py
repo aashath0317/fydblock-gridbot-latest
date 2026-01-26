@@ -151,8 +151,10 @@ class OrderManager:
         # 1. Snapshot State (Net Worth)
         await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange_service, current_price)
 
-        current_coin = self.balance_tracker.crypto_balance
-        current_cash = self.balance_tracker.balance
+        # Use TOTAL (Free + Reserved) for State Diff Check.
+        # If we have funds locked in Grid Orders (Reserved), we count them as "Inventory".
+        current_coin = self.balance_tracker.crypto_balance + self.balance_tracker.reserved_crypto
+        current_cash = self.balance_tracker.balance + self.balance_tracker.reserved_fiat
 
         # 2. Compute Targets
         total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
@@ -245,13 +247,16 @@ class OrderManager:
             else:
                 self.logger.warning("Phase 2: Coin Deficit detected but Insufficient Cash to fully cover.")
 
-    async def initialize_grid_orders(self, current_price: float):
+    async def initialize_grid_orders(self, current_price: float, can_clean_start: bool = True):
         # 1. Block the Watchdog
         self.initializing = True
 
         try:
-            # 2. Phase 0: Enforce Zero State
-            await self.perform_clean_start()
+            # 2. Phase 0: Enforce Zero State (Only if fresh start / clean start)
+            if can_clean_start:
+                await self.perform_clean_start()
+            else:
+                self.logger.info("Initializing Grid Orders: Skipping Clean Start (Preserving existing orders).")
 
             self.logger.info("Initializing Grid Orders (State Diff Strategy)...")
 
@@ -1184,8 +1189,12 @@ class OrderManager:
         required_amount = deficit.get("amount", 0.0)
         reason = deficit.get("reason", "Unknown")
 
-        self.logger.warning(
-            f"⚖️ REBALANCING: Attempting to fix deficit: {reason} (Action: {action_type}, Amount: {required_amount:.6f})"
+        # FIX: Throttle this warning using the same logic as the "Paused" warning below
+        # This prevents spamming "Attempting to fix" every 5 seconds when locked.
+        self._throttled_warning(
+            f"⚖️ REBALANCING: Attempting to fix deficit: {reason} (Action: {action_type}, Amount: {required_amount:.6f})",
+            f"rebalance_locked_{self.bot_id}",
+            interval=300,
         )
 
         try:
