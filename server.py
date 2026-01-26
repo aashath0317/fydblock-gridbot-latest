@@ -693,41 +693,41 @@ async def get_bot_stats(bot_id: int):
 
         # 3. Get Order Stats (FILLED and OPEN) for calculating correct FREE balance
         # Using direct pool query for aggregation
-        try:
-            # Formula: FREE = Investment - Reserve - BuyFilled + SellFilled - BuyOpen
-            rows = await db.pool.fetch(
-                """
-                SELECT side, status, SUM(quantity * price) as total
-                FROM grid_orders 
-                WHERE bot_id = $1
-                GROUP BY side, status
-            """,
-                bot_id,
-            )
+        # try:
+        #     # Calculate correct FREE balance from order history
+        #     # FIX: Use Trade History for "Filled" amounts, as grid_orders is ephemeral/incomplete for closed orders.
+        #     # trade_aggs = await db.get_trade_aggregates(bot_id)
+        #     # buy_filled_cost = float(trade_aggs["total_buy_cost"])
+        #     # sell_filled_proceeds = float(trade_aggs["total_sell_proceeds"])
 
-            buy_filled = 0.0
-            sell_filled = 0.0
-            buy_open_total = 0.0
+        #     # For OPEN orders, we MUST still use the active grid_orders table to know what is LOCKED.
+        #     # (We already do this in the lines below for locking, but we need the TOTAL cost of open buys here too)
 
-            for row in rows:
-                side = row["side"]
-                status = row["status"]
-                total = float(row["total"]) if row["total"] else 0.0
+        #     # rows = await db.pool.fetch(
+        #     #     """
+        #     #     SELECT side, status, SUM(quantity * price) as total
+        #     #     FROM grid_orders
+        #     #     WHERE bot_id = $1 AND status = 'OPEN'
+        #     #     GROUP BY side, status
+        #     # """,
+        #     #     bot_id,
+        #     # )
 
-                if side.lower() == "buy" and status.upper() == "FILLED":
-                    buy_filled = total
-                elif side.lower() == "sell" and status.upper() == "FILLED":
-                    sell_filled = total
-                elif side.lower() == "buy" and status.upper() == "OPEN":
-                    buy_open_total = total
+        #     # buy_open_total = 0.0
+        #     # for row in rows:
+        #     #     if row["side"].lower() == "buy":
+        #     #         buy_open_total = float(row["total"] or 0.0)
 
-            # Calculate correct FREE balance from order history
-            # Note: This logic assumes 'investment' is the total started with.
-            if investment > 0:
-                correct_free = investment - reserve - buy_filled + sell_filled - buy_open_total
-                stats["holdings"]["free_quote"] = max(0.0, correct_free)
-        except Exception as e:
-            logger.error(f"Stats Aggregation Failed: {e}")
+        #     # Formula: FREE = Investment - (Money Spent Buying) + (Money Got Selling) - (Money Locked in Open Buys)
+        #     # if investment > 0:
+        #     #     # Note: 'reserve' is the *configured* operational reserve (usually 1% or accumulated profit).
+        #     #     # We deduct it because it's not "Free" to trade.
+        #     #     # However, our balance tracking in `balance_tracker` is: Balance = Inv - Reserve + Sells - Buys.
+        #     #     # So this formula reconstructs that state.
+        #     #     correct_free = investment - reserve - buy_filled_cost + sell_filled_proceeds - buy_open_total
+        #     #     stats["holdings"]["free_quote"] = max(0.0, correct_free)
+        # except Exception as e:
+        #     logger.error(f"Stats Aggregation Failed: {e}")
 
         # 3b. Get Locked Funds (grid_orders) & Order Counts
         orders = await db.get_all_active_orders(bot_id)  # Returns dict: order_id -> {price, side, amount}

@@ -421,6 +421,30 @@ class BotDatabase:
             self.logger.error(f"Failed to get trade history: {e}")
             return []
 
+    async def get_trade_aggregates(self, bot_id: int):
+        """
+        Returns the sum of all filled buy costs and sell proceeds from trade history.
+        Used to reconstruct the 'Realized Balance' flow.
+        """
+        try:
+            row = await self.pool.fetchrow(
+                """
+                SELECT 
+                    SUM(CASE WHEN side = 'buy' THEN (quantity * price) ELSE 0 END) as total_buy_cost,
+                    SUM(CASE WHEN side = 'sell' THEN (quantity * price) ELSE 0 END) as total_sell_proceeds
+                FROM trade_history
+                WHERE bot_id = $1
+            """,
+                bot_id,
+            )
+            return {
+                "total_buy_cost": row["total_buy_cost"] or 0.0,
+                "total_sell_proceeds": row["total_sell_proceeds"] or 0.0,
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to get trade aggregates: {e}")
+            return {"total_buy_cost": 0.0, "total_sell_proceeds": 0.0}
+
     async def get_active_bots(self):
         """Retrieve all bots with status 'RUNNING'."""
         try:
