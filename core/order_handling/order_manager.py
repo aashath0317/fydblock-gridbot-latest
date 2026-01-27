@@ -368,6 +368,9 @@ class OrderManager:
                         self.logger.info(f"   Ignoring unrelated order {order_id} at {price}")
                         continue
 
+                # Accumulate reserves logic removed (Redundant)
+                pass
+
                 # 4. update Grid Level State
                 grid_level = self.grid_manager.grid_levels.get(price)
 
@@ -432,12 +435,18 @@ class OrderManager:
 
             self.logger.info(f"✅ Resumed {matched_count} orders from Hot Boot.")
 
+            # Force Sync Reserves Block Removed (Redundant & caused crash)
+            # register_open_order loop above handles reserve tracking.
+
+            # Re-save state removed (GridManager has no such method, and DB is updated via OrderManager)
+            pass
             # 5. Fill Gaps (If any grids are empty but should have orders)
             # We call reconcile once to plug holes
             await self.reconcile_grid_orders(current_price)
 
         finally:
             self.initializing = False
+            self.logger.info("✅ Initialization Complete. Watchdog released.")
 
     # ==============================================================================
     #  CORE EVENT HANDLERS
@@ -928,7 +937,11 @@ class OrderManager:
 
         if self.bot_id is not None:
             db_orders = await self.db.get_all_active_orders(self.bot_id)
-            for order_id, _ in db_orders.items():
+            # Track reserves for Hot Boot restoration
+            restored_reserved_crypto = 0.0
+            restored_reserved_fiat = 0.0
+
+            for order_id, order_info in db_orders.items():
                 if order_id not in exchange_order_ids:
                     self.logger.warning(f"⚠️ Order {order_id} missing from exchange open orders. Verifying status...")
                     try:
@@ -982,8 +995,21 @@ class OrderManager:
                             await self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
 
                     except Exception as e:
-                        self.logger.error(f"Failed to verify missing order {order_id}: {e}. Marking CLOSED_UNKNOWN.")
-                        await self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
+                        err_msg = str(e).lower()
+                        if (
+                            "network" in err_msg
+                            or "timeout" in err_msg
+                            or "50001" in err_msg
+                            or "service temporarily unavailable" in err_msg
+                        ):
+                            self.logger.warning(
+                                f"⚠️ Network issue verifying order {order_id}. Retrying next cycle. ({e})"
+                            )
+                        else:
+                            self.logger.error(
+                                f"Failed to verify missing order {order_id}: {e}. Marking CLOSED_UNKNOWN."
+                            )
+                            await self.db.update_order_status(order_id, "CLOSED_UNKNOWN")
 
         # Balance Check Limits (soft check only needed later)
         # We don't block the loop on this anymore.
@@ -1042,7 +1068,11 @@ class OrderManager:
             if active_grid_order_count >= self.grid_manager.num_grids:
                 self._throttled_warning(
                     f"🛑 Max orders reached ({active_grid_order_count}/{self.grid_manager.num_grids}). Skipping BUY at {price}.",
-                    f"max_orders_buy_{self.bot_id}",
+                    f"max_orders_reached_{self.bot_id}",
+                    interval=600,
+                )
+                self.logger.debug(
+                    f"Order skipped: grid capacity full ({active_grid_order_count}/{self.grid_manager.num_grids})"
                 )
                 break
             # --------------------------------
@@ -1091,7 +1121,11 @@ class OrderManager:
             if active_grid_order_count >= self.grid_manager.num_grids:
                 self._throttled_warning(
                     f"🛑 Max orders reached ({active_grid_order_count}/{self.grid_manager.num_grids}). Skipping SELL at {price}.",
-                    f"max_orders_sell_{self.bot_id}",
+                    f"max_orders_reached_{self.bot_id}",
+                    interval=600,
+                )
+                self.logger.debug(
+                    f"Order skipped: grid capacity full ({active_grid_order_count}/{self.grid_manager.num_grids})"
                 )
                 break
             # --------------------------------
@@ -1133,7 +1167,8 @@ class OrderManager:
         deficit = self.balance_tracker.check_rebalance_needs(required_fiat, required_crypto, current_price)
 
         if deficit:
-            self.logger.info(f"⚖️ Deficit Detected: {deficit}")
+            # Throttle this log to avoid spamming every 5s when stuck
+            self._throttled_warning(f"⚖️ Deficit Detected: {deficit}", f"deficit_detected_{self.bot_id}", interval=60)
             await self.execute_rebalance(deficit, current_price)
             # We assume rebalance works. The next iteration/step will use the new funds.
 
@@ -1204,9 +1239,11 @@ class OrderManager:
                 # Check fiat balance first (redundant but safe)
                 cost = required_amount * current_price
                 if self.balance_tracker.balance < cost:
-                    self.logger.error(
+                    self._throttled_warning(
                         f"❌ CANNOT REBALANCE: Need {required_amount} crypto (Cost: {cost:.2f}) "
-                        f"but only have {self.balance_tracker.balance:.2f} fiat. Manual intervention required."
+                        f"but only have {self.balance_tracker.balance:.2f} fiat. Manual intervention required.",
+                        f"cannot_rebalance_fiat_{self.bot_id}",
+                        interval=300,
                     )
                     return False
 

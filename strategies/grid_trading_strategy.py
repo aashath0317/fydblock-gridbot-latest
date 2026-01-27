@@ -267,23 +267,9 @@ class GridTradingStrategy(TradingStrategyInterface):
         capped_equity = min(total_equity, investment_amount)
         self.logger.info(f"🔒 Equity Capped at Investment Amount: {capped_equity:.2f} (Total: {total_equity:.2f})")
 
-        # 2. Implicit Rehydration (Hot Boot Fix)
-        # If migrating from old version or DB corruption caused 0 balance state,
-        # we rehydrate the "Free Balance" with the Investment Amount so that
-        # resume_existing_orders has a pool to deduct from.
-        if self.use_hot_boot:
-            # Check for "Ghost" state (Low Balance + Low Crypto + Active Orders Exist)
-            # We use a heuristic: < 1% of investment found in tracker
-            tracked_equity = self.balance_tracker.get_total_balance_value(current_price)
-            if tracked_equity < (investment_amount * 0.01):
-                self.logger.warning(
-                    f"⚠️ Ghost State Detected (Tracked {tracked_equity:.2f} < 1% of {investment_amount}). "
-                    f"Implicitly Rehydrating Balance Tracker to {investment_amount:.2f} for Hot Boot."
-                )
-                # Reset fiat to investment cap.
-                # We assume crypto is 0 or negligible in this glitch state, or will be synced.
-                # But critical part is having Fiat to "back" the Buy Orders we are about to resume.
-                self.balance_tracker.balance = investment_amount
+        # 2. Implicit Rehydration Removed
+        # We respect the actual wallet state. If it is 0, it is 0.
+        pass
 
         # 3. Dynamic Resizing Injection
         self.logger.info(f"🔄 Calibrating Grid Sizes to Capped Equity: {capped_equity:.2f}")

@@ -253,43 +253,33 @@ class BalanceTracker:
                 effective_cap = self.investment_cap - self.operational_reserve
 
                 # ---------------------------------------------------------
-                # ISOLATION LOGIC: FIAT
+                # ISOLATION LOGIC: FIAT & CRYPTO
                 # ---------------------------------------------------------
-                # Max Fiat we can possibly have = Cap - (My Locked Crypto Value) - (My Free Crypto Value)
-                # But My Free Crypto is unknown yet.
-                # Alternative: Clamp Fiat based on simple "Cap - Current Crypto Value"?
-                # No, because Current Crypto Value might include User's 5 SOL.
+                # Logic: We should trust the Wallet for FREE funds, but CLAMP to our Investment Cap.
+                # If Wallet has MORE than we think AND it's within our budget, we sync UP.
+                # If Wallet has LESS than we think, we sync DOWN.
 
-                # We need to trust our Internal Ledger but "reconcile" downwards if Wallet is empty.
-                # If Wallet has LESS than we think, we must shrink.
-                # If Wallet has MORE than we think, we must IGNORE the excess.
+                # Determine how much "Budget" is left after accounting for our locked funds
+                locked_value = (self.reserved_crypto * current_price) + self.reserved_fiat
+                available_budget = max(0, effective_cap - locked_value)
 
-                # Sanity Check 1: We cannot have more free fiat than the wallet has.
-                checked_free_fiat = min(self.balance, wallet_free_fiat)
-
-                # Sanity Check 2: We cannot have more free crypto than the wallet has.
-                checked_free_crypto = min(self.crypto_balance, wallet_free_crypto)
-
-                # 4. Check for External Deposit "Drift" (User added funds?)
-                # If we suddenly see MORE funds, we do NOT auto-claim them unless explicitly resized.
-                # So the `min` check above implicitly handles "User added 5 SOL".
-                # self.crypto_balance (0.4) vs Wallet (5.4) -> min serves up 0.4. Correct.
-
-                # 5. Check for External Withdrawal "Drift" (User took funds?)
-                # self.crypto_balance (0.4) vs Wallet (0.2) -> min serves up 0.2.
-                # We must accept this loss to avoid order errors.
+                # Clamp wallet free funds to the available budget
+                checked_free_fiat = min(wallet_free_fiat, available_budget)
+                # Note: For crypto, we use the value to check against budget
+                checked_free_crypto = wallet_free_crypto
+                if (checked_free_crypto * current_price) > available_budget:
+                    checked_free_crypto = available_budget / current_price
 
                 if checked_free_fiat != self.balance:
-                    self.logger.warning(
-                        f"📉 Fiat Sync: Internal {self.balance:.2f} -> Wallet Limit {checked_free_fiat:.2f} "
-                        f"(User withdrew funds?)"
+                    self.logger.info(
+                        f"🔄 Fiat Sync: Internal {self.balance:.2f} -> Wallet {checked_free_fiat:.2f} "
+                        f"(Budget Cap: {effective_cap:.2f})"
                     )
                     self.balance = checked_free_fiat
 
                 if checked_free_crypto != self.crypto_balance:
-                    self.logger.warning(
-                        f"📉 Crypto Sync: Internal {self.crypto_balance:.6f} -> Wallet Limit {checked_free_crypto:.6f} "
-                        f"(User withdrew funds?)"
+                    self.logger.info(
+                        f"🔄 Crypto Sync: Internal {self.crypto_balance:.6f} -> Wallet {checked_free_crypto:.6f} "
                     )
                     self.crypto_balance = checked_free_crypto
 
@@ -409,11 +399,9 @@ class BalanceTracker:
         self.reserved_crypto -= quantity
 
         if self.reserved_crypto < 0:
-            self.crypto_balance += abs(self.reserved_crypto)  # Adjust with excess reserved crypto
-            self.reserved_crypto = 0
-
-        if self.reserved_crypto < 0:
-            self.crypto_balance += abs(self.reserved_crypto)  # Adjust with excess reserved crypto
+            # If we sold more than reserved, the remainder comes from Free Balance.
+            # reserved_crypto is negative (e.g. -2.0), so adding it reduces the balance.
+            self.crypto_balance += self.reserved_crypto
             self.reserved_crypto = 0
 
         # --- Standard Sell Completion ---
@@ -427,6 +415,16 @@ class BalanceTracker:
         self.total_fees += fee
 
         self.logger.info(f"Sell order completed. Proceeds: {sale_proceeds:.4f} {self.quote_currency} added to balance.")
+        await self._persist_balances()
+
+    async def force_update_reserves(self, fiat_reserved: float, crypto_reserved: float) -> None:
+        """
+        Manually overrides the reserved amounts.
+        Used by OrderManager during Hot Boot reconciliation to sync with existing open orders.
+        """
+        self.reserved_fiat = fiat_reserved
+        self.reserved_crypto = crypto_reserved
+        self.logger.info(f"🔄 Forced Reserve Sync: Fiat={self.reserved_fiat:.2f}, Crypto={self.reserved_crypto:.6f}")
         await self._persist_balances()
 
     async def allocate_profit_to_reserve(self, amount: float) -> None:
