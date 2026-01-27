@@ -40,7 +40,8 @@ class OrderStatusTracker:
         self.bot_id = bot_id  # Store for ownership validation
         self._monitoring_task = None
         self._active_tasks = set()
-        self.logger = logging.getLogger(self.__class__.__name__)
+        # FIX: Include bot_id and pair in logger name to distinguish instances
+        self.logger = logging.getLogger(f"{self.__class__.__name__}.{bot_id}.{trading_pair}")
         # Deduplication: Track processed fill events to prevent duplicates
         self._processed_fills: set[str] = set()
 
@@ -143,6 +144,16 @@ class OrderStatusTracker:
                 self.logger.error(f"Missing 'status' in order data: {order_data}")
                 return  # Can't raise here as it might break the loop, just return
 
+            # --- ISOLATION FIX: Filter by Trading Pair ---
+            # Every bot sees every order update on the account. We must ignore other symbols.
+            msg_symbol = (
+                order_data.get("symbol") if isinstance(order_data, dict) else getattr(order_data, "symbol", None)
+            )
+            # Normalization (e.g. OKX sometimes returns 'BTC-USDT-SWAP' vs 'BTC/USDT')
+            if msg_symbol and msg_symbol != self.trading_pair:
+                # Silently ignore orders for other symbols
+                return
+
             # Normalize status to enum if possible or string check
             # Normalize ID for deduplication
             order_id_str = str(order_id)
@@ -214,7 +225,7 @@ class OrderStatusTracker:
                                     expected_prefix = f"G{self.bot_id}x"
 
                                     if not client_oid or not str(client_oid).startswith(expected_prefix):
-                                        self.logger.warning(
+                                        self.logger.debug(
                                             f"Ignored orphan order {order_id}. Ownership mismatch. "
                                             f"Expected prefix '{expected_prefix}', got CID '{client_oid}'."
                                         )

@@ -195,7 +195,7 @@ async def solvency_check_loop():
                 # Assuming all bots trade USDT for now.
                 # TODO: Handle multi-collateral.
                 quote = "USDT"
-                global_free = float(ex_balances.get("free", {}).get(quote, 0.0))
+                global_total = float(ex_balances.get("total", {}).get(quote, 0.0))
             except Exception as e:
                 logger.warning(f"Solvency Check failed to fetch exchange balance: {e}")
                 continue
@@ -234,17 +234,17 @@ async def solvency_check_loop():
             # (Paper bots run on virtual ledgers, so they don't share a real constraint)
             total_live_demand = live_demand + live_reserve
 
-            if total_live_demand > (global_free + 1.0):
-                shortfall = total_live_demand - global_free
-                ratio = global_free / total_live_demand if total_live_demand > 0 else 0
+            if total_live_demand > (global_total + 1.0):
+                shortfall = total_live_demand - global_total
+                ratio = global_total / total_live_demand if total_live_demand > 0 else 0
 
                 logger.warning(
-                    f"🚨 SOLVENCY CRISIS (LIVE): Global Free {global_free:.2f} < Demand {total_live_demand:.2f}. "
+                    f"🚨 SOLVENCY CRISIS (LIVE): Global Total {global_total:.2f} < Demand {total_live_demand:.2f}. "
                     f"Shortfall: {shortfall:.2f}. Applying Haircut Ratio: {ratio:.4f}"
                 )
 
                 for b in live_bots:
-                    b.strategy.balance_tracker.adjust_capital_allocation(ratio)
+                    await b.strategy.balance_tracker.adjust_capital_allocation(ratio)
 
             # else:
             #     logger.info(f"✅ Solvency Check Passed: Free {global_free:.2f} >= Demand {total_demand:.2f}")

@@ -35,7 +35,7 @@ class BalanceTracker:
             db: The persistent database instance.
             bot_id: The ID of the bot owning this tracker.
         """
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = logging.getLogger(f"{self.__class__.__name__}.{bot_id}.{base_currency}-{quote_currency}")
         self.event_bus: EventBus = event_bus
         self.fee_calculator: FeeCalculator = fee_calculator
         self.trading_mode: TradingMode = trading_mode
@@ -52,6 +52,16 @@ class BalanceTracker:
         self.investment_cap: float = float("inf")
         self.operational_reserve: float = 0.0  # Dynamic Fee Stabilization Reserve
         self._last_drift_warning_time = 0
+        self._log_throttle = {}
+
+    def _throttled_info(self, msg: str, key: str, interval: int = 300):
+        """Logs an info message only if 'interval' seconds have passed for 'key'."""
+        import time
+
+        now = time.time()
+        if now - self._log_throttle.get(key, 0) > interval:
+            self.logger.info(msg)
+            self._log_throttle[key] = now
 
     async def _persist_balances(self):
         """Saves current balance state to DB."""
@@ -263,23 +273,41 @@ class BalanceTracker:
                 locked_value = (self.reserved_crypto * current_price) + self.reserved_fiat
                 available_budget = max(0, effective_cap - locked_value)
 
-                # Clamp wallet free funds to the available budget
-                checked_free_fiat = min(wallet_free_fiat, available_budget)
-                # Note: For crypto, we use the value to check against budget
-                checked_free_crypto = wallet_free_crypto
-                if (checked_free_crypto * current_price) > available_budget:
-                    checked_free_crypto = available_budget / current_price
+                # --- ISOLATION FIX: SYNC-DOWN ONLY ---
+                # Logic: We should trust the Wallet for REALITY CHECKS (Sync Down).
+                # But we should NOT "snatch" funds from the wallet just because they are there (No Sync Up).
+                # If we sync up, we might be stealing funds that belong to other bots or the user's HODL stack.
+
+                # FIAT:
+                checked_free_fiat = self.balance
+                if wallet_free_fiat < self.balance:
+                    # Wallet has less than we think. We must sync down.
+                    checked_free_fiat = wallet_free_fiat
+                elif wallet_free_fiat > self.balance:
+                    # Wallet has more. We only take it if it fits our budget AND we previously had less.
+                    # However, to be safe in multi-bot setups, we avoid auto-sync-up.
+                    # If the user wants to increase bot funds, they should adjust capital allocation.
+                    pass
+
+                # CRYPTO:
+                checked_free_crypto = self.crypto_balance
+                if wallet_free_crypto < self.crypto_balance:
+                    checked_free_crypto = wallet_free_crypto
 
                 if checked_free_fiat != self.balance:
-                    self.logger.info(
-                        f"🔄 Fiat Sync: Internal {self.balance:.2f} -> Wallet {checked_free_fiat:.2f} "
-                        f"(Budget Cap: {effective_cap:.2f})"
+                    self._throttled_info(
+                        f"🔄 Fiat Sync (DOWN): Internal {self.balance:.2f} -> Wallet {checked_free_fiat:.2f} "
+                        f"(Budget Cap: {effective_cap:.2f})",
+                        f"fiat_sync_{self.bot_id}",
+                        interval=60,
                     )
                     self.balance = checked_free_fiat
 
                 if checked_free_crypto != self.crypto_balance:
-                    self.logger.info(
-                        f"🔄 Crypto Sync: Internal {self.crypto_balance:.6f} -> Wallet {checked_free_crypto:.6f} "
+                    self._throttled_info(
+                        f"🔄 Crypto Sync (DOWN): Internal {self.crypto_balance:.6f} -> Wallet {checked_free_crypto:.6f} ",
+                        f"crypto_sync_{self.bot_id}",
+                        interval=60,
                     )
                     self.crypto_balance = checked_free_crypto
 
@@ -642,8 +670,8 @@ class BalanceTracker:
         total_crypto = self.get_adjusted_crypto_balance()
         if total_crypto < required_crypto:
             shortfall = required_crypto - total_crypto
-            # Ensure shortfall is significant (> 1% of required or some min value)
-            if shortfall > (required_crypto * 0.01):
+            # Ensure shortfall is significant (> 1.5% of required or some min value)
+            if shortfall > (required_crypto * 0.015):
                 self.logger.warning(
                     f"⚠️ Rebalance Needed: Crypto Shortfall. Have {total_crypto} (Free+Reserved), Need {required_crypto}."
                 )
@@ -656,12 +684,14 @@ class BalanceTracker:
         # 2. Check Excess Crypto (Liquidation of Dust/Old Grid inventory)
         # MOVED UP: Priority is to liquidate excess assets to fund the Buy side naturally.
         # If we have significantly MORE crypto than needed, sell it to free up Fiat.
-        if total_crypto > (required_crypto * 1.005):  # 0.5% buffer
+        if total_crypto > (required_crypto * 1.015):  # 1.5% buffer
             excess_crypto = total_crypto - required_crypto
 
-            self.logger.info(
+            self._throttled_info(
                 f"♻️ Excess Crypto Detected: Have {total_crypto:.6f}, Need {required_crypto:.6f}. "
-                f"Liquidating {excess_crypto:.6f} to rebalance portfolio."
+                f"Liquidating {excess_crypto:.6f} to rebalance portfolio.",
+                f"excess_crypto_{self.bot_id}",
+                interval=300,
             )
             return {
                 "type": "SELL_CRYPTO",
@@ -674,7 +704,7 @@ class BalanceTracker:
         total_fiat = self.get_adjusted_fiat_balance()
         if total_fiat < required_fiat:
             shortfall = required_fiat - total_fiat
-            if shortfall > (required_fiat * 0.01):
+            if shortfall > (required_fiat * 0.015):
                 # We need to raise 'shortfall' USDT.
                 # Amount of crypto to SELL = shortfall / current_price
                 crypto_to_sell = shortfall / current_price if current_price > 0 else 0
@@ -690,7 +720,7 @@ class BalanceTracker:
 
         return None
 
-    def adjust_capital_allocation(self, ratio: float) -> None:
+    async def adjust_capital_allocation(self, ratio: float) -> None:
         """
         Global Solvency Mechanism:
         Reduces the specific bot's liquid capital and reserves by a ratio < 1.0.
@@ -715,4 +745,4 @@ class BalanceTracker:
             f"Balance {old_bal:.4f} -> {self.balance:.4f}, "
             f"Reserve {old_res:.4f} -> {self.operational_reserve:.4f}"
         )
-        self._persist_balances()
+        await self._persist_balances()

@@ -56,6 +56,8 @@ class OrderManager:
         self.bot_id = bot_id
         self.backend_url = backend_url
         self.initializing = False
+        self.logger = logging.getLogger(f"{self.__class__.__name__}.{bot_id}.{trading_pair}")
+        self._rebalancing_lock = asyncio.Lock()
 
         # --- LOCKS ---
         self._placing_orders = set()  # Tracks prices currently being processed for orders
@@ -872,6 +874,8 @@ class OrderManager:
                             # Recursively retry ONCE with new stock
                             if actual_crypto > 0.0001:
                                 self.logger.info("🔁 Retrying Sell Order with synced balance...")
+                                # FIX: Important to discard the lock BEFORE retrying
+                                self._placing_orders.discard(price)
                                 return await self._place_limit_order_safe(price, side, quantity_override=actual_crypto)
                             else:
                                 self.logger.warning("🚫 Balance too low to retry.")
@@ -1217,8 +1221,9 @@ class OrderManager:
         """
         Executes a MARKET order to fix a balance deficit.
         """
-        if not deficit:
-            return False
+        async with self._rebalancing_lock:
+            if not deficit:
+                return False
 
         action_type = deficit.get("type")
         required_amount = deficit.get("amount", 0.0)
