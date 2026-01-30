@@ -229,9 +229,27 @@ class OrderStatusTracker:
                             else getattr(order_data, "pair", None)
                         )
 
-                        # Fallback to known trading pair if missing in update (common in some WS streams)
+                        # Fallback to known trading pair ONLY if we can verify ownership via clientOrderId
                         if not symbol:
-                            symbol = self.trading_pair
+                            info = (
+                                order_data.get("info", {})
+                                if isinstance(order_data, dict)
+                                else getattr(order_data, "info", {})
+                            )
+                            client_oid = (
+                                info.get("clientOrderId") or info.get("clOrdId") or info.get("client_oid")
+                                if info
+                                else None
+                            )
+                            expected_prefix = f"G{self.bot_id}x"
+
+                            # checks if the order belongs to this bot
+                            if client_oid and str(client_oid).startswith(expected_prefix):
+                                symbol = self.trading_pair
+                            else:
+                                # If we can't verify it's ours, DO NOT assume it is.
+                                # This prevents 'Order does not exist' errors when another bot's order comes in without a symbol.
+                                return
 
                         if not symbol:
                             self.logger.error(f"Cannot recover orphan order {order_id}: Symbol missing in update data.")

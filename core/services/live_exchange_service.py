@@ -177,6 +177,7 @@ class LiveExchangeService(ExchangeInterface):
                             "status": order["status"],
                             "filled": float(order.get("filled", 0.0)),
                             "remaining": float(order.get("remaining", 0.0)),
+                            "symbol": order.get("symbol"),
                             "clientOrderId": order.get("clientOrderId") or order.get("info", {}).get("clOrdId"),
                             "raw": order,  # Keep raw just in case
                         }

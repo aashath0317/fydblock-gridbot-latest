@@ -728,6 +728,69 @@ class OrderManager:
                 # Place new/replacement sell order with total accumulated stock
                 await self._place_sell_order(grid_level, paired_sell_level, paired_sell_level.stock_on_hand)
 
+                # --- QUOTE MODE: SELL PROFIT COINS IMMEDIATELY ---
+                # Calculate the EXACT profit coins from THIS cycle only
+                # This prevents accidentally selling user's other holdings
+                self.logger.info(f"🔎 DEBUG: Checking Profit Logic. Type: {order_size_type}")
+
+                if order_size_type == "quote":
+                    coins_bought = order.filled  # Amount we just bought
+                    buy_price = order.average or order.price
+                    sell_price = paired_sell_level.price
+
+                    # Calculate how many coins were allocated to the sell order
+                    # This is: USDT_cost / sell_price
+                    usdt_cost = paired_sell_level.order_quantity
+                    coins_to_sell = usdt_cost / sell_price if sell_price > 0 else 0
+
+                    # Profit coins = what we bought - what we're selling
+                    theoretical_profit_coins = coins_bought - coins_to_sell
+
+                    self.logger.info(
+                        f"🔎 DEBUG: Bought: {coins_bought}, Sell Qty: {coins_to_sell}, "
+                        f"Profit: {theoretical_profit_coins}, Val: {theoretical_profit_coins * buy_price}"
+                    )
+
+                    # Only sell if meaningful amount (> $1 USDT value)
+                    if theoretical_profit_coins > 0 and theoretical_profit_coins * buy_price > 1.0:
+                        try:
+                            # 1. Sync Balances to get Real Wallet State
+                            # This ensures we don't try to sell phantom coins if fees ate them
+                            await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange, buy_price)
+
+                            # 2. Determine Safe Sell Amount
+                            # Use the MIN of (Theoretical Profit) and (Actual Wallet Balance)
+                            # This handles cases where dust/fees reduced the real balance below theoretical
+                            actual_balance = self.balance_tracker.crypto_balance
+                            safe_sell_amount = min(theoretical_profit_coins, actual_balance)
+
+                            # 3. Apply a tiny safety buffer (99.9%) to avoid "insufficient balance" on rounding
+                            safe_sell_amount *= 0.999
+
+                            self.logger.info(
+                                f"💎 Profit Coins: {safe_sell_amount:.6f} "
+                                f"(Theoretical: {theoretical_profit_coins:.6f}, Actual: {actual_balance:.6f})"
+                            )
+
+                            adj_qty = self.order_validator.adjust_and_validate_sell_quantity(
+                                safe_sell_amount, safe_sell_amount
+                            )
+                            if adj_qty > 0:
+                                profit_order = await self.order_execution_strategy.execute_market_order(
+                                    OrderSide.SELL, self.trading_pair, adj_qty, buy_price
+                                )
+                                if profit_order and profit_order.status == OrderStatus.CLOSED:
+                                    proceeds = profit_order.filled * (profit_order.average or buy_price)
+                                    self.balance_tracker.crypto_balance -= profit_order.filled
+                                    self.balance_tracker.balance += proceeds
+                                    self.logger.info(
+                                        f"✅ Profit Coins Sold: {profit_order.filled:.6f} @ "
+                                        f"{profit_order.average or buy_price:.4f} = +{proceeds:.4f} USDT"
+                                    )
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ Failed to sell profit coins: {e}")
+                # ------------------------------------------------
+
         else:
             self.logger.warning(
                 f"No valid sell grid level found for buy grid level {grid_level}. Stock remains on Buy Level."
@@ -850,39 +913,7 @@ class OrderManager:
             self.logger.warning("Could not calculate profit: No paired buy level found.")
         # -------------------
 
-        # --- QUOTE MODE: SELL LEFTOVER "PROFIT COINS" ---
-        # In Quote Mode, we sell fewer coins to match the USDT cost.
-        # After main sell completes, sell any remaining crypto as profit.
-        order_size_type = self.grid_manager.config_manager.get_order_size_type()
-        if order_size_type == "quote":
-            # Check remaining crypto balance (now freed after sell completes)
-            remaining_crypto = self.balance_tracker.crypto_balance
-            sell_price = order.average or order.price
-
-            # Only sell if meaningful amount (> 1 USDT value)
-            if remaining_crypto > 0 and remaining_crypto * sell_price > 1.0:
-                self.logger.info(
-                    f"💎 Profit Coins Detected: {remaining_crypto:.6f} coins "
-                    f"(~{remaining_crypto * sell_price:.2f} USDT)"
-                )
-                try:
-                    # Adjust quantity for exchange precision
-                    adj_qty = self.order_validator.adjust_and_validate_sell_quantity(remaining_crypto, remaining_crypto)
-                    if adj_qty > 0:
-                        profit_order = await self.order_execution_strategy.execute_market_order(
-                            OrderSide.SELL, self.trading_pair, adj_qty, sell_price
-                        )
-                        if profit_order and profit_order.status == OrderStatus.CLOSED:
-                            proceeds = profit_order.filled * (profit_order.average or sell_price)
-                            self.balance_tracker.crypto_balance -= profit_order.filled
-                            self.balance_tracker.balance += proceeds
-                            self.logger.info(
-                                f"✅ Profit Coins Sold: {profit_order.filled:.6f} @ "
-                                f"{profit_order.average or sell_price:.4f} = +{proceeds:.4f} USDT"
-                            )
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Failed to sell profit coins: {e}")
-        # ------------------------------------------------
+        # (Profit coins are now sold in _handle_buy_order_completion with exact calculation)
 
         # --- REPLENISHMENT ---
         if paired_buy_level:
