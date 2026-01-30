@@ -93,12 +93,32 @@ class GridTradingStrategy(TradingStrategyInterface):
 
                 actual_crypto = float(balances.get(base_currency, {}).get("free", 0.0))
 
-                # Update the tracker with the REAL amount to sell
-                self.balance_tracker.crypto_balance = actual_crypto
-                self.logger.info(f"?? Balance Synced for Liquidation: {actual_crypto} {base_currency}")
+                # --- SAFE LIQUIDATION FIX ---
+                # Only sell what we own/track. Do NOT wipe the whole wallet if shared.
+                # FIX: Include RESERVED crypto (from cancelled orders) in tracked amount
+                # Since we stopped tracking, the release event might not have fired, so we manually sum them.
+                tracked_crypto = self.balance_tracker.crypto_balance + self.balance_tracker.reserved_crypto
 
-                # 4. Sell everything to Quote Currency
-                await self.order_manager.liquidate_positions(current_price)
+                # We sell the minimum of what we have and what we think we have.
+                # If we think we have more than actual, we can only sell actual.
+                # If we have more actual than tracked (user funds), we only sell tracked.
+                safe_sell_amount = min(actual_crypto, tracked_crypto)
+
+                self.logger.info(
+                    f"?? Safe Liquidation: Actual={actual_crypto}, Tracked={tracked_crypto} "
+                    f"(Free: {self.balance_tracker.crypto_balance}, Reserved: {self.balance_tracker.reserved_crypto}). "
+                    f"Selling {safe_sell_amount} {base_currency}."
+                )
+
+                if safe_sell_amount > 0:
+                    # Update tracker to match reality before selling (for consistency)
+                    self.balance_tracker.crypto_balance = safe_sell_amount
+
+                    # 4. Sell everything to Quote Currency
+                    # OrderManager uses balance_tracker.crypto_balance, so this works safely now.
+                    await self.order_manager.liquidate_positions(current_price)
+                else:
+                    self.logger.warning("?? Nothing to liquidate (Safe Amount is 0).")
 
             except Exception as e:
                 self.logger.error(f"Error during emergency cleanup: {e}", exc_info=True)

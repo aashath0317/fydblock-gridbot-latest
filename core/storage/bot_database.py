@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 import logging
 import os
@@ -21,20 +22,41 @@ class BotDatabase:
 
             self.db_url = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
 
-    async def connect(self):
-        """Initializes the connection pool and creates tables."""
-        try:
-            # DEBUG: Log the host and partial URL to debug connection issues
-            self.logger.info(f"🔌 Attempting to connect to DB Host: {self.host}, Port: {self.port}, DB: {self.dbname}")
+    async def connect(self, max_retries: int = 5, initial_delay: float = 2.0):
+        """Initializes the connection pool with retry logic and creates tables."""
+        delay = initial_delay
 
-            self.pool = await asyncpg.create_pool(
-                user=self.user, password=self.password, host=self.host, port=self.port, database=self.dbname
-            )
-            self.logger.info("✅ Connected to PostgreSQL Database")
-            await self._init_db()
-        except Exception as e:
-            self.logger.critical(f"❌ Failed to connect to PostgreSQL: {e}")
-            raise
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.logger.info(
+                    f"🔌 Attempting to connect to DB Host: {self.host}, Port: {self.port}, DB: {self.dbname} (attempt {attempt}/{max_retries})"
+                )
+
+                self.pool = await asyncpg.create_pool(
+                    user=self.user,
+                    password=self.password,
+                    host=self.host,
+                    port=self.port,
+                    database=self.dbname,
+                    min_size=2,  # Keep at least 2 connections ready
+                    max_size=20,  # Maximum pool size
+                    command_timeout=30,  # Timeout for individual commands
+                    timeout=10,  # Connection acquisition timeout
+                )
+                self.logger.info("✅ Connected to PostgreSQL Database")
+                await self._init_db()
+                return  # Success - exit retry loop
+
+            except Exception as e:
+                self.logger.error(f"❌ Connection attempt {attempt}/{max_retries} failed: {e}")
+
+                if attempt < max_retries:
+                    self.logger.info(f"🔄 Retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 30)  # Exponential backoff, max 30s
+                else:
+                    self.logger.critical(f"❌ All {max_retries} connection attempts failed. Cannot start bot.")
+                    raise
 
     async def close(self):
         """Closes the connection pool."""
@@ -104,11 +126,20 @@ class BotDatabase:
                         price DOUBLE PRECISION,
                         status TEXT,
                         stock_on_hand DOUBLE PRECISION DEFAULT 0.0,
+                        order_quantity DOUBLE PRECISION DEFAULT 0.0,
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                         PRIMARY KEY (bot_id, price)
                     )
                 """)
+
+                # 3c. Auto-Migration: Add order_quantity column if it doesn't exist
+                try:
+                    await conn.execute(
+                        "ALTER TABLE grid_levels ADD COLUMN IF NOT EXISTS order_quantity DOUBLE PRECISION DEFAULT 0.0"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Migration: optional order_quantity check: {e}")
 
                 # 4. Trade History Table
                 await conn.execute("""
@@ -458,22 +489,26 @@ class BotDatabase:
             return []
 
     # --- Grid Level Persistence (Infinite Grid) ---
-    async def add_grid_level(self, bot_id: int, price: float, status: str, stock_on_hand: float = 0.0):
+    async def add_grid_level(
+        self, bot_id: int, price: float, status: str, stock_on_hand: float = 0.0, order_quantity: float = 0.0
+    ):
         """Inserts a new grid level into the database."""
         try:
             await self.pool.execute(
                 """
-                INSERT INTO grid_levels (bot_id, price, status, stock_on_hand, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, NOW(), NOW())
+                INSERT INTO grid_levels (bot_id, price, status, stock_on_hand, order_quantity, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                 ON CONFLICT(bot_id, price) DO UPDATE SET
                     status=EXCLUDED.status,
                     stock_on_hand=EXCLUDED.stock_on_hand,
+                    order_quantity=EXCLUDED.order_quantity,
                     updated_at=NOW()
             """,
                 bot_id,
                 price,
                 status,
                 stock_on_hand,
+                order_quantity,
             )
         except Exception as e:
             self.logger.error(f"Failed to add grid level {price}: {e}")
@@ -523,15 +558,33 @@ class BotDatabase:
         """Retrieves all grid levels for this bot."""
         try:
             rows = await self.pool.fetch(
-                "SELECT price, status, stock_on_hand FROM grid_levels WHERE bot_id = $1", bot_id
+                "SELECT price, status, stock_on_hand, order_quantity FROM grid_levels WHERE bot_id = $1", bot_id
             )
             return {
                 row["price"]: {
                     "status": row["status"],
                     "stock": row["stock_on_hand"] if row["stock_on_hand"] is not None else 0.0,
+                    "order_quantity": row["order_quantity"] if row["order_quantity"] is not None else 0.0,
                 }
                 for row in rows
             }
         except Exception as e:
             self.logger.error(f"Failed to get grid levels: {e}")
             return {}
+
+    async def update_grid_order_quantity(self, bot_id: int, price: float, order_quantity: float):
+        """Updates the order_quantity for a grid level."""
+        try:
+            await self.pool.execute(
+                """
+                UPDATE grid_levels
+                SET order_quantity = $1, updated_at = NOW()
+                WHERE bot_id = $2 AND price = $3
+            """,
+                order_quantity,
+                bot_id,
+                price,
+            )
+            self.logger.info(f"💾 DB: Updated order_quantity for {price} to {order_quantity:.6f}")
+        except Exception as e:
+            self.logger.error(f"Failed to update order_quantity for {price}: {e}")

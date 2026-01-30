@@ -1,6 +1,8 @@
 import asyncio
+import bisect
 import logging
 import math
+import time
 import uuid
 
 import aiohttp
@@ -13,7 +15,7 @@ from core.bot_management.notification.notification_handler import NotificationHa
 from core.storage.bot_database import BotDatabase
 from strategies.strategy_type import StrategyType
 
-from ..grid_management.grid_level import GridLevel
+from ..grid_management.grid_level import GridCycleState, GridLevel
 from ..grid_management.grid_manager import GridManager
 from ..order_handling.balance_tracker import BalanceTracker
 from ..order_handling.order_book import OrderBook
@@ -286,10 +288,12 @@ class OrderManager:
 
                 order = await self._place_limit_order_safe(price, OrderSide.SELL, quantity_override=target_qty)
                 if order:
-                    # Record Initial Stock
+                    # Record Initial Stock and Order Quantity
                     self.grid_manager.grid_levels[price].stock_on_hand = order.amount
+                    self.grid_manager.grid_levels[price].order_quantity = order.amount
                     if self.bot_id is not None:
                         await self.db.update_grid_stock(self.bot_id, price, order.amount)
+                        await self.db.update_grid_order_quantity(self.bot_id, price, order.amount)
                     self.logger.info(f"🏁 Init: Recorded initial stock {order.amount} for grid {price}")
 
             # --- BUY ORDERS (Phase 4 Solvency) ---
@@ -303,9 +307,13 @@ class OrderManager:
                 cost = target_qty * price
 
                 if self.balance_tracker.balance < (cost * 0.98):
+                    # Gather all remaining grids to skip
+                    skipped_prices = [p for p in self.grid_manager.sorted_buy_grids if p <= price]
                     self.logger.warning(
-                        f"🛡️ Phase 4 Solvency: Insufficient Cash for Buy at {price}. Auto-Scaling (Stopping)."
+                        f"🛡️ Phase 4 Solvency: Insufficient Cash for Buy at {price}. "
+                        f"Auto-Scaling: Trimming {len(skipped_prices)} grids."
                     )
+                    self.grid_manager.deactivate_grid_levels(skipped_prices)
                     break
 
                 await self._place_limit_order_safe(price, OrderSide.BUY)
@@ -468,6 +476,31 @@ class OrderManager:
             # For SELL, we reserved (Amount) of crypto
             await self.balance_tracker.release_reserve_for_sell(order.remaining)
 
+        # FIX: Reset Grid Level State
+        grid_level = self.grid_manager.grid_levels.get(order.price)
+        if not grid_level:
+            # Fallback for float precision issues
+            for price, level in self.grid_manager.grid_levels.items():
+                if math.isclose(price, order.price, rel_tol=1e-9):
+                    grid_level = level
+                    break
+
+        if grid_level:
+            # Remove order from level references
+            initial_count = len(grid_level.orders)
+            # Remove by ID
+            grid_level.orders = [o for o in grid_level.orders if str(o.identifier) != str(order.identifier)]
+
+            # If we removed an order and no active orders remain, reset state
+            if len(grid_level.orders) == 0 and initial_count > 0:
+                if order.side == OrderSide.BUY:
+                    grid_level.state = GridCycleState.READY_TO_BUY
+                elif order.side == OrderSide.SELL:
+                    grid_level.state = GridCycleState.READY_TO_SELL
+                self.logger.info(
+                    f"🔄 Grid Level {grid_level.price} reset to {grid_level.state.name} after cancellation."
+                )
+
         await self.notification_handler.async_send_notification(
             NotificationType.ORDER_CANCELLED,
             order_details=str(order),
@@ -493,6 +526,35 @@ class OrderManager:
                 # But here we explicitly call: await self.balance_tracker.update_balance_on_order_completion(order)
                 # We SHOULD call it to ensure local state is fresh before next logic.
                 await self.balance_tracker.update_balance_on_order_completion(order)
+
+                # --- FIX: Clear phantom stock when rebalance SELL orders fill ---
+                # When we liquidate "excess crypto" via MARKET SELL, that crypto was counted
+                # as stock_on_hand on grid levels. We must reduce it to prevent accumulation.
+                if order.side == OrderSide.SELL:
+                    sold_amount = order.filled
+                    remaining_to_clear = sold_amount
+
+                    # Clear stock from sell grids (highest first, as that's where stock accumulates)
+                    for price in sorted(self.grid_manager.sorted_sell_grids, reverse=True):
+                        if remaining_to_clear <= 0:
+                            break
+                        grid_level = self.grid_manager.grid_levels.get(price)
+                        if grid_level and grid_level.stock_on_hand > 0:
+                            cleared = min(grid_level.stock_on_hand, remaining_to_clear)
+                            grid_level.stock_on_hand -= cleared
+                            grid_level.stock_on_hand = round(grid_level.stock_on_hand, 6)
+                            remaining_to_clear -= cleared
+
+                            if self.bot_id is not None:
+                                await self.db.update_grid_stock(self.bot_id, price, grid_level.stock_on_hand)
+
+                            self.logger.info(
+                                f"🧹 Cleared phantom stock: {cleared:.6f} from grid {price} "
+                                f"(Remaining stock: {grid_level.stock_on_hand:.6f})"
+                            )
+
+                    if remaining_to_clear > 0.0001:
+                        self.logger.warning(f"⚠️ Could not fully clear sold amount. Remaining: {remaining_to_clear:.6f}")
 
                 if self.bot_id is not None:
                     await self.db.update_order_status(order.identifier, "FILLED")
@@ -597,28 +659,75 @@ class OrderManager:
 
         if paired_sell_level:
             # TRANSFER STOCK: Buy Level -> Sell Level
-            # Accumulate on Sell Level (prevent dust overwrite)
+            # SET (not accumulate) - each sell uses what THIS buy purchased
             amount_to_transfer = grid_level.stock_on_hand
-            paired_sell_level.stock_on_hand += amount_to_transfer
-            paired_sell_level.stock_on_hand = round(paired_sell_level.stock_on_hand, 6)  # Rounding safety
+
+            # FIX: SET order_quantity based on Order Size Type
+            # Quote Mode: Store USDT cost (so sell calculates coins = cost / sell_price)
+            # Base Mode: Store coin quantity (consistent coin amount per trade)
+            order_size_type = self.grid_manager.config_manager.get_order_size_type()
+            buy_price = order.average or order.price
+
+            if order_size_type == "quote":
+                # Quote Mode: Store the USDT cost of this buy
+                usdt_cost = buy_price * net_coin_received
+                paired_sell_level.order_quantity = usdt_cost
+                self.logger.info(f"📊 Quote Mode: Storing USDT cost {usdt_cost:.4f} for sell calculation")
+            else:
+                # Base Mode: Store the coin quantity
+                paired_sell_level.order_quantity = net_coin_received
+
+            paired_sell_level.stock_on_hand = amount_to_transfer  # Replace, not accumulate
+            paired_sell_level.stock_on_hand = round(paired_sell_level.stock_on_hand, 6)
 
             if self.bot_id is not None:
-                # Update DB with TOTAL stock (not just the increment)
+                # Update DB with stock and order_quantity
                 await self.db.update_grid_stock(self.bot_id, paired_sell_level.price, paired_sell_level.stock_on_hand)
+                await self.db.update_grid_order_quantity(
+                    self.bot_id, paired_sell_level.price, paired_sell_level.order_quantity
+                )
 
             # Clear Buy Level
             grid_level.stock_on_hand = 0.0
+            grid_level.order_quantity = 0.0
             if self.bot_id is not None:
                 await self.db.update_grid_stock(self.bot_id, grid_level.price, 0.0)
 
             self.logger.info(
-                f"🚚 Stock Transferred: {amount_to_transfer:.6f} moved from {grid_level.price} to {paired_sell_level.price} "
-                f"(Total Sell Stock: {paired_sell_level.stock_on_hand:.6f})"
+                f"🚚 Stock Transferred: {amount_to_transfer:.6f} coins from {grid_level.price} to {paired_sell_level.price} "
+                f"(Order Value: {paired_sell_level.order_quantity:.4f} {'USDT' if order_size_type == 'quote' else 'coins'})"
             )
 
             if self.grid_manager.can_place_order(paired_sell_level, OrderSide.SELL):
-                # FIX: Pass the EXACT net coin quantity
-                await self._place_sell_order(grid_level, paired_sell_level, net_coin_received)
+                # Check if we're in accumulation mode (sell order already pending)
+                if paired_sell_level.state == GridCycleState.WAITING_FOR_SELL_FILL:
+                    # Stock accumulated! Cancel old order and replace with new one for total stock
+                    self.logger.info(
+                        f"📦 Stock accumulated on {paired_sell_level.price}. "
+                        f"Cancelling old sell order and replacing with total stock: {paired_sell_level.stock_on_hand:.6f}"
+                    )
+
+                    # Cancel existing order(s) at this level
+                    for order in list(paired_sell_level.orders):
+                        try:
+                            # Extract order ID (could be Order object or just ID)
+                            order_id = order.identifier if hasattr(order, "identifier") else order
+                            # Skip if order is already filled/closed
+                            if hasattr(order, "status") and order.status == OrderStatus.CLOSED:
+                                self.logger.debug(f"Skipping cancel for already-filled order {order_id}")
+                                continue
+                            await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
+                            self.logger.info(f"✅ Cancelled old sell order {order_id} at {paired_sell_level.price}")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to cancel order {order}: {e}")
+
+                    # Clear the orders list and reset state
+                    paired_sell_level.orders.clear()
+                    self.grid_manager.complete_order(paired_sell_level, OrderSide.SELL)
+
+                # Place new/replacement sell order with total accumulated stock
+                await self._place_sell_order(grid_level, paired_sell_level, paired_sell_level.stock_on_hand)
+
         else:
             self.logger.warning(
                 f"No valid sell grid level found for buy grid level {grid_level}. Stock remains on Buy Level."
@@ -654,9 +763,28 @@ class OrderManager:
         self.logger.info(f"Sell order completed at grid level {grid_level}.")
         self.grid_manager.complete_order(grid_level, OrderSide.SELL)
 
+        # --- FIX: Clear stock_on_hand and order_quantity after sell order completes ---
+        # The crypto has been sold, so we must zero out the stock tracking.
+        # This prevents phantom stock accumulation where future buys add to old, already-sold stock.
+        sold_amount = order.filled
+        if grid_level.stock_on_hand > 0 or grid_level.order_quantity > 0:
+            cleared = min(grid_level.stock_on_hand, sold_amount) if grid_level.stock_on_hand > 0 else sold_amount
+            grid_level.stock_on_hand = 0.0
+            grid_level.order_quantity = 0.0
+
+            if self.bot_id is not None:
+                await self.db.update_grid_stock(self.bot_id, grid_level.price, 0.0)
+                await self.db.update_grid_order_quantity(self.bot_id, grid_level.price, 0.0)
+
+            self.logger.info(
+                f"🧹 Cleared sold stock: {cleared:.6f} from grid {grid_level.price} "
+                f"(Stock and Order Quantity reset to 0)"
+            )
+        # -----------------------------------------------------------
+
         # --- FIX: Determine Buy Level FIRST (with fallback) ---
         # Try to find the paired buy level (explicit or theoretical)
-        paired_buy_level = self._get_or_create_paired_buy_level(grid_level)
+        paired_buy_level = await self._get_or_create_paired_buy_level(grid_level)
         # ------------------------------------------------------
 
         # --- PROFIT SYNC ---
@@ -722,6 +850,40 @@ class OrderManager:
             self.logger.warning("Could not calculate profit: No paired buy level found.")
         # -------------------
 
+        # --- QUOTE MODE: SELL LEFTOVER "PROFIT COINS" ---
+        # In Quote Mode, we sell fewer coins to match the USDT cost.
+        # After main sell completes, sell any remaining crypto as profit.
+        order_size_type = self.grid_manager.config_manager.get_order_size_type()
+        if order_size_type == "quote":
+            # Check remaining crypto balance (now freed after sell completes)
+            remaining_crypto = self.balance_tracker.crypto_balance
+            sell_price = order.average or order.price
+
+            # Only sell if meaningful amount (> 1 USDT value)
+            if remaining_crypto > 0 and remaining_crypto * sell_price > 1.0:
+                self.logger.info(
+                    f"💎 Profit Coins Detected: {remaining_crypto:.6f} coins "
+                    f"(~{remaining_crypto * sell_price:.2f} USDT)"
+                )
+                try:
+                    # Adjust quantity for exchange precision
+                    adj_qty = self.order_validator.adjust_and_validate_sell_quantity(remaining_crypto, remaining_crypto)
+                    if adj_qty > 0:
+                        profit_order = await self.order_execution_strategy.execute_market_order(
+                            OrderSide.SELL, self.trading_pair, adj_qty, sell_price
+                        )
+                        if profit_order and profit_order.status == OrderStatus.CLOSED:
+                            proceeds = profit_order.filled * (profit_order.average or sell_price)
+                            self.balance_tracker.crypto_balance -= profit_order.filled
+                            self.balance_tracker.balance += proceeds
+                            self.logger.info(
+                                f"✅ Profit Coins Sold: {profit_order.filled:.6f} @ "
+                                f"{profit_order.average or sell_price:.4f} = +{proceeds:.4f} USDT"
+                            )
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Failed to sell profit coins: {e}")
+        # ------------------------------------------------
+
         # --- REPLENISHMENT ---
         if paired_buy_level:
             # FIX: Pass 0.0 quantity to force recalculation based on config (Fixed USDT vs Fixed Coin)
@@ -729,14 +891,98 @@ class OrderManager:
         else:
             self.logger.error(f"Failed to find or create a paired buy grid level for grid level {grid_level}.")
 
-    def _get_or_create_paired_buy_level(self, sell_grid_level: GridLevel) -> GridLevel | None:
+    async def _get_or_create_paired_buy_level(self, sell_grid_level: GridLevel) -> GridLevel | None:
+        # 1. Try explicit pairing (set during order flow)
         paired_buy_level = sell_grid_level.paired_buy_level
         if paired_buy_level and self.grid_manager.can_place_order(paired_buy_level, OrderSide.BUY):
             return paired_buy_level
 
+        # 2. Try to find an existing grid level below (works if levels weren't trimmed)
         fallback_buy_level = self.grid_manager.get_grid_level_below(sell_grid_level)
         if fallback_buy_level:
             return fallback_buy_level
+
+        sell_price = sell_grid_level.price
+
+        # 3. FALLBACK: Find the nearest buy level BELOW the sell price (in-memory)
+        try:
+            all_levels = sorted(self.grid_manager.grid_levels.keys())
+            levels_below = [p for p in all_levels if p < sell_price]
+
+            if levels_below:
+                nearest_buy_price = max(levels_below)
+                nearest_level = self.grid_manager.grid_levels[nearest_buy_price]
+                self.logger.info(
+                    f"♻️ FALLBACK: Using nearest buy level at {nearest_buy_price:.4f} for sell at {sell_price:.4f}"
+                )
+                return nearest_level
+        except Exception as e:
+            self.logger.debug(f"In-memory fallback failed: {e}")
+
+        # 4. DATABASE FALLBACK: Query grid_levels table for persisted levels
+        # Crucial after restart when in-memory state is lost
+        if self.db and self.bot_id:
+            try:
+                db_grid_levels = await self.db.get_grid_levels(self.bot_id)
+                if db_grid_levels:
+                    db_prices_below = [p for p in db_grid_levels if p < sell_price]
+
+                    if db_prices_below:
+                        nearest_db_price = max(db_prices_below)
+                        db_level_data = db_grid_levels[nearest_db_price]
+
+                        # Recreate the grid level from DB data
+                        new_level = GridLevel(
+                            price=nearest_db_price,
+                            state=GridCycleState.READY_TO_BUY,
+                            paired_sell_level=sell_grid_level,
+                        )
+                        new_level.stock_on_hand = db_level_data.get("stock", 0.0)
+                        new_level.order_quantity = db_level_data.get("order_quantity", 0.0)
+
+                        # Add to in-memory grid
+                        self.grid_manager.grid_levels[nearest_db_price] = new_level
+                        if nearest_db_price not in self.grid_manager.sorted_buy_grids:
+                            self.grid_manager.sorted_buy_grids.append(nearest_db_price)
+                            self.grid_manager.sorted_buy_grids.sort(reverse=True)
+
+                        self.logger.info(
+                            f"♻️ DB RECOVERY: Restored buy level at {nearest_db_price:.4f} "
+                            f"for sell at {sell_price:.4f} (stock: {new_level.stock_on_hand:.6f})"
+                        )
+                        return new_level
+            except Exception as e:
+                self.logger.warning(f"DB fallback for paired buy level failed: {e}")
+
+        # 5. LAST RESORT: Recreate from price_grids
+        try:
+            sorted_original_prices = sorted(self.grid_manager.price_grids)
+            idx = bisect.bisect_left(sorted_original_prices, sell_price)
+
+            if idx > 0:
+                buy_price = sorted_original_prices[idx - 1]
+
+                if buy_price not in self.grid_manager.grid_levels:
+                    new_level = GridLevel(
+                        price=buy_price,
+                        state=GridCycleState.READY_TO_BUY,
+                        paired_sell_level=sell_grid_level,
+                    )
+                    self.grid_manager.grid_levels[buy_price] = new_level
+
+                    if buy_price not in self.grid_manager.sorted_buy_grids:
+                        self.grid_manager.sorted_buy_grids.append(buy_price)
+                        self.grid_manager.sorted_buy_grids.sort(reverse=True)
+
+                    self.logger.info(
+                        f"♻️ REACTIVATED: Recreated buy level at {buy_price:.4f} (for sell level {sell_price:.4f})"
+                    )
+                    return new_level
+                else:
+                    return self.grid_manager.grid_levels[buy_price]
+        except Exception as e:
+            self.logger.error(f"Failed to find/create buy level below {sell_price}: {e}")
+
         return None
 
     def _get_or_create_paired_sell_level(self, buy_grid_level: GridLevel) -> GridLevel | None:
@@ -778,13 +1024,31 @@ class OrderManager:
 
             quantity = quantity_override if quantity_override > 0 else raw_quantity
 
-            # --- PRECISE COIN TRACKING (Phase 3) ---
-            # If Selling, check if we have specific stock tracking for this grid
+            # --- PRECISE ORDER SIZING (Fixed Quantity per Grid) ---
+            # SELL orders use order_quantity from the grid level (set during BUY completion)
+            # Quote Mode: order_quantity stores USDT cost -> calculate coins = cost / price
+            # Base Mode: order_quantity stores coin quantity -> use directly
             dust_remainder = 0.0
-            if side == OrderSide.SELL and grid_level.stock_on_hand > 0:
-                self.logger.info(f"📉 Using Stock-On-Hand for Sell Order: {grid_level.stock_on_hand:.6f}")
-                quantity = grid_level.stock_on_hand
-            # ---------------------------------------
+            if side == OrderSide.SELL:
+                if grid_level.order_quantity > 0:
+                    # Check order sizing mode
+                    order_size_type = self.grid_manager.config_manager.get_order_size_type()
+
+                    if order_size_type == "quote":
+                        # Quote Mode: order_quantity contains USDT cost
+                        # Calculate coin quantity: USDT cost / sell price
+                        usdt_cost = grid_level.order_quantity
+                        quantity = usdt_cost / price  # price is the sell price
+                        self.logger.info(f"📐 Quote Mode Sell: {usdt_cost:.4f} USDT ÷ {price} = {quantity:.6f} coins")
+                    else:
+                        # Base Mode: order_quantity contains coin quantity
+                        quantity = grid_level.order_quantity
+                        self.logger.info(f"📐 Base Mode Sell: Using fixed coin quantity {quantity:.6f}")
+                elif grid_level.stock_on_hand > 0:
+                    # Fallback: Legacy mode - use stock_on_hand if order_quantity not set
+                    quantity = grid_level.stock_on_hand
+                    self.logger.info(f"📉 Using Stock-On-Hand for Sell Order (Legacy): {quantity:.6f}")
+            # -------------------------------------------------------
 
             try:
                 if side == OrderSide.BUY:
@@ -1009,6 +1273,28 @@ class OrderManager:
                             self.logger.warning(
                                 f"⚠️ Network issue verifying order {order_id}. Retrying next cycle. ({e})"
                             )
+                        elif "does not exist" in err_msg or "51603" in err_msg or "not found" in err_msg:
+                            self.logger.warning(
+                                f"🚫 Order {order_id} reported missing by Exchange. treating as CANCELED to fix state."
+                            )
+                            # Construct Dummy Order
+                            dummy_order = Order(
+                                identifier=order_id,
+                                status=OrderStatus.CANCELED,
+                                order_type=OrderType.LIMIT,
+                                side=OrderSide(order_info["side"].lower()),
+                                price=float(order_info["price"]),
+                                average=None,
+                                amount=float(order_info["amount"]),
+                                filled=0.0,
+                                remaining=float(order_info["amount"]),  # Assume none filled so full refund
+                                timestamp=int(time.time() * 1000),
+                                datetime=None,
+                                last_trade_timestamp=None,
+                                symbol=self.trading_pair,
+                                time_in_force="GTC",
+                            )
+                            await self._on_order_cancelled(dummy_order)
                         else:
                             self.logger.error(
                                 f"Failed to verify missing order {order_id}: {e}. Marking CLOSED_UNKNOWN."
@@ -1172,7 +1458,8 @@ class OrderManager:
 
         if deficit:
             # Throttle this log to avoid spamming every 5s when stuck
-            self._throttled_warning(f"⚖️ Deficit Detected: {deficit}", f"deficit_detected_{self.bot_id}", interval=60)
+            # FIX: Increased throttle to 5 minutes to reduce spam
+            self._throttled_warning(f"⚖️ Deficit Detected: {deficit}", f"deficit_detected_{self.bot_id}", interval=300)
             await self.execute_rebalance(deficit, current_price)
             # We assume rebalance works. The next iteration/step will use the new funds.
 
@@ -1191,21 +1478,33 @@ class OrderManager:
 
         # 1. Sum up BUY requirements
         for price in self.grid_manager.sorted_buy_grids:
-            if price >= safe_buy_limit:
-                continue
-            # Calculate cost for this level
-            raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
-            required_fiat += raw_quantity * price
+            # FIX: Only include levels that need NEW orders (active zone AND no existing order)
+            # Don't include levels with existing orders - their funds are already reserved in BalanceTracker
+            is_active_zone = price < safe_buy_limit
+            grid_level = self.grid_manager.grid_levels.get(price)
+            has_active_order = len(grid_level.orders) > 0 if grid_level else False
+
+            # Only count if we need a NEW order here
+            if is_active_zone and not has_active_order:
+                # Calculate cost for this level
+                raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+                required_fiat += raw_quantity * price
 
         required_fiat *= 1.005
 
         # 2. Sum up SELL requirements
         for price in self.grid_manager.sorted_sell_grids:
-            if price <= safe_sell_limit:
-                continue
+            # FIX: Only include levels that need NEW orders (active zone AND no existing order/stock)
+            # Don't include levels with existing orders/stock - their funds are already reserved
+            is_active_zone = price > safe_sell_limit
+            grid_level = self.grid_manager.grid_levels.get(price)
+            # Check for orders OR stock_on_hand (reserved for sell)
+            has_active_order = (len(grid_level.orders) > 0 or grid_level.stock_on_hand > 0) if grid_level else False
 
-            raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
-            required_crypto += raw_quantity
+            # Only count if we need a NEW order here
+            if is_active_zone and not has_active_order:
+                raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+                required_crypto += raw_quantity
 
         # FIX: Add 2% buffer to the crypto requirement to cover rounding/dust issues
         # This prevents the last sell order placement from failing after rebalancing.
@@ -1244,13 +1543,33 @@ class OrderManager:
                 # Check fiat balance first (redundant but safe)
                 cost = required_amount * current_price
                 if self.balance_tracker.balance < cost:
-                    self._throttled_warning(
-                        f"❌ CANNOT REBALANCE: Need {required_amount} crypto (Cost: {cost:.2f}) "
-                        f"but only have {self.balance_tracker.balance:.2f} fiat. Manual intervention required.",
-                        f"cannot_rebalance_fiat_{self.bot_id}",
-                        interval=300,
-                    )
-                    return False
+                    # FIX: Relaxed Rebalance Logic (Runtime Check)
+                    # If we can't afford the rebalance, check if it's just a small "Phantom" deficit (N+1 issue)
+                    single_grid_qty = required_amount  # Default fallback
+                    if (
+                        hasattr(self.grid_manager, "uniform_order_quantity")
+                        and self.grid_manager.uniform_order_quantity
+                    ):
+                        single_grid_qty = self.grid_manager.uniform_order_quantity
+                    elif hasattr(self.grid_manager, "auto_usdt_per_grid") and self.grid_manager.auto_usdt_per_grid:
+                        single_grid_qty = self.grid_manager.auto_usdt_per_grid / current_price
+
+                    if required_amount <= (single_grid_qty * 2.5):
+                        self._throttled_warning(
+                            f"⚠️ Runtime Rebalance: Insufficient Cash for Deficit ({cost:.2f} > {self.balance_tracker.balance:.2f}). "
+                            f"Deficit ({required_amount:.4f}) is small (~2.5 grids). Skipping to avoid spam.",
+                            f"skip_small_deficit_{self.bot_id}",
+                            interval=300,
+                        )
+                        return False
+                    else:
+                        self._throttled_warning(
+                            f"❌ CANNOT REBALANCE: Need {required_amount} crypto (Cost: {cost:.2f}) "
+                            f"but only have {self.balance_tracker.balance:.2f} fiat. Manual intervention required.",
+                            f"cannot_rebalance_fiat_{self.bot_id}",
+                            interval=300,
+                        )
+                        return False
 
                 # Convert crypto amount to fiat cost for 'quote' based market buy?
                 # Usually execute_market_order takes 'amount' as crypto quantity for BUY/SELL if side is base.
@@ -1546,17 +1865,53 @@ class OrderManager:
         except Exception as e:
             self.logger.error(f"❌ Critical Error during cancel_all_open_orders: {e}", exc_info=True)
 
-    async def liquidate_positions(self, current_price: float) -> None:
-        crypto_balance = self.balance_tracker.crypto_balance
-        if crypto_balance > 0:
-            self.logger.info(f"Liquidating {crypto_balance} {self.trading_pair} at market price...")
+    async def liquidate_positions(self, current_price: float, max_retries: int = 3) -> None:
+        """
+        Liquidate all crypto holdings with retry logic and verification.
+        Ensures complete liquidation by checking actual exchange balance after each attempt.
+        """
+        base_currency = self.trading_pair.split("/")[0]
+        min_trade_amount = 0.0001  # Minimum tradeable amount (dust threshold)
+
+        for attempt in range(max_retries):
             try:
-                await self.order_execution_strategy.execute_market_order(
-                    OrderSide.SELL, self.trading_pair, crypto_balance, current_price
+                # 1. Get ACTUAL balance from exchange (not tracked balance)
+                balances = await self.order_execution_strategy.exchange_service.get_balance()
+                actual_balance = float(balances.get(base_currency, {}).get("free", 0.0))
+
+                # Check if liquidation is complete
+                if actual_balance < min_trade_amount:
+                    self.logger.info(f"✅ Liquidation complete. Remaining {base_currency}: {actual_balance}")
+                    return
+
+                # 2. Attempt to sell what's available
+                self.logger.info(
+                    f"🔄 Liquidation Attempt {attempt + 1}/{max_retries}: Selling {actual_balance} {base_currency}..."
                 )
-                self.logger.info("Liquidation successful.")
+
+                await self.order_execution_strategy.execute_market_order(
+                    OrderSide.SELL, self.trading_pair, actual_balance, current_price
+                )
+
+                # 3. Wait for order to settle before next check
+                await asyncio.sleep(2)
+
             except Exception as e:
-                self.logger.error(f"Failed to liquidate positions: {e}")
+                self.logger.error(f"Liquidation attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(1)  # Brief pause before retry
+
+        # 4. Final verification after all attempts
+        try:
+            balances = await self.order_execution_strategy.exchange_service.get_balance()
+            remaining = float(balances.get(base_currency, {}).get("free", 0.0))
+            if remaining >= min_trade_amount:
+                self.logger.error(
+                    f"⚠️ Liquidation incomplete after {max_retries} attempts. Remaining: {remaining} {base_currency}"
+                )
+            else:
+                self.logger.info("✅ Liquidation verified complete after retries.")
+        except Exception as e:
+            self.logger.error(f"Failed to verify liquidation: {e}")
 
     async def _sync_profit_to_backend(self, order: Order, profit: float):
         payload = {

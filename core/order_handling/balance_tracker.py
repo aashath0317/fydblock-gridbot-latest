@@ -63,6 +63,15 @@ class BalanceTracker:
             self.logger.info(msg)
             self._log_throttle[key] = now
 
+    def _throttled_warning(self, msg: str, key: str, interval: int = 300):
+        """Logs a warning message only if 'interval' seconds have passed for 'key'."""
+        import time
+
+        now = time.time()
+        if now - self._log_throttle.get(key, 0) > interval:
+            self.logger.warning(msg)
+            self._log_throttle[key] = now
+
     async def _persist_balances(self):
         """Saves current balance state to DB."""
         if self.db and self.bot_id:
@@ -672,8 +681,10 @@ class BalanceTracker:
             shortfall = required_crypto - total_crypto
             # Ensure shortfall is significant (> 1.5% of required or some min value)
             if shortfall > (required_crypto * 0.015):
-                self.logger.warning(
-                    f"⚠️ Rebalance Needed: Crypto Shortfall. Have {total_crypto} (Free+Reserved), Need {required_crypto}."
+                self._throttled_warning(
+                    f"⚠️ Rebalance Needed: Crypto Shortfall. Have {total_crypto} (Free+Reserved), Need {required_crypto}.",
+                    f"crypto_shortfall_{self.bot_id}",
+                    interval=300,
                 )
                 return {
                     "type": "BUY_CRYPTO",
@@ -682,22 +693,17 @@ class BalanceTracker:
                 }
 
         # 2. Check Excess Crypto (Liquidation of Dust/Old Grid inventory)
-        # MOVED UP: Priority is to liquidate excess assets to fund the Buy side naturally.
-        # If we have significantly MORE crypto than needed, sell it to free up Fiat.
-        if total_crypto > (required_crypto * 1.015):  # 1.5% buffer
-            excess_crypto = total_crypto - required_crypto
-
-            self._throttled_info(
-                f"♻️ Excess Crypto Detected: Have {total_crypto:.6f}, Need {required_crypto:.6f}. "
-                f"Liquidating {excess_crypto:.6f} to rebalance portfolio.",
-                f"excess_crypto_{self.bot_id}",
-                interval=300,
-            )
-            return {
-                "type": "SELL_CRYPTO",
-                "amount": excess_crypto,
-                "reason": "Liquidation of excess crypto for grid adjustment.",
-            }
+        # --- FIX: DISABLED AUTOMATIC EXCESS CRYPTO LIQUIDATION ---
+        # The stock_on_hand system already tracks what crypto needs to be sold via limit orders.
+        # We should NOT automatically liquidate pre-existing holdings or "excess" crypto.
+        # The grid bot should only sell crypto that IT BOUGHT, tracked via stock_on_hand.
+        #
+        # Automatic liquidation caused issues:
+        # 1. Selling user's pre-existing holdings
+        # 2. Selling crypto that should be reserved for pending sell orders
+        #
+        # If fiat is truly needed (section 3 below), that's the only time we should sell.
+        # ---------------------------------------------------------
 
         # 3. Check Fiat Deficit (for Buy Orders)
         # FIX: Check TOTAL owned fiat (Free + Reserved).

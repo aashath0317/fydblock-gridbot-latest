@@ -193,6 +193,31 @@ class OrderStatusTracker:
                     self.event_bus.publish_sync(Events.ORDER_FILLED, local_order)
                     self.logger.info(f"Order {order_id} filled.")
                 else:
+                    # --- EARLY OWNERSHIP CHECK (BEFORE LOGGING/RECOVERY) ---
+                    # If this order doesn't belong to us, skip silently without logging warnings
+                    # This prevents cross-bot log spam when multiple bots share an exchange account
+                    if self.bot_id:
+                        # Get clientOrderId from the incoming order_data if available
+                        info = (
+                            order_data.get("info", {})
+                            if isinstance(order_data, dict)
+                            else getattr(order_data, "info", {})
+                        )
+                        client_oid = (
+                            info.get("clientOrderId") or info.get("clOrdId") or info.get("client_oid") if info else None
+                        )
+
+                        # If we have a client order ID that starts with "G" (a bot order) but NOT our prefix, skip silently
+                        expected_prefix = f"G{self.bot_id}x"
+                        if (
+                            client_oid
+                            and str(client_oid).startswith("G")
+                            and not str(client_oid).startswith(expected_prefix)
+                        ):
+                            # This order belongs to another bot - skip without logging
+                            return
+                    # -------------------------------------------------------
+
                     self.logger.warning(f"Filled order {order_id} not found in local OrderBook. Attempting recovery...")
                     # Attempt to fetch remote order to get full details (symbol, amount, etc)
                     try:
@@ -213,7 +238,7 @@ class OrderStatusTracker:
                         else:
                             remote_order = await self.order_execution_strategy.get_order(order_id, symbol)
                             if remote_order and remote_order.status == OrderStatus.CLOSED:
-                                # OWNERSHIP VALIDATION: Check clientOrderId if bot_id is set
+                                # OWNERSHIP VALIDATION: Check clientOrderId if bot_id is set (double-check after fetch)
                                 if self.bot_id:
                                     info = remote_order.info or {}
                                     # Check common fields for client ID (CCXT standardizes to 'clientOrderId', exchange specific might be 'clOrdId')

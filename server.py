@@ -455,7 +455,7 @@ async def start_bot(req: BotRequest):
 
 
 @app.post("/stop/{bot_id}")
-async def stop_bot(bot_id: int):
+async def stop_bot(bot_id: int, liquidate: bool = False):
     # Idempotency Check: If bot is not active, check if it exists in DB
     if bot_id not in active_instances:
         status = await db.get_bot_status(bot_id)
@@ -473,8 +473,8 @@ async def stop_bot(bot_id: int):
     # 1. Update Status to STOPPING (Lock)
     await db.update_bot_status(bot_id, "STOPPING")
 
-    # 2. Trigger Strict Stop (No Liquidation by default on Stop)
-    await bot._stop(sell_assets=False)
+    # 2. Trigger Strict Stop (Liquidate if requested)
+    await bot._stop(sell_assets=liquidate)
 
     try:
         await asyncio.wait_for(instance["task"], timeout=30.0)

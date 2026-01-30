@@ -13,11 +13,12 @@ class GridCycleState(Enum):
 
 
 class GridLevel:
-    def __init__(self, price: float, state: GridCycleState, stock_on_hand: float = 0.0):
+    def __init__(self, price: float, state: GridCycleState, stock_on_hand: float = 0.0, order_quantity: float = 0.0):
         self.price: float = price
         self.orders: list[Order] = []  # Track all orders at this level
         self.state: GridCycleState = state
         self.stock_on_hand: float = stock_on_hand
+        self.order_quantity: float = order_quantity  # Fixed order size for this grid level
         self.paired_buy_level: GridLevel | None = None
         self.paired_sell_level: GridLevel | None = None
 

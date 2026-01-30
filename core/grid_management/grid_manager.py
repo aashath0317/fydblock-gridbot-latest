@@ -1,3 +1,4 @@
+import bisect
 import logging
 from typing import Any
 
@@ -65,7 +66,8 @@ class GridManager:
         else:
             # Legacy / Auto-Calculate Mode (Standard Grid)
             # Legacy / Auto-Calculate Mode (Standard Grid)
-            usable_investment = investment * 0.999
+            # FIX: Use 98% of investment to provide a robust safety buffer for N+1 Grid Logic + Fees
+            usable_investment = investment * 0.98
             total_lines = len(self.price_grids)
 
             if total_lines > 0:
@@ -416,18 +418,32 @@ class GridManager:
 
     def get_grid_level_below(self, grid_level: GridLevel) -> GridLevel | None:
         sorted_levels = sorted(self.grid_levels.keys())
-        current_index = sorted_levels.index(grid_level.price)
-        if current_index > 0:
-            lower_price = sorted_levels[current_index - 1]
-            return self.grid_levels[lower_price]
+        try:
+            current_index = sorted_levels.index(grid_level.price)
+            if current_index > 0:
+                lower_price = sorted_levels[current_index - 1]
+                return self.grid_levels[lower_price]
+        except ValueError:
+            # Price not in list (Trimmed or Float mismatch), find nearest below
+            idx = bisect.bisect_left(sorted_levels, grid_level.price)
+            if idx > 0:
+                lower_price = sorted_levels[idx - 1]
+                return self.grid_levels[lower_price]
         return None
 
     def get_grid_level_above(self, grid_level: GridLevel) -> GridLevel | None:
         sorted_levels = sorted(self.grid_levels.keys())
-        current_index = sorted_levels.index(grid_level.price)
-        if current_index < len(sorted_levels) - 1:
-            higher_price = sorted_levels[current_index + 1]
-            return self.grid_levels[higher_price]
+        try:
+            current_index = sorted_levels.index(grid_level.price)
+            if current_index < len(sorted_levels) - 1:
+                higher_price = sorted_levels[current_index + 1]
+                return self.grid_levels[higher_price]
+        except ValueError:
+            # Price not in list (Trimmed or Float mismatch), find nearest above
+            idx = bisect.bisect_right(sorted_levels, grid_level.price)
+            if idx < len(sorted_levels):
+                higher_price = sorted_levels[idx]
+                return self.grid_levels[higher_price]
         return None
 
     def mark_order_pending(
@@ -517,7 +533,12 @@ class GridManager:
             elif order_side == OrderSide.SELL:
                 # FIX: Allow placement if we have a bag (READY_TO_SELL)
                 # OR if the level is empty (READY_TO_BUY) and we are pushing a bag from below.
-                return grid_level.state in [GridCycleState.READY_TO_SELL, GridCycleState.READY_TO_BUY]
+                # OR if the level already has a pending sell order (WAITING_FOR_SELL_FILL) - stock can accumulate
+                return grid_level.state in [
+                    GridCycleState.READY_TO_SELL,
+                    GridCycleState.READY_TO_BUY,
+                    GridCycleState.WAITING_FOR_SELL_FILL,
+                ]
 
         elif self.strategy_type == StrategyType.HEDGED_GRID:
             if order_side == OrderSide.BUY:
@@ -849,3 +870,26 @@ class GridManager:
 
         self.logger.info(f"🕸️ Infinity Grid Shift DOWN: Removed {highest_price:.4f}, Added {new_bottom:.4f}")
         return highest_price, new_bottom
+
+    def deactivate_grid_levels(self, prices_to_remove: list[float]) -> None:
+        """
+        Removes the specified grid levels from the active grid lists.
+        Used when the bot runs out of budget and must trim the grid.
+        """
+        if not prices_to_remove:
+            return
+
+        initial_count = len(self.grid_levels)
+        for price in prices_to_remove:
+            if price in self.grid_levels:
+                del self.grid_levels[price]
+
+        # Re-sort lists to ensure consistency
+        self.sorted_buy_grids = [p for p in self.sorted_buy_grids if p not in prices_to_remove]
+        self.sorted_sell_grids = [p for p in self.sorted_sell_grids if p not in prices_to_remove]
+        self.price_grids = [p for p in self.price_grids if p not in prices_to_remove]
+
+        self.logger.warning(
+            f"🚫 Deactivated {len(prices_to_remove)} grid levels due to budget constraints. "
+            f"Active Grids: {initial_count} -> {len(self.grid_levels)}"
+        )
