@@ -23,7 +23,8 @@
     "range": {
       "top": 240,
       "bottom": 210
-    }
+    },
+    "profit_currency_type": "quote"
   },
   "risk_management": {
     "take_profit": {

@@ -332,6 +332,79 @@ class BalanceTracker:
 
         return None, None
 
+    async def request_wallet_topup(
+        self,
+        amount_needed: float,
+        currency_type: str,
+        exchange_service: ExchangeInterface,
+    ) -> bool:
+        """
+        Attempts to top up the internal balance from the actual wallet balance.
+        Used to resolve small deficits (drift/fees) without trimming grids.
+
+        Args:
+            amount_needed: The amount of shortfall.
+            currency_type: 'QUOTE' (Fiat) or 'BASE' (Crypto).
+            exchange_service: Interface to fetch live wallet data.
+
+        Returns:
+            bool: True if top-up successful, False otherwise.
+        """
+        try:
+            balances = await exchange_service.get_balance()
+            if not balances or "free" not in balances:
+                return False
+
+            if currency_type == "QUOTE":
+                wallet_free = float(balances["free"].get(self.quote_currency, 0.0))
+                # Check if wallet has enough to cover the deficit
+                # We do NOT check self.balance here, we assume the caller did.
+                # But we must ensure wallet_free >= amount_needed.
+                # Actually, the 'shortfall' is amount_needed.
+                # So we check if wallet *actually* has this amount available.
+
+                # Logic: We might have self.balance = 5.0, need 10.0. Shortfall = 5.0.
+                # Wallet Free might be 100.0.
+                # We can safely take 5.0 from Wallet Free conceptually.
+                # But wait, self.balance IS a representation of Wallet Free (clamped).
+                # So if self.balance < Wallet Free, we can "Top Up" (Unclamp).
+
+                # Available "Extra" in Wallet = Wallet Free - self.balance
+                available_surplus = max(0.0, wallet_free - self.balance)
+
+                if available_surplus >= amount_needed:
+                    self.balance += amount_needed
+                    self.logger.info(
+                        f"💰 Wallet Top-Up (Fiat): {amount_needed:.4f} {self.quote_currency} injected from Wallet Surplus."
+                    )
+                    await self._persist_balances()
+                    return True
+                else:
+                    self.logger.warning(
+                        f"⚠️ Top-Up Failed: Wallet Surplus ({available_surplus:.4f}) < Needed ({amount_needed:.4f})."
+                    )
+
+            elif currency_type == "BASE":
+                wallet_free = float(balances["free"].get(self.base_currency, 0.0))
+                available_surplus = max(0.0, wallet_free - self.crypto_balance)
+
+                if available_surplus >= amount_needed:
+                    self.crypto_balance += amount_needed
+                    self.logger.info(
+                        f"💰 Wallet Top-Up (Crypto): {amount_needed:.6f} {self.base_currency} injected from Wallet Surplus."
+                    )
+                    await self._persist_balances()
+                    return True
+                else:
+                    self.logger.warning(
+                        f"⚠️ Top-Up Failed: Wallet Surplus ({available_surplus:.6f}) < Needed ({amount_needed:.6f})."
+                    )
+
+        except Exception as e:
+            self.logger.error(f"Failed to execute wallet top-up: {e}")
+
+        return False
+
     # CHANGED: Renamed from _update_balance_on_order_completion to public method
     async def update_balance_on_order_completion(self, order: Order) -> None:
         """

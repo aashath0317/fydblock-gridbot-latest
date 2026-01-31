@@ -120,6 +120,7 @@ class GridTradingBot:
                 self.trading_mode,
                 self.trading_pair,
                 strategy_type,
+                self.exchange_service,
                 self.bot_id,
                 db=self.db,
             )

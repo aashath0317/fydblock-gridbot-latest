@@ -12,6 +12,7 @@ from config.trading_mode import TradingMode
 from core.bot_management.event_bus import EventBus, Events
 from core.bot_management.notification.notification_content import NotificationType
 from core.bot_management.notification.notification_handler import NotificationHandler
+from core.services.exchange_interface import ExchangeInterface
 from core.storage.bot_database import BotDatabase
 from strategies.strategy_type import StrategyType
 
@@ -39,6 +40,7 @@ class OrderManager:
         trading_mode: TradingMode,
         trading_pair: str,
         strategy_type: StrategyType,
+        exchange_service: ExchangeInterface,
         bot_id: int | None = None,
         backend_url: str = "http://localhost:5000/api/user/bot-trade",
         db: BotDatabase | None = None,
@@ -55,6 +57,7 @@ class OrderManager:
         self.trading_mode: TradingMode = trading_mode
         self.trading_pair = trading_pair
         self.strategy_type: StrategyType = strategy_type
+        self.exchange_service = exchange_service
         self.bot_id = bot_id
         self.backend_url = backend_url
         self.initializing = False
@@ -307,14 +310,23 @@ class OrderManager:
                 cost = target_qty * price
 
                 if self.balance_tracker.balance < (cost * 0.98):
-                    # Gather all remaining grids to skip
-                    skipped_prices = [p for p in self.grid_manager.sorted_buy_grids if p <= price]
-                    self.logger.warning(
-                        f"🛡️ Phase 4 Solvency: Insufficient Cash for Buy at {price}. "
-                        f"Auto-Scaling: Trimming {len(skipped_prices)} grids."
+                    # NEW: Try Safe Top-Up First
+                    shortfall = cost - self.balance_tracker.balance
+                    topup_success = await self.balance_tracker.request_wallet_topup(
+                        shortfall, "QUOTE", self.exchange_service
                     )
-                    self.grid_manager.deactivate_grid_levels(skipped_prices)
-                    break
+
+                    if topup_success:
+                        self.logger.info(f"🛡️ Solvency: Rescued Buy at {price} via Wallet Top-Up.")
+                    else:
+                        # Gather all remaining grids to skip
+                        skipped_prices = [p for p in self.grid_manager.sorted_buy_grids if p <= price]
+                        self.logger.warning(
+                            f"🛡️ Phase 4 Solvency: Insufficient Cash for Buy at {price}. "
+                            f"Auto-Scaling: Trimming {len(skipped_prices)} grids."
+                        )
+                        self.grid_manager.deactivate_grid_levels(skipped_prices)
+                        break
 
                 await self._place_limit_order_safe(price, OrderSide.BUY)
 
@@ -728,69 +740,10 @@ class OrderManager:
                 # Place new/replacement sell order with total accumulated stock
                 await self._place_sell_order(grid_level, paired_sell_level, paired_sell_level.stock_on_hand)
 
-                # --- QUOTE MODE: SELL PROFIT COINS IMMEDIATELY ---
-                # Calculate the EXACT profit coins from THIS cycle only
-                # This prevents accidentally selling user's other holdings
-                self.logger.info(f"🔎 DEBUG: Checking Profit Logic. Type: {order_size_type}")
-
-                if order_size_type == "quote":
-                    coins_bought = order.filled  # Amount we just bought
-                    buy_price = order.average or order.price
-                    sell_price = paired_sell_level.price
-
-                    # Calculate how many coins were allocated to the sell order
-                    # This is: USDT_cost / sell_price
-                    usdt_cost = paired_sell_level.order_quantity
-                    coins_to_sell = usdt_cost / sell_price if sell_price > 0 else 0
-
-                    # Profit coins = what we bought - what we're selling
-                    theoretical_profit_coins = coins_bought - coins_to_sell
-
-                    self.logger.info(
-                        f"🔎 DEBUG: Bought: {coins_bought}, Sell Qty: {coins_to_sell}, "
-                        f"Profit: {theoretical_profit_coins}, Val: {theoretical_profit_coins * buy_price}"
-                    )
-
-                    # Only sell if meaningful amount (> $1 USDT value)
-                    if theoretical_profit_coins > 0 and theoretical_profit_coins * buy_price > 1.0:
-                        try:
-                            # 1. Sync Balances to get Real Wallet State
-                            # This ensures we don't try to sell phantom coins if fees ate them
-                            await self.balance_tracker.sync_balances(
-                                self.order_execution_strategy.exchange_service, buy_price
-                            )
-
-                            # 2. Determine Safe Sell Amount
-                            # Use the MIN of (Theoretical Profit) and (Actual Wallet Balance)
-                            # This handles cases where dust/fees reduced the real balance below theoretical
-                            actual_balance = self.balance_tracker.crypto_balance
-                            safe_sell_amount = min(theoretical_profit_coins, actual_balance)
-
-                            # 3. Apply a tiny safety buffer (99.9%) to avoid "insufficient balance" on rounding
-                            safe_sell_amount *= 0.999
-
-                            self.logger.info(
-                                f"💎 Profit Coins: {safe_sell_amount:.6f} "
-                                f"(Theoretical: {theoretical_profit_coins:.6f}, Actual: {actual_balance:.6f})"
-                            )
-
-                            adj_qty = self.order_validator.adjust_and_validate_sell_quantity(
-                                safe_sell_amount, safe_sell_amount
-                            )
-                            if adj_qty > 0:
-                                profit_order = await self.order_execution_strategy.execute_market_order(
-                                    OrderSide.SELL, self.trading_pair, adj_qty, buy_price
-                                )
-                                if profit_order and profit_order.status == OrderStatus.CLOSED:
-                                    proceeds = profit_order.filled * (profit_order.average or buy_price)
-                                    self.balance_tracker.crypto_balance -= profit_order.filled
-                                    self.balance_tracker.balance += proceeds
-                                    self.logger.info(
-                                        f"✅ Profit Coins Sold: {profit_order.filled:.6f} @ "
-                                        f"{profit_order.average or buy_price:.4f} = +{proceeds:.4f} USDT"
-                                    )
-                        except Exception as e:
-                            self.logger.warning(f"⚠️ Failed to sell profit coins: {e}")
+                # --- QUOTE MODE: REMOVED PREMATURE SELL ---
+                # We no longer sell "profit coins" immediately on Buy Fill.
+                # Profit is realized at the Sell Order (Sell-High).
+                # ------------------------------------------
                 # ------------------------------------------------
 
         else:
@@ -860,38 +813,134 @@ class OrderManager:
             # Quote = Fixed USDT Amount (Accumulate Coin) -> Profit is Total Value Gain (Realized + Unrealized Dust)
             order_size_type = self.grid_manager.config_manager.get_order_size_type()
 
-            if order_size_type == "quote":
-                # Formula: Revenue * (SellPrice - BuyPrice) / BuyPrice
-                # This calculates the value of the 'extra coin' gained at the current sell price
-                revenue = order.average * order.filled
-                gross_profit = revenue * (order.average - paired_buy_level.price) / paired_buy_level.price
-                self.logger.info(f"🧮 Quote Mode Profit: {gross_profit:.4f} (Based on Val. Gain)")
+            # --- PROFIT CALCULATION ---
+            # Universal Formula: (AverageSellPrice - BuyPrice) * QuantitySold
+            # This represents the Realized PnL in QUOTE CURRENCY (USDT).
+            # Even if we kept some coin (Base Profit), the "Realized USDT" is strictly this formula on the *sold portion*.
+            # However, for "Base Profit" logging, we want to show the COIN amount retained.
+
+            profit_type = self.grid_manager.config_manager.get_profit_currency_type()
+
+            sell_price = order.average or order.price
+            buy_price = paired_buy_level.price
+            quantity_sold = order.filled
+
+            # Gross Realized Profit (USDT)
+            gross_profit_usdt = (sell_price - buy_price) * quantity_sold
+
+            # Calculate what we *retained* (Coin Profit)
+            # We need to know what we *bought* to know what we kept.
+            # But here we only simply know what we sold.
+            # Implication: if profit_type == 'base', we intentionally sold LESS than we bought.
+            # We can infer retained coin if we know the original buy size.
+            # But strictly speaking, the user wants to see:
+            # Coin Mode: "0.0013 SOL"
+            # Fiat Mode: "8.00 USDT"
+            # Mixed: "0.0006 SOL + 4 USDT"
+
+            # We need to estimate "Retained Coin" based on the assumption of what a "Full Sell" would have been.
+            # Full Sell would be: Cost / BuyPrice? Or just Cost?
+            # Quote Mode Cost = paired_buy_level.order_quantity (if relying on Quote Mode logic)
+            # Let's derive it:
+            # We Sold 'quantity_sold' at 'sell_price'. Revenue = Q * S.
+            # Cost of that sold portion = Q * BuyPrice.
+            # Realized Profit = Q * (S - B).
+
+            # If we are in BASE profit mode:
+            # We sold enough to cover cost. Revenue ~= Original Total Cost.
+            # Current Profit (in USDT) ~= 0 (Realized).
+            # The "Profit" is the coin we didn't sell.
+            # How much did we not sell?
+            # Margin = (S - B) / S.  (Profit Margin ratio in Coin terms)
+            # Coin Profit = Revenue * Margin / B ? No.
+
+            # Simpler approach:
+            # If `profit_type == 'base'`:
+            #   The profit is the *unsold* portion.
+            #   We assume we bought `TotalQty`. We sold `SoldQty`.
+            #   ProfitCoin = TotalQty - SoldQty.
+            #   We can't easily know TotalQty here unless we track it perfectly from the buy.
+            #   BUT, we can calculate "Imputed Coin Profit" from the Realized USDT Profit.
+            #   If we made $10 USDT profit, how much SOL is that at current price?
+            #   CoinArgs = RealizedUSDT / CurrentPrice.
+            #   This represents the "Buying Power" of that profit.
+
+            # Let's use that for standardisation:
+            # CoinProfit = GrossProfitUSDT / SellPrice.
+
+            base_currency = self.trading_pair.split("/")[0]
+            quote_currency = self.trading_pair.split("/")[1]
+
+            log_msg = ""
+
+            if profit_type == "base":
+                # Show in Coin
+                profit_coin = gross_profit_usdt / sell_price
+                log_msg = f"+{profit_coin:.6f} {base_currency}"
+                # For backend sync, we might still send USDT value? Or Coin?
+                # Usually PnL is tracked in Quote.
+                net_profit = gross_profit_usdt  # Internal tracking always USDT
+
+            elif profit_type == "mixed":
+                # Show Split
+                # We assume 50/50 split of the *value*
+                profit_coin = (gross_profit_usdt / 2) / sell_price
+                profit_usdt = gross_profit_usdt / 2
+                log_msg = f"+{profit_coin:.6f} {base_currency} + {profit_usdt:.4f} {quote_currency}"
+                net_profit = gross_profit_usdt
+
             else:
-                # Standard: Price Diff * Quantity Sold
-                gross_profit = (order.average - paired_buy_level.price) * order.filled
+                # Quote (Fiat) - Default
+                log_msg = f"+{gross_profit_usdt:.4f} {quote_currency}"
+                net_profit = gross_profit_usdt
 
             # --------------------------
 
             # Calculate Fees (Estimate)
-            # Buy Fee: based on the original buy price
             buy_fee = self.balance_tracker.fee_calculator.calculate_fee(paired_buy_level.price * order.filled)
-            # Sell Fee: based on the sell price (or use actual fee if available, but estimate for consistency)
             sell_fee = self.balance_tracker.fee_calculator.calculate_fee(order.average * order.filled)
-
             total_estimated_fees = buy_fee + sell_fee
-            net_profit = gross_profit - total_estimated_fees
+
+            # Adjust Net Profit (Realized) for backend tracking
+            # Note: If 'base' mode, 'net_profit' (USDT) is technically realized,
+            # but if we held the coin, the wallet doesn't have this USDT.
+            # Wait. In 'base' mode, we recover cost.
+            # Cost = 100. Rev = 100. Profit = 0.
+            # So `gross_profit_usdt` calculated above `(S-B)*Q` corresponds to the profit on the *sold* coins.
+            # If we only sold cost-recovery coins, then `(S-B)*Q_recovery` is the Realized Profit on that chunk.
+            # But the *Unrealized* profit is in the bag.
+
+            # User wants to "Keep Profit in Coin".
+            # This means they want the "Gain" to remain as Coin.
+            # So `log_msg` using `gross_profit_usdt / sell_price` is a representation of the *value* generated.
+            # Ideally, we should subtract fees from the *value* before display.
+
+            net_profit_display_value = max(0, gross_profit_usdt - total_estimated_fees)
+
+            if profit_type == "base":
+                profit_coin = net_profit_display_value / sell_price
+                log_msg = f"+{profit_coin:.6f} {base_currency}"
+            elif profit_type == "mixed":
+                profit_coin = (net_profit_display_value / 2) / sell_price
+                profit_usdt = net_profit_display_value / 2
+                log_msg = f"+{profit_coin:.6f} {base_currency} + {profit_usdt:.4f} {quote_currency}"
+            else:
+                log_msg = f"+{net_profit_display_value:.4f} {quote_currency}"
+
+            self.logger.info(
+                f"💰 PROFIT SECURED: {log_msg} "
+                f"[Sold {order.filled:.6f} {base_currency} @ {sell_price:.4f}] "
+                f"(Gross Val: {gross_profit_usdt:.4f}, Fees: {total_estimated_fees:.4f})"
+            )
+
+            # For backend sync and reserves, we use the USDT value equivalent
+            net_profit = net_profit_display_value
 
             # --- RESERVE ALLOCATION (10%) ---
             reserve_amount = 0.0
             if net_profit > 0:
                 reserve_amount = net_profit * 0.10
                 await self.balance_tracker.allocate_profit_to_reserve(reserve_amount)
-
-            self.logger.info(
-                f"💰 PROFIT SECURED: +{net_profit:.4f} {self.trading_pair.split('/')[1]} "
-                f"[Sold {order.filled:.6f} {self.trading_pair.split('/')[0]}] "
-                f"(Gross: {gross_profit:.4f}, Fees: {total_estimated_fees:.4f}, Reserve: {reserve_amount:.4f})"
-            )
 
             if self.bot_id is not None:
                 # Sync Net Profit to backend
@@ -1089,15 +1138,48 @@ class OrderManager:
             dust_remainder = 0.0
             if side == OrderSide.SELL:
                 if grid_level.order_quantity > 0:
-                    # Check order sizing mode
+                    # Check order sizing mode AND profit currency preference
                     order_size_type = self.grid_manager.config_manager.get_order_size_type()
+                    profit_type = self.grid_manager.config_manager.get_profit_currency_type()  # quote, base, mixed
 
                     if order_size_type == "quote":
                         # Quote Mode: order_quantity contains USDT cost
-                        # Calculate coin quantity: USDT cost / sell price
                         usdt_cost = grid_level.order_quantity
-                        quantity = usdt_cost / price  # price is the sell price
-                        self.logger.info(f"📐 Quote Mode Sell: {usdt_cost:.4f} USDT ÷ {price} = {quantity:.6f} coins")
+                        full_qty = usdt_cost / price
+
+                        recover_cost_qty = usdt_cost / price
+
+                        if profit_type == "quote":
+                            # Sell EVERYTHING we bought (Max Profit in USDT)
+                            if grid_level.stock_on_hand > 0:
+                                quantity = grid_level.stock_on_hand
+                                self.logger.info(f"📐 Profit(Fiat): Selling ALL stock {quantity:.6f}")
+                            else:
+                                quantity = recover_cost_qty  # Better than nothing
+                                self.logger.warning(
+                                    f"⚠️ Profit(Fiat): No stock recorded. Defaulting to break-even qty {quantity:.6f}"
+                                )
+
+                        elif profit_type == "base":
+                            # Sell only enough to recover cost
+                            quantity = recover_cost_qty
+                            self.logger.info(
+                                f"📐 Profit(Coin): Selling calculated qty {quantity:.6f} to recover {usdt_cost:.2f} USDT"
+                            )
+
+                        elif profit_type == "mixed":
+                            # 50% Coin, 50% Fiat
+                            if grid_level.stock_on_hand > recover_cost_qty:
+                                surplus = grid_level.stock_on_hand - recover_cost_qty
+                                quantity = recover_cost_qty + (surplus * 0.5)
+                                self.logger.info(
+                                    f"📐 Profit(Mixed): Selling {quantity:.6f} ({recover_cost_qty:.6f} Cost + {surplus * 0.5:.6f} Profit)"
+                                )
+                            else:
+                                quantity = recover_cost_qty
+                        else:
+                            pass
+
                     else:
                         # Base Mode: order_quantity contains coin quantity
                         quantity = grid_level.order_quantity

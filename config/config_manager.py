@@ -139,6 +139,23 @@ class ConfigManager:
         grid_settings = self.get_grid_settings()
         return grid_settings.get("order_size_type", "quote")
 
+    def get_profit_currency_type(self) -> str:
+        """
+        Returns the preferred currency for profit taking:
+        - 'quote': Keep profit in Quote Currency (Fiat/Stable) - Default for Fiat Mode
+        - 'base': Keep profit in Base Currency (Coin)
+        - 'mixed': Keep 50% in Coin, 50% in Fiat
+        """
+        grid_settings = self.get_grid_settings()
+        profit_type = grid_settings.get("profit_currency_type")
+
+        if profit_type:
+            return profit_type.lower()
+
+        # Fallback based on Order Size Type (Legacy Behavior)
+        # If order_size_type is 'quote' (Fiat Mode), usually people want Fiat Profit.
+        return "quote"
+
     def get_amount_per_grid(self) -> float:
         grid_settings = self.get_grid_settings()
         return grid_settings.get("amount_per_grid", 0.0)
