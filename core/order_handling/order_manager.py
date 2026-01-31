@@ -756,7 +756,9 @@ class OrderManager:
                         try:
                             # 1. Sync Balances to get Real Wallet State
                             # This ensures we don't try to sell phantom coins if fees ate them
-                            await self.balance_tracker.sync_balances(self.order_execution_strategy.exchange, buy_price)
+                            await self.balance_tracker.sync_balances(
+                                self.order_execution_strategy.exchange_service, buy_price
+                            )
 
                             # 2. Determine Safe Sell Amount
                             # Use the MIN of (Theoretical Profit) and (Actual Wallet Balance)
@@ -988,10 +990,30 @@ class OrderManager:
         # 5. LAST RESORT: Recreate from price_grids
         try:
             sorted_original_prices = sorted(self.grid_manager.price_grids)
+            # FIX: Use bisect_left but handle exact matches or float jitter
             idx = bisect.bisect_left(sorted_original_prices, sell_price)
+
+            # If sell_price matches exactly, idx points to it. We want idx-1.
+            # If sell_price is slightly larger (drift), idx points to next. We still want idx-1?
+            # Wait. if sell_price = 100. bisect_left([100, 200], 100) -> 0.
+            # Then idx-1 = -1. INVALID.
+
+            # Logic: We want the price strictly LESS than sell_price.
+            # bisect_left gives first position >= x.
+            # So sorted[idx] >= sell_price.
+            # Thus sorted[idx-1] < sell_price (if idx > 0).
+            # This is correct.
 
             if idx > 0:
                 buy_price = sorted_original_prices[idx - 1]
+
+                # Double check to prevent "Buying at same price" due to weird float drift
+                if math.isclose(buy_price, sell_price, rel_tol=1e-5):
+                    if idx > 1:
+                        buy_price = sorted_original_prices[idx - 2]
+                    else:
+                        self.logger.warning(f"⚠️ Bottom of grid reached at {sell_price}. Cannot create buy level.")
+                        return None
 
                 if buy_price not in self.grid_manager.grid_levels:
                     new_level = GridLevel(
@@ -1011,8 +1033,13 @@ class OrderManager:
                     return new_level
                 else:
                     return self.grid_manager.grid_levels[buy_price]
+            else:
+                self.logger.warning(
+                    f"⚠️ Sell Price {sell_price} is below lowest grid configuration. Cannot find buy level."
+                )
+
         except Exception as e:
-            self.logger.error(f"Failed to find/create buy level below {sell_price}: {e}")
+            self.logger.error(f"Failed to find/create buy level below {sell_price}: {e}", exc_info=True)
 
         return None
 
@@ -1437,6 +1464,15 @@ class OrderManager:
             is_active = any(math.isclose(p, price, rel_tol=1e-3) for p in [float(o["price"]) for o in exchange_orders])
             if is_active:
                 continue
+
+            # --- CHECK STOCK ON HAND ---
+            # If we don't have stock for this level, we cannot place a sell order.
+            # This prevents "Crypto Exhausted" warnings for empty grid levels.
+            grid_level = self.grid_manager.grid_levels.get(price)
+            if not grid_level or grid_level.stock_on_hand <= 0:
+                # If we have no stock and no active order (checked above), skip this level.
+                continue
+            # ---------------------------
 
             # --- STRICT ORDER COUNT GUARD ---
             if active_grid_order_count >= self.grid_manager.num_grids:
