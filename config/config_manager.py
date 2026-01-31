@@ -154,7 +154,8 @@ class ConfigManager:
 
         # Fallback based on Order Size Type (Legacy Behavior)
         # If order_size_type is 'quote' (Fiat Mode), usually people want Fiat Profit.
-        return "quote"
+        # FIX: Changed default to 'base' (Accumulate) to match initial order behavior and user expectation.
+        return "base"
 
     def get_amount_per_grid(self) -> float:
         grid_settings = self.get_grid_settings()

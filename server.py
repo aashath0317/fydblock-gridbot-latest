@@ -1,19 +1,17 @@
 import asyncio
-from contextlib import asynccontextmanager
-from datetime import datetime  # Added import
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
-from adapter.config_adapter import DictConfigManager
 import ccxt.async_support as ccxt  # Use Async CCXT for public data
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from adapter.config_adapter import DictConfigManager
 from config.config_validator import ConfigValidator
 from core.bot_management.event_bus import EventBus
 from core.bot_management.grid_trading_bot import GridTradingBot
@@ -21,6 +19,8 @@ from core.bot_management.notification.notification_handler import NotificationHa
 from core.services.exchange_service_factory import ExchangeServiceFactory
 from core.storage.bot_database import BotDatabase
 from utils.logging_config import setup_logging
+
+load_dotenv()
 
 
 # --- Logging Setup ---
@@ -84,6 +84,11 @@ class StrategyConfig(BaseModel):
     grid_gap: float = 0.0  # Optional: explicitly set gap size (%, e.g 1.0, or amount, e.g 20)
     trailing_up: bool = False  # Enable Infinity Grid Trailing Up
     trailing_down: bool = False  # Enable Infinity Grid Trailing Down
+    profit_currency_type: str = "quote"  # "quote" (Fiat/USDT) or "base" (Coin/XRP)
+    # Profit Strategy Settings
+    profit_mode: str = "USDT_ONLY"  # "USDT_ONLY", "COIN_ONLY", "HYBRID"
+    fiat_profit_style: str = "SPLIT"  # "INSTANT", "DELAYED", "SPLIT"
+    profit_split_ratio: float = 0.5  # 0.0 to 1.0 (portion to sell immediately or split)
     # Initial Budget Allocation (from Frontend Projection)
     initial_base_balance_allocation: float = 0.0
     initial_quote_balance_allocation: float = 0.0
@@ -156,6 +161,11 @@ def create_config(
             "grid_gap": strategy_settings.get("grid_gap", 0.0),
             "trailing_up": strategy_settings.get("trailing_up", False),
             "trailing_down": strategy_settings.get("trailing_down", False),
+            "profit_currency_type": strategy_settings.get("profit_currency_type", "quote"),
+            # New Profit Strategy
+            "profit_mode": strategy_settings.get("profit_mode", "USDT_ONLY"),
+            "fiat_profit_style": strategy_settings.get("fiat_profit_style", "SPLIT"),
+            "profit_split_ratio": strategy_settings.get("profit_split_ratio", 0.5),
         },
         "risk_management": risk_management_settings,
         "logging": {"log_level": "INFO", "log_to_file": True},
@@ -208,7 +218,7 @@ async def solvency_check_loop():
             paper_demand = 0.0
             # Paper bots are effectively self-funded, but we track them for consistency
 
-            for b_id, item in active_instances.items():
+            for item in active_instances.values():
                 b = item["bot"]
                 # FIX: Access quote_currency from BalanceTracker
                 try:
@@ -263,7 +273,7 @@ async def lifespan(app: FastAPI):
     await db.connect()
 
     # Start Solvency Monitor
-    asyncio.create_task(solvency_check_loop())
+    _ = asyncio.create_task(solvency_check_loop())
 
     # Resume active bots
     await recover_active_bots()
@@ -385,6 +395,10 @@ async def start_bot(req: BotRequest):
         "grid_gap": req.strategy.grid_gap,
         "trailing_up": req.strategy.trailing_up,
         "trailing_down": req.strategy.trailing_down,
+        "profit_currency_type": req.strategy.profit_currency_type,
+        "profit_mode": req.strategy.profit_mode,
+        "fiat_profit_style": req.strategy.fiat_profit_style,
+        "profit_split_ratio": req.strategy.profit_split_ratio,
         "initial_base_balance_allocation": req.strategy.initial_base_balance_allocation,
         "initial_quote_balance_allocation": req.strategy.initial_quote_balance_allocation,
     }
@@ -451,7 +465,7 @@ async def start_bot(req: BotRequest):
     except Exception as e:
         logger.error(f"Failed to start bot {req.bot_id}: {e}", exc_info=True)
         await db.update_bot_status(req.bot_id, "CRASHED")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/stop/{bot_id}")
@@ -783,7 +797,7 @@ async def get_bot_stats(bot_id: int):
                 t_ts = t_ts.isoformat()
             elif not t_ts:
                 # Fallback to avoid Invalid Date
-                t_ts = datetime.utcnow().isoformat() + "Z"
+                t_ts = datetime.now(timezone.utc).isoformat()
 
             t_fee = t.get("fee_amount")
             t_fee_curr = t.get("fee_currency")

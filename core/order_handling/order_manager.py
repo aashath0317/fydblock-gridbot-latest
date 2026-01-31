@@ -1,5 +1,6 @@
 import asyncio
 import bisect
+import contextlib
 import logging
 import math
 import time
@@ -137,10 +138,8 @@ class OrderManager:
 
             # Cancel them all
             for order_id in orders_to_cancel:
-                try:
+                with contextlib.suppress(Exception):
                     await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
-                except Exception:
-                    pass  # Ignore errors, just try to kill it
 
             # Wait for exchange to process cancellations
             await asyncio.sleep(2)
@@ -641,63 +640,224 @@ class OrderManager:
         self.logger.info(f"Buy order completed at grid level {grid_level}.")
         self.grid_manager.complete_order(grid_level, OrderSide.BUY)
 
-        # --- PRECISE COIN TRACKING: Calculate Net Coin FIRST ---
-        # 1. Get the exact fill data
+        # 1. Get Settings
+        strat_config = self.grid_manager.config_manager.config.get("grid_strategy", {})
+        profit_mode = strat_config.get("profit_mode", "USDT_ONLY")
+        fiat_style = strat_config.get("fiat_profit_style", "SPLIT")
+        split_ratio = strat_config.get("profit_split_ratio", 0.5)
+        order_size_type = self.grid_manager.config_manager.get_order_size_type()
+
+        # 2. Precise Coin Tracking
         executed_qty = order.filled
         fee_paid_in_coin = 0.0
-
         if order.fee and order.fee.get("currency") == self.trading_pair.split("/")[0]:
-            # Fee was paid in Base Currency (e.g. SOL)
             fee_paid_in_coin = float(order.fee.get("cost", 0.0))
-        elif not order.fee:
-            pass  # Fallback handled elsewhere or assumed 0
 
-        # 2. Calculate Net Coin Received
         net_coin_received = executed_qty - fee_paid_in_coin
 
-        # 3. Save to Buy Level Initially (Safety - Accumulate)
+        # Save to Buy Level initially (Accumulate logic)
         grid_level.stock_on_hand += net_coin_received
         if self.bot_id is not None:
             await self.db.update_grid_stock(self.bot_id, grid_level.price, grid_level.stock_on_hand)
 
         self.logger.info(
-            f"🧬 Precise Tracking: Bought {executed_qty} - Fee {fee_paid_in_coin} = Stock {net_coin_received:.6f} "
-            f"(Total on hand: {grid_level.stock_on_hand:.6f})"
+            f"🧬 Precise Tracking: Bought {executed_qty} - Fee {fee_paid_in_coin:.6f} = Net {net_coin_received:.6f}"
         )
-        # -------------------------------------------------------
 
-        # --- Determine Sell Level & Transfer Stock ---
+        # 3. Determine Sell Level
         paired_sell_level = self._get_or_create_paired_sell_level(grid_level)
 
         if paired_sell_level:
-            # TRANSFER STOCK: Buy Level -> Sell Level
-            # SET (not accumulate) - each sell uses what THIS buy purchased
-            amount_to_transfer = grid_level.stock_on_hand
-
-            # FIX: SET order_quantity based on Order Size Type
-            # Quote Mode: Store USDT cost (so sell calculates coins = cost / sell_price)
-            # Base Mode: Store coin quantity (consistent coin amount per trade)
-            order_size_type = self.grid_manager.config_manager.get_order_size_type()
+            # --- PROFIT STRATEGY LOGIC ---
             buy_price = order.average or order.price
+            sell_price = paired_sell_level.price
 
+            # Calculate Cost Basis (Coins needed to recover USDT invested)
+            # USDT Invested = Net Coin * Buy Price (approx) or Executed Qty * Buy Price?
+            # Strictly: We spent (Executed Qty * Buy Price) USDT + Fees(USDT).
+            # But let's keep it simple: We received `net_coin_received` which cost us `order.cost` (or filled * price).
+            # We want to recover that Cost.
+            total_cost_usdt = order.cost if order.cost else (executed_qty * buy_price)
+
+            # Target: Sell X coins at SellPrice to get TotalCostUSDT.
+            # X = TotalCostUSDT / SellPrice
+            cost_basis_coins = total_cost_usdt / sell_price
+
+            # Profit Coins = What we have - What we need to sell to break even
+            profit_coins = max(0.0, net_coin_received - cost_basis_coins)
+
+            self.logger.info(
+                f"💰 Profit Calc: Mode={profit_mode}, Style={fiat_style}. "
+                f"NetCoin={net_coin_received:.6f}, CostBasis={cost_basis_coins:.6f}, Profit={profit_coins:.6f}"
+            )
+
+            qty_to_sell_at_paired = 0.0
+            qty_to_carry = 0.0
+            qty_to_keep_as_moonbag = 0.0
+
+            # --- MODE SWITCH ---
+            if profit_mode == "COIN_ONLY":
+                # MOON BAG: Sell only cost basis, keep profit.
+                qty_to_sell_at_paired = cost_basis_coins
+                qty_to_keep_as_moonbag = profit_coins
+
+            else:  # USDT_ONLY or HYBRID (treated as USDT variants here usually, or explicit Hybrid check)
+                if profit_mode == "HYBRID":
+                    # Hybrid usually implies some split. Let's map it to SPLIT style for now or handling custom.
+                    # Assuming HYBRID = SPLIT logic but maybe keeping moonbag?
+                    # Let's stick to the requested "Fiat Profit Style" logic for USDT_ONLY.
+                    pass
+
+                # Handle USDT_ONLY styles
+                if fiat_style == "INSTANT":
+                    # Sell Everything at Target (Standard Grid)
+                    qty_to_sell_at_paired = net_coin_received
+
+                elif fiat_style == "DELAYED":
+                    # Sell Cost Basis, Carry Profit
+                    qty_to_sell_at_paired = cost_basis_coins
+                    qty_to_carry = profit_coins
+
+                elif fiat_style == "SPLIT":
+                    # USER REQUESTED LOGIC: "Instant Split"
+                    # Determine the portion of profit to realize in Fiat
+                    profit_to_fiat = profit_coins * split_ratio
+
+                    if profit_to_fiat > 0:
+                        # SELL IT NOW (Market Order)
+                        self.logger.info(f"⚡ SPLIT: Executing IMMEDIATE market sell of {profit_to_fiat:.6f} profit.")
+                        try:
+                            # We must release the lock or handle it carefully?
+                            # calling execute_market_order is safe as it handles its own locking/execution.
+                            # But we are inside _on_order_filled... async is fine.
+
+                            # Fire and forget? No, wait for it to adjust stock.
+                            start_balance = self.balance_tracker.crypto_balance
+
+                            # Execute Market Sell
+                            sell_order = await self.order_execution_strategy.execute_market_order(
+                                OrderSide.SELL,
+                                self.trading_pair,
+                                profit_to_fiat,
+                                params={"clientOrderId": f"G{self.bot_id}xSPLIT{int(buy_price)}"}
+                                if self.bot_id
+                                else None,
+                            )
+
+                            if sell_order and sell_order.status == OrderStatus.CLOSED:
+                                sold_qty = sell_order.filled
+                                self.logger.info(
+                                    f"✅ Immediate Profit Secured: Sold {sold_qty:.6f} for {sell_order.cost:.2f} USDT"
+                                )
+
+                                # Setup the main Grid Sell Order
+                                # We have 'net_coin_received' - 'sold_qty' left.
+                                # effectively: remaining = total - sold
+                                # We need to sell 'cost_basis_coins' to recover original investment.
+                                # Whatever is left after that is the Moonbag.
+
+                                remaining_stock = net_coin_received - sold_qty
+                                qty_to_sell_at_paired = remaining_stock
+                                qty_to_carry = 0.0  # Zero Moonbag
+
+                                self.logger.info(
+                                    f"📐 Split Remaining: Selling all {qty_to_sell_at_paired:.6f} at target (No Moonbag)."
+                                )
+
+                                # Safety: If we oversold (e.g. huge fees or slippage)?
+                                if qty_to_sell_at_paired < 0:
+                                    self.logger.warning(f"⚠️ Immediate sell oversold! Stock is negative.")
+                                    qty_to_sell_at_paired = 0.0
+                                    qty_to_carry = 0.0
+                                else:
+                                    # Logic to proceed
+                                    # --- SYNC PROFIT TO FRONTEND ---
+                                    # We sold 'sold_qty'.
+                                    # Cost Basis of this portion = sold_qty * buy_price
+                                    # Revenue = sell_order.cost (Total USDT received)
+                                    # Realized Profit = Revenue - Cost Basis
+
+                                    instant_profit_usdt = sell_order.cost - (sold_qty * buy_price)
+                                    if self.bot_id:
+                                        self.logger.info(f"📊 Syncing Instant Profit: +{instant_profit_usdt:.4f} USDT")
+
+                                        # Record as a Trade History Event
+                                        trade_data = {
+                                            "bot_id": self.bot_id,
+                                            "order_id": sell_order.identifier,
+                                            "pair": self.trading_pair,
+                                            "side": "sell",
+                                            "price": sell_order.average or sell_order.price,
+                                            "quantity": sold_qty,
+                                            "fee_amount": sell_order.fee.get("cost", 0.0) if sell_order.fee else 0.0,
+                                            "fee_currency": sell_order.fee.get("currency", "USDT")
+                                            if sell_order.fee
+                                            else "USDT",
+                                            "realized_pnl": instant_profit_usdt,
+                                        }
+                                        await self.db.add_trade_history(trade_data)
+                                    # -------------------------------
+
+                            else:
+                                self.logger.error(
+                                    "❌ Immediate market sell failed/incomplete. Reverting to standard Split (Delayed)."
+                                )
+                                # Fallback to Standard Split logic
+                                profit_to_sell = profit_coins * split_ratio
+                                qty_to_sell_at_paired = cost_basis_coins + profit_to_sell
+                                qty_to_carry = profit_coins - profit_to_sell
+
+                        except Exception as e:
+                            self.logger.error(f"❌ Error during Instant Split execution: {e}")
+                            # Fallback
+                            profit_to_sell = profit_coins * split_ratio
+                            qty_to_sell_at_paired = cost_basis_coins + profit_to_sell
+                            qty_to_carry = profit_coins - profit_to_sell
+
+                    else:
+                        # No profit to split?
+                        qty_to_sell_at_paired = cost_basis_coins
+                        qty_to_carry = profit_coins
+
+            # --- Validations & Adjustments ---
+
+            # SAFETY: If top of grid, we cannot carry. Sell ALL.
+            next_upper_level = self.grid_manager.get_grid_level_above(paired_sell_level)
+            if qty_to_carry > 0 and not next_upper_level:
+                self.logger.info("⚠️ Cannot carry profit (Top of Grid). converting to INSTANT sell.")
+                qty_to_sell_at_paired += qty_to_carry
+                qty_to_carry = 0.0
+
+            # Rounding Safety
+            qty_to_sell_at_paired = round(qty_to_sell_at_paired, 6)
+            qty_to_carry = round(qty_to_carry, 6)
+
+            # Apply to Paired Level
+            # We overwrite stock_on_hand because we are transferring ownership from Buy Level
+            paired_sell_level.stock_on_hand = qty_to_sell_at_paired
+
+            # Update Order Quantity (For logic checking)
             if order_size_type == "quote":
-                # Quote Mode: Store the USDT cost of this buy
-                usdt_cost = buy_price * net_coin_received
-                paired_sell_level.order_quantity = usdt_cost
-                self.logger.info(f"📊 Quote Mode: Storing USDT cost {usdt_cost:.4f} for sell calculation")
+                paired_sell_level.order_quantity = total_cost_usdt  # Tracking cost
             else:
-                # Base Mode: Store the coin quantity
-                paired_sell_level.order_quantity = net_coin_received
+                paired_sell_level.order_quantity = qty_to_sell_at_paired
 
-            paired_sell_level.stock_on_hand = amount_to_transfer  # Replace, not accumulate
-            paired_sell_level.stock_on_hand = round(paired_sell_level.stock_on_hand, 6)
-
+            # DB Updates for Paired
             if self.bot_id is not None:
-                # Update DB with stock and order_quantity
                 await self.db.update_grid_stock(self.bot_id, paired_sell_level.price, paired_sell_level.stock_on_hand)
                 await self.db.update_grid_order_quantity(
                     self.bot_id, paired_sell_level.price, paired_sell_level.order_quantity
                 )
+
+            # Apply Carry Forward
+            if qty_to_carry > 0 and next_upper_level:
+                next_upper_level.stock_on_hand += qty_to_carry
+                self.logger.info(f"⤴️ CARRYING PROFIT: Moved {qty_to_carry:.6f} to Next Level {next_upper_level.price}")
+                if self.bot_id is not None:
+                    await self.db.update_grid_stock(self.bot_id, next_upper_level.price, next_upper_level.stock_on_hand)
+
+            if qty_to_keep_as_moonbag > 0:
+                self.logger.info(f"🌑 MOON BAG: Keeping {qty_to_keep_as_moonbag:.6f} coins (Removed from grid logic)")
 
             # Clear Buy Level
             grid_level.stock_on_hand = 0.0
@@ -705,46 +865,27 @@ class OrderManager:
             if self.bot_id is not None:
                 await self.db.update_grid_stock(self.bot_id, grid_level.price, 0.0)
 
-            self.logger.info(
-                f"🚚 Stock Transferred: {amount_to_transfer:.6f} coins from {grid_level.price} to {paired_sell_level.price} "
-                f"(Order Value: {paired_sell_level.order_quantity:.4f} {'USDT' if order_size_type == 'quote' else 'coins'})"
-            )
-
+            # --- PLACE SELL ORDER ---
             if self.grid_manager.can_place_order(paired_sell_level, OrderSide.SELL):
-                # Check if we're in accumulation mode (sell order already pending)
+                # Check for existing accumulation
                 if paired_sell_level.state == GridCycleState.WAITING_FOR_SELL_FILL:
-                    # Stock accumulated! Cancel old order and replace with new one for total stock
-                    self.logger.info(
-                        f"📦 Stock accumulated on {paired_sell_level.price}. "
-                        f"Cancelling old sell order and replacing with total stock: {paired_sell_level.stock_on_hand:.6f}"
-                    )
-
-                    # Cancel existing order(s) at this level
-                    for order in list(paired_sell_level.orders):
-                        try:
-                            # Extract order ID (could be Order object or just ID)
-                            order_id = order.identifier if hasattr(order, "identifier") else order
-                            # Skip if order is already filled/closed
-                            if hasattr(order, "status") and order.status == OrderStatus.CLOSED:
-                                self.logger.debug(f"Skipping cancel for already-filled order {order_id}")
+                    # Cancel and Replace
+                    self.logger.info(f"📦 Accumulating on {paired_sell_level.price}. Replacing order...")
+                    for o in list(paired_sell_level.orders):
+                        with contextlib.suppress(Exception):
+                            oid = o.identifier if hasattr(o, "identifier") else o
+                            if hasattr(o, "status") and o.status == OrderStatus.CLOSED:
                                 continue
-                            await self.order_execution_strategy.cancel_order(order_id, self.trading_pair)
-                            self.logger.info(f"✅ Cancelled old sell order {order_id} at {paired_sell_level.price}")
-                        except Exception as e:
-                            self.logger.warning(f"Failed to cancel order {order}: {e}")
-
-                    # Clear the orders list and reset state
+                            await self.order_execution_strategy.cancel_order(oid, self.trading_pair)
                     paired_sell_level.orders.clear()
                     self.grid_manager.complete_order(paired_sell_level, OrderSide.SELL)
 
-                # Place new/replacement sell order with total accumulated stock
+                # Place Sell with NEW Quantity
+                # NOTE: The helper `_place_limit_order_safe` usually looks at `order_size_for_grid`.
+                # We need to force it to use our `stock_on_hand`.
+                # We can use `quantity_override` in `_place_limit_order_safe`. or `_place_sell_order` helper.
+                # `_handle_buy_order_completion` used `_place_sell_order` at the end previously.
                 await self._place_sell_order(grid_level, paired_sell_level, paired_sell_level.stock_on_hand)
-
-                # --- QUOTE MODE: REMOVED PREMATURE SELL ---
-                # We no longer sell "profit coins" immediately on Buy Fill.
-                # Profit is realized at the Sell Order (Sell-High).
-                # ------------------------------------------
-                # ------------------------------------------------
 
         else:
             self.logger.warning(
@@ -760,19 +901,12 @@ class OrderManager:
                 "side": "buy",
                 "price": order.average or order.price,
                 "quantity": order.filled,
-                "fee_amount": 0.0,
+                "fee_amount": fee_paid_in_coin,
                 "fee_currency": self.trading_pair.split("/")[0],
                 "realized_pnl": 0.0,
             }
-            if order.fee:
-                trade_record["fee_amount"] = float(order.fee.get("cost", 0.0))
-                currency = order.fee.get("currency", "")
-                if currency and currency.upper() != "UNKNOWN":
-                    trade_record["fee_currency"] = currency
-            else:
-                # Fallback: Estimate Fee in Base Currency
-                rate = self.balance_tracker.fee_calculator.trading_fee
-                trade_record["fee_amount"] = order.filled * rate
+            if order.fee and "currency" in order.fee:
+                trade_record["fee_currency"] = order.fee["currency"]
 
             await self.db.add_trade_history(trade_record)
         # --------------------------------
