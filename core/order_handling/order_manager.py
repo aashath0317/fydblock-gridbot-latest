@@ -545,24 +545,30 @@ class OrderManager:
                     sold_amount = order.filled
                     remaining_to_clear = sold_amount
 
-                    # Clear stock from sell grids (highest first, as that's where stock accumulates)
-                    for price in sorted(self.grid_manager.sorted_sell_grids, reverse=True):
+                    # Clear stock from ALL grids (highest first)
+                    # Instant Split sells might draw from "Buy Grids" that just filled but aren't yet "Sell Grids"
+                    grids_with_stock = sorted(
+                        [g for g in self.grid_manager.grid_levels.values() if g.stock_on_hand > 0],
+                        key=lambda x: x.price,
+                        reverse=True,
+                    )
+
+                    for grid_level in grids_with_stock:
                         if remaining_to_clear <= 0:
                             break
-                        grid_level = self.grid_manager.grid_levels.get(price)
-                        if grid_level and grid_level.stock_on_hand > 0:
-                            cleared = min(grid_level.stock_on_hand, remaining_to_clear)
-                            grid_level.stock_on_hand -= cleared
-                            grid_level.stock_on_hand = round(grid_level.stock_on_hand, 6)
-                            remaining_to_clear -= cleared
 
-                            if self.bot_id is not None:
-                                await self.db.update_grid_stock(self.bot_id, price, grid_level.stock_on_hand)
+                        cleared = min(grid_level.stock_on_hand, remaining_to_clear)
+                        grid_level.stock_on_hand -= cleared
+                        grid_level.stock_on_hand = round(grid_level.stock_on_hand, 6)
+                        remaining_to_clear -= cleared
 
-                            self.logger.info(
-                                f"🧹 Cleared phantom stock: {cleared:.6f} from grid {price} "
-                                f"(Remaining stock: {grid_level.stock_on_hand:.6f})"
-                            )
+                        if self.bot_id is not None:
+                            await self.db.update_grid_stock(self.bot_id, grid_level.price, grid_level.stock_on_hand)
+
+                        self.logger.info(
+                            f"🧹 Cleared phantom stock: {cleared:.6f} from grid {grid_level.price} "
+                            f"(Remaining stock: {grid_level.stock_on_hand:.6f})"
+                        )
 
                     if remaining_to_clear > 0.0001:
                         self.logger.warning(f"⚠️ Could not fully clear sold amount. Remaining: {remaining_to_clear:.6f}")
@@ -1322,7 +1328,17 @@ class OrderManager:
                     # Fallback: Legacy mode - use stock_on_hand if order_quantity not set
                     quantity = grid_level.stock_on_hand
                     self.logger.info(f"📉 Using Stock-On-Hand for Sell Order (Legacy): {quantity:.6f}")
-            # -------------------------------------------------------
+
+            # --- FINAL GUARD: strict cap at stock_on_hand ---
+            # Ensure we NEVER try to sell more than we physically track, regardless of mode.
+            if side == OrderSide.SELL and grid_level.stock_on_hand > 0:
+                original_qty = quantity
+                quantity = min(quantity, grid_level.stock_on_hand)
+                if quantity < original_qty:
+                    self.logger.warning(
+                        f"⚠️ Quantity clamped to Stock-on-Hand: Requested {original_qty:.6f} -> Capped {quantity:.6f}"
+                    )
+            # ------------------------------------------------
 
             try:
                 if side == OrderSide.BUY:
@@ -1357,16 +1373,36 @@ class OrderManager:
                             dust_remainder = quantity - qty
                             grid_level.stock_on_hand = dust_remainder
                             if self.bot_id is not None:
-                                await self.db.update_grid_stock(self.bot_id, price, dust_remainder)
+                                try:
+                                    await self.db.update_grid_stock(self.bot_id, price, dust_remainder)
+                                except Exception as e:
+                                    self.logger.error(f"❌ DB Error: Failed to update grid stock for {price}: {e}")
                             self.logger.info(f"🧹 Dust Management: Keeping {dust_remainder:.6f} as residue.")
                         else:
                             grid_level.stock_on_hand = 0.0
                             if self.bot_id is not None:
-                                await self.db.update_grid_stock(self.bot_id, price, 0.0)
+                                try:
+                                    await self.db.update_grid_stock(self.bot_id, price, 0.0)
+                                except Exception as e:
+                                    self.logger.error(f"❌ DB Error: Failed to zero grid stock for {price}: {e}")
                     # ----------------------------------------------
 
                     if self.bot_id is not None:
-                        await self.db.add_order(self.bot_id, order.identifier, price, side.value, order.amount)
+                        try:
+                            await self.db.add_order(self.bot_id, order.identifier, price, side.value, order.amount)
+                        except Exception as e:
+                            self.logger.error(
+                                f"❌ CRITICAL DB FAILURE: Failed to save order {order.identifier} to DB after retries: {e}"
+                            )
+                            self.logger.warning(f"🛡️ Attempting to cancel ghost order {order.identifier} on exchange...")
+                            try:
+                                await self.order_execution_strategy.cancel_order(order.identifier, self.trading_pair)
+                                self.logger.info(f"✅ Successfully neutralized ghost order {order.identifier}.")
+                            except Exception as ce:
+                                self.logger.critical(
+                                    f"💀 Failed to cancel ghost order {order.identifier}! It is now loose on the exchange. Error: {ce}"
+                                )
+                            return None
 
                     if side == OrderSide.BUY:
                         await self.balance_tracker.reserve_funds_for_buy(order.amount * order.price)
@@ -1477,7 +1513,24 @@ class OrderManager:
 
         exchange_order_ids = set(o["id"] for o in exchange_orders)
 
+        # --- GHOST ORDER ADOPTION (Phase 4) ---
+        # Detect if any order on the exchange (with our prefix) is MISSING from our DB.
+        # This happens if a multi-order strike hit and DB insertion failed silently.
         if self.bot_id is not None:
+            for o in exchange_orders:
+                order_id = o["id"]
+                if not await self.db.get_order(order_id):
+                    self.logger.warning(
+                        f"👻 Ghost Order Found: {order_id} at {o['price']} is on exchange but NOT in DB. Adopting..."
+                    )
+                    try:
+                        await self.db.add_order(
+                            self.bot_id, order_id, float(o["price"]), o["side"].lower(), float(o["amount"])
+                        )
+                        self.logger.info(f"✅ Ghost Order {order_id} successfully adopted into database.")
+                    except Exception as e:
+                        self.logger.error(f"❌ Failed to adopt ghost order {order_id}: {e}")
+            # --------------------------------------
             db_orders = await self.db.get_all_active_orders(self.bot_id)
             # Track reserves for Hot Boot restoration
             restored_reserved_crypto = 0.0
@@ -1668,6 +1721,60 @@ class OrderManager:
             else:
                 # CRITICAL FIX: Increment count so subsequent loops don't overfill
                 active_grid_order_count += 1
+
+        # --- FIX: Auto-Allocate Surplus Crypto to Empty Grids ---
+        # Detect if we have free crypto in the wallet that isn't assigned to any grid.
+        # This happens on Hot Boot, Manual Deposit, or after manual cancellations.
+        try:
+            committed_idle_stock = sum(
+                g.stock_on_hand
+                for p, g in self.grid_manager.grid_levels.items()
+                if g.stock_on_hand > 0 and p not in occupied_grid_prices
+            )
+            # Use a small epsilon to avoid floating point noise triggers
+            surplus_crypto = self.balance_tracker.crypto_balance - committed_idle_stock
+
+            # Fixed threshold (0.0001) as GridManager does not expose min_order_size_base
+            if surplus_crypto > 0.0001:
+                self.logger.debug(
+                    f"🔎 Found Surplus Crypto: {surplus_crypto:.6f} (Free: {self.balance_tracker.crypto_balance:.6f} - IdleStock: {committed_idle_stock:.6f})"
+                )
+
+                # Distribute to empty Sell Grids (Top Down - Sell High first)
+                for price in self.grid_manager.sorted_sell_grids:
+                    if surplus_crypto <= 0:
+                        break
+                    if price <= safe_sell_limit:
+                        continue
+                    if price in occupied_grid_prices:
+                        continue
+
+                    grid_level = self.grid_manager.grid_levels.get(price)
+                    if grid_level and grid_level.stock_on_hand <= 0:
+                        # Determine how much this grid *should* have
+                        total_val = self.balance_tracker.get_total_balance_value(current_price)
+                        target_qty = self.grid_manager.get_order_size_for_grid_level(total_val, price)
+
+                        # Allocate what we can
+                        allocation = min(surplus_crypto, target_qty)
+
+                        # Only allocate if meaningful amount
+                        if allocation > 0.00001:
+                            grid_level.stock_on_hand = allocation
+                            surplus_crypto -= allocation
+
+                            if self.bot_id is not None:
+                                await self.db.update_grid_stock(self.bot_id, price, allocation)
+                                # Also update order qty to match, for consistency
+                                if grid_level.order_quantity <= 0:
+                                    grid_level.order_quantity = allocation
+                                    await self.db.update_grid_order_quantity(self.bot_id, price, allocation)
+
+                            self.logger.info(f"✨ Auto-Allocated {allocation:.6f} surplus crypto to grid {price}")
+
+        except Exception as e:
+            self.logger.error(f"Error during surplus allocation: {e}")
+        # --------------------------------------------------------
 
         # Check SELL Grids
         for price in self.grid_manager.sorted_sell_grids:
